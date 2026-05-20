@@ -73,10 +73,25 @@ fn resolve_git_identity() -> Option<String> {
     {
         let identity = parse_git_var_identity(&stdout);
         if let Some(formatted) = identity.formatted() {
-            return Some(formatted);
+            return Some(encode_for_header(&formatted));
         }
     }
     None
+}
+
+/// Percent-encode non-ASCII and control bytes so the value is safe for HTTP headers.
+/// ureq 2.x accepts only visible ASCII (0x21..=0x7E) and space/tab in header values.
+fn encode_for_header(value: &str) -> String {
+    use std::fmt::Write;
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'%' => encoded.push_str("%25"),
+            0x20..=0x7E => encoded.push(byte as char),
+            _ => write!(encoded, "%{:02X}", byte).unwrap(),
+        }
+    }
+    encoded
 }
 
 /// API client context with optional authentication
@@ -458,5 +473,45 @@ mod tests {
         // All threads should have acquired the lock sequentially
         let final_count = counter.load(Ordering::SeqCst);
         assert_eq!(final_count, 5);
+    }
+
+    // ============= encode_for_header Tests =============
+
+    #[test]
+    fn test_encode_for_header_ascii_passthrough() {
+        let value = "John Doe <john@example.com>";
+        assert_eq!(encode_for_header(value), value);
+    }
+
+    #[test]
+    fn test_encode_for_header_non_ascii() {
+        assert_eq!(
+            encode_for_header("Ex\u{00f6}utf8lastname <user@example.com>"),
+            "Ex%C3%B6utf8lastname <user@example.com>"
+        );
+    }
+
+    #[test]
+    fn test_encode_for_header_percent_encoded_for_reversibility() {
+        assert_eq!(encode_for_header("100% done"), "100%25 done");
+    }
+
+    #[test]
+    fn test_encode_for_header_special_ascii_chars_passthrough() {
+        let value = "Name+Tag <user+tag@sub.example.com>";
+        assert_eq!(encode_for_header(value), value);
+    }
+
+    #[test]
+    fn test_encode_for_header_all_bytes_valid_for_ureq() {
+        let input = "Ñoño García <nono@example.com>";
+        let encoded = encode_for_header(input);
+        assert!(
+            encoded
+                .bytes()
+                .all(|b| b == b' ' || b == b'\t' || (0x21..=0x7E).contains(&b)),
+            "encoded value contains invalid header bytes: {:?}",
+            encoded
+        );
     }
 }
