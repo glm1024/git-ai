@@ -3528,7 +3528,7 @@ fn remove_pid_metadata(config: &DaemonConfig) -> Result<(), GitAiError> {
 /// startup — never from probe functions — so it cannot break flock visibility
 /// for read-only lock checks.
 #[cfg(unix)]
-fn remove_stale_daemon_files(config: &DaemonConfig) {
+pub(crate) fn remove_stale_daemon_files(config: &DaemonConfig) {
     let pid_path = pid_metadata_path(config);
     for path in [
         config.lock_path.as_path(),
@@ -3550,7 +3550,7 @@ fn remove_stale_daemon_files(config: &DaemonConfig) {
 }
 
 #[cfg(not(unix))]
-fn remove_stale_daemon_files(_config: &DaemonConfig) {}
+pub(crate) fn remove_stale_daemon_files(_config: &DaemonConfig) {}
 
 #[cfg(not(windows))]
 fn daemon_is_test_mode() -> bool {
