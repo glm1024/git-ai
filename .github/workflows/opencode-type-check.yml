@@ -27,12 +27,12 @@ jobs:
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '20'
-          cache: 'yarn'
-          cache-dependency-path: agent-support/opencode/yarn.lock
+          cache: 'npm'
+          cache-dependency-path: agent-support/opencode/package-lock.json
 
       - name: Install dependencies
-        run: yarn install --frozen-lockfile
+        run: npm ci
 
       - name: Run type check
-        run: yarn type-check
+        run: npm run type-check
 
