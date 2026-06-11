@@ -87,7 +87,7 @@ namespace GitAiVS.Services
 
         private async Task<bool> RunCheckpointAsync(string preset, string inputType, string stdinJson, string cwd)
         {
-            var binaryPath = _resolver.Resolve();
+            var binaryPath = await _resolver.ResolveAsync();
             if (binaryPath == null)
             {
                 Trace.WriteLine("[git-ai] Skipping checkpoint -- git-ai not available");

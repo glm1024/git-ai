@@ -45,7 +45,7 @@ namespace GitAiVS
                 System.Diagnostics.Trace.WriteLine("[git-ai] GitAiPackage initializing...");
 
                 _binaryResolver = new BinaryResolver();
-                var binaryPath = _binaryResolver.Resolve();
+                var binaryPath = await _binaryResolver.ResolveAsync();
 
                 if (binaryPath == null)
                 {

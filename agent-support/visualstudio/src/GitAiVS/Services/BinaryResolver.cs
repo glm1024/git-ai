@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading.Tasks;
 
 namespace GitAiVS.Services
 {
@@ -26,7 +27,7 @@ namespace GitAiVS.Services
         public string? ResolvedPath => _cachedPath;
         public Version? ResolvedVersion => _cachedVersion;
 
-        public string? Resolve()
+        public async Task<string?> ResolveAsync()
         {
             if (_cachedPath != null && File.Exists(_cachedPath))
                 return _cachedPath;
@@ -34,7 +35,7 @@ namespace GitAiVS.Services
             _cachedPath = null;
             _cachedVersion = null;
 
-            var path = FindBinary();
+            var path = await FindBinaryAsync().ConfigureAwait(false);
             if (path == null)
             {
                 var searched = _lastSearchedPaths != null ? string.Join(", ", _lastSearchedPaths) : "(none)";
@@ -44,7 +45,7 @@ namespace GitAiVS.Services
                 return null;
             }
 
-            var version = GetVersion(path);
+            var version = await GetVersionAsync(path).ConfigureAwait(false);
             if (version == null)
             {
                 Trace.WriteLine($"[git-ai] Could not determine git-ai version at {path}");
@@ -69,7 +70,7 @@ namespace GitAiVS.Services
             _cachedVersion = null;
         }
 
-        private string? FindBinary()
+        private async Task<string?> FindBinaryAsync()
         {
             var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var isWindows = Environment.OSVersion.Platform == PlatformID.Win32NT;
@@ -93,10 +94,10 @@ namespace GitAiVS.Services
             }
 
             Trace.WriteLine("[git-ai] git-ai not found in known locations, trying PATH lookup");
-            return TryPathLookup(isWindows);
+            return await TryPathLookupAsync(isWindows).ConfigureAwait(false);
         }
 
-        private static string? TryPathLookup(bool isWindows)
+        private static async Task<string?> TryPathLookupAsync(bool isWindows)
         {
             try
             {
@@ -110,17 +111,10 @@ namespace GitAiVS.Services
                     CreateNoWindow = true,
                 };
 
-                using var proc = Process.Start(psi);
-                if (proc == null) return null;
+                var result = await RunProcessAsync(psi, PathLookupTimeoutMs).ConfigureAwait(false);
+                if (result == null || result.ExitCode != 0) return null;
 
-                var outputTask = proc.StandardOutput.ReadToEndAsync();
-                proc.WaitForExit(PathLookupTimeoutMs);
-                if (!proc.HasExited) { proc.Kill(); return null; }
-                var output = outputTask.Result.Trim();
-
-                if (proc.ExitCode != 0) return null;
-
-                var firstLine = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                var firstLine = result.Stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
                 if (firstLine.Length > 0 && File.Exists(firstLine[0]))
                 {
                     Trace.WriteLine($"[git-ai] Found git-ai via PATH lookup: {firstLine[0]}");
@@ -135,7 +129,7 @@ namespace GitAiVS.Services
             return null;
         }
 
-        private static Version? GetVersion(string binaryPath)
+        private static async Task<Version?> GetVersionAsync(string binaryPath)
         {
             try
             {
@@ -149,33 +143,23 @@ namespace GitAiVS.Services
                     CreateNoWindow = true,
                 };
 
-                using var proc = Process.Start(psi);
-                if (proc == null) return null;
-
-                var outputTask = proc.StandardOutput.ReadToEndAsync();
-                var stderrTask = proc.StandardError.ReadToEndAsync();
-                proc.WaitForExit(VersionCheckTimeoutMs);
-
-                if (!proc.HasExited)
+                var result = await RunProcessAsync(psi, VersionCheckTimeoutMs).ConfigureAwait(false);
+                if (result == null)
                 {
-                    proc.Kill();
                     Trace.WriteLine("[git-ai] git-ai version check timed out");
                     return null;
                 }
 
-                var output = outputTask.Result.Trim();
-                var stderr = stderrTask.Result.Trim();
-
-                if (proc.ExitCode != 0)
+                if (result.ExitCode != 0)
                 {
                     Trace.WriteLine($"[git-ai] git-ai version check failed");
-                    Trace.WriteLine($"[git-ai]   Exit code: {proc.ExitCode}");
-                    Trace.WriteLine($"[git-ai]   Stdout: {output}");
-                    Trace.WriteLine($"[git-ai]   Stderr: {stderr}");
+                    Trace.WriteLine($"[git-ai]   Exit code: {result.ExitCode}");
+                    Trace.WriteLine($"[git-ai]   Stdout: {result.Stdout}");
+                    Trace.WriteLine($"[git-ai]   Stderr: {result.Stderr}");
                     return null;
                 }
 
-                return ParseVersion(output);
+                return ParseVersion(result.Stdout);
             }
             catch (Exception ex)
             {
@@ -198,6 +182,75 @@ namespace GitAiVS.Services
             }
 
             return null;
+        }
+
+        private static async Task<ProcessResult?> RunProcessAsync(ProcessStartInfo psi, int timeoutMs)
+        {
+            using var proc = Process.Start(psi);
+            if (proc == null) return null;
+
+            var outputTask = proc.StandardOutput.ReadToEndAsync();
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+
+            if (!await WaitForExitAsync(proc, timeoutMs).ConfigureAwait(false))
+            {
+                TryKill(proc);
+                return null;
+            }
+
+            var stdout = (await outputTask.ConfigureAwait(false)).Trim();
+            var stderr = (await stderrTask.ConfigureAwait(false)).Trim();
+            return new ProcessResult(proc.ExitCode, stdout, stderr);
+        }
+
+        private static async Task<bool> WaitForExitAsync(Process proc, int timeoutMs)
+        {
+            var exited = new TaskCompletionSource<bool>();
+
+            void OnExited(object sender, EventArgs args) => exited.TrySetResult(true);
+
+            try
+            {
+                proc.EnableRaisingEvents = true;
+                proc.Exited += OnExited;
+
+                if (proc.HasExited)
+                    return true;
+
+                var completed = await Task.WhenAny(exited.Task, Task.Delay(timeoutMs)).ConfigureAwait(false);
+                return completed == exited.Task;
+            }
+            finally
+            {
+                proc.Exited -= OnExited;
+            }
+        }
+
+        private static void TryKill(Process proc)
+        {
+            try
+            {
+                if (!proc.HasExited)
+                    proc.Kill();
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[git-ai] Failed to kill timed-out process: {ex.Message}");
+            }
+        }
+
+        private sealed class ProcessResult
+        {
+            public ProcessResult(int exitCode, string stdout, string stderr)
+            {
+                ExitCode = exitCode;
+                Stdout = stdout;
+                Stderr = stderr;
+            }
+
+            public int ExitCode { get; }
+            public string Stdout { get; }
+            public string Stderr { get; }
         }
     }
 }
