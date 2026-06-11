@@ -98,5 +98,28 @@ namespace GitAiVS.Tests
 
             Assert.IsFalse(doc.RootElement.TryGetProperty("cwd", out _));
         }
+
+        [TestMethod]
+        public void JsonOptionsSerializesUnannotatedPropertiesAsSnakeCase()
+        {
+            var json = JsonSerializer.Serialize(
+                new NamingPolicyProbe
+                {
+                    RepoWorkingDir = "/repo",
+                    URLValue = "https://example.test",
+                },
+                JsonOptions.Default);
+            var doc = JsonDocument.Parse(json);
+
+            Assert.AreEqual("/repo", doc.RootElement.GetProperty("repo_working_dir").GetString());
+            Assert.AreEqual("https://example.test", doc.RootElement.GetProperty("url_value").GetString());
+            Assert.IsFalse(doc.RootElement.TryGetProperty("repoWorkingDir", out _));
+        }
+
+        private sealed class NamingPolicyProbe
+        {
+            public string RepoWorkingDir { get; set; } = "";
+            public string URLValue { get; set; } = "";
+        }
     }
 }

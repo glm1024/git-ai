@@ -43,6 +43,9 @@ jobs:
           if [ "${{ github.event_name }}" = "merge_group" ]; then
             echo 'matrix={"include":[{"os":"ubuntu-latest","test_mode":"daemon","test_threads":4,"daemon_pool":4},{"os":"ubuntu-latest","test_mode":"wrapper-daemon","test_threads":4,"daemon_pool":4},{"os":"macos-latest","test_mode":"daemon","test_threads":2,"daemon_pool":2},{"os":"macos-latest","test_mode":"wrapper-daemon","test_threads":2,"daemon_pool":2}]}' >> "$GITHUB_OUTPUT"
           else
+            # Keep Windows daemon-mode below the Ubuntu parallelism level. On windows-latest
+            # the 4-thread/4-daemon-pool configuration has intermittently made the hosted
+            # runner lose communication with GitHub during the long daemon test lane.
             echo 'matrix={"include":[{"os":"ubuntu-latest","test_mode":"daemon","test_threads":4,"daemon_pool":4},{"os":"ubuntu-latest","test_mode":"wrapper-daemon","test_threads":4,"daemon_pool":4},{"os":"windows-latest","test_mode":"daemon","test_threads":2,"daemon_pool":2},{"os":"windows-latest","test_mode":"wrapper-daemon","test_threads":4,"daemon_pool":4},{"os":"macos-latest","test_mode":"daemon","test_threads":2,"daemon_pool":2},{"os":"macos-latest","test_mode":"wrapper-daemon","test_threads":2,"daemon_pool":2}]}' >> "$GITHUB_OUTPUT"
           fi
 

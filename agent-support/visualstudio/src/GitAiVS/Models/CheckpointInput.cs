@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -102,8 +103,50 @@ namespace GitAiVS.Models
         public static readonly JsonSerializerOptions Default = new()
         {
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNamingPolicy = SnakeCaseJsonNamingPolicy.Instance,
             WriteIndented = false,
         };
+    }
+
+    internal sealed class SnakeCaseJsonNamingPolicy : JsonNamingPolicy
+    {
+        public static readonly SnakeCaseJsonNamingPolicy Instance = new();
+
+        public override string ConvertName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return name;
+
+            var builder = new StringBuilder(name.Length + 8);
+
+            for (var i = 0; i < name.Length; i++)
+            {
+                var value = name[i];
+                if (char.IsUpper(value))
+                {
+                    if (ShouldInsertUnderscore(name, i))
+                        builder.Append('_');
+
+                    builder.Append(char.ToLowerInvariant(value));
+                }
+                else
+                {
+                    builder.Append(value);
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private static bool ShouldInsertUnderscore(string name, int index)
+        {
+            if (index == 0 || name[index - 1] == '_')
+                return false;
+
+            if (char.IsLower(name[index - 1]) || char.IsDigit(name[index - 1]))
+                return true;
+
+            return index + 1 < name.Length && char.IsLower(name[index + 1]);
+        }
     }
 }
