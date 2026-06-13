@@ -6,7 +6,7 @@ use crate::authorship::hunk_shift::{DiffHunk, apply_hunk_shifts_to_line_attribut
 use crate::authorship::working_log::CheckpointKind;
 use crate::commands::blame::{GitAiBlameOptions, OLDEST_AI_BLAME_DATE};
 use crate::error::GitAiError;
-use crate::git::repository::Repository;
+use crate::git::repository::{Repository, batch_read_paths_at_treeishes};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1178,6 +1178,36 @@ fn build_attestations_from_attributions(
     files
 }
 
+/// Derive committed (added) line ranges per file from a pre-computed
+/// parent→commit `DiffTreeResult`, equivalent to what `collect_committed_hunks`
+/// would return for the same pair. The new-side hunk ranges are the lines added
+/// by the commit. Filtered by `pathspecs` when provided.
+pub(crate) fn committed_hunks_from_diff_result(
+    diff: &crate::authorship::rewrite::DiffTreeResult,
+    pathspecs: Option<&HashSet<String>>,
+) -> HashMap<String, Vec<LineRange>> {
+    let mut committed_hunks: HashMap<String, Vec<LineRange>> = HashMap::new();
+    for (file_path, hunks) in &diff.hunks_by_file {
+        if let Some(paths) = pathspecs
+            && !paths.contains(file_path)
+        {
+            continue;
+        }
+        let mut lines: Vec<u32> = Vec::new();
+        for hunk in hunks {
+            for line in hunk.new_start..hunk.new_start + hunk.new_count {
+                if line > 0 {
+                    lines.push(line);
+                }
+            }
+        }
+        if !lines.is_empty() {
+            committed_hunks.insert(file_path.clone(), LineRange::compress_lines(&lines));
+        }
+    }
+    committed_hunks
+}
+
 /// Helper function to collect committed line ranges from git diff
 fn collect_committed_hunks(
     repo: &Repository,
@@ -1339,8 +1369,19 @@ fn collect_unstaged_hunks_from_snapshot(
         None => final_state_snapshot.keys().cloned().collect(),
     };
 
+    // Batch-read committed content for every file in two git spawns instead of
+    // one (fast-reader-miss) spawn per file.
+    let requests: Vec<(String, String)> = file_paths
+        .iter()
+        .map(|file_path| (commit_sha.to_string(), file_path.clone()))
+        .collect();
+    let committed_contents = batch_file_contents(repo, &requests)?;
+
     for file_path in file_paths {
-        let committed_content = get_file_content_at_commit(repo, commit_sha, &file_path)?;
+        let committed_content = committed_contents
+            .get(&(commit_sha.to_string(), file_path.clone()))
+            .cloned()
+            .unwrap_or_default();
         let final_content = final_state_snapshot
             .get(&file_path)
             .cloned()
@@ -1479,49 +1520,29 @@ fn line_sequence_contains(needle: &str, haystack: &str) -> bool {
     false
 }
 
-fn get_file_content_at_parent(
-    repo: &Repository,
-    parent_sha: &str,
-    file_path: &str,
-) -> Result<String, GitAiError> {
-    if parent_sha == "initial" {
-        Ok(String::new())
-    } else {
-        get_file_content_at_commit(repo, parent_sha, file_path)
-    }
-}
-
-fn merged_carryover_content(
-    repo: &Repository,
-    parent_sha: &str,
-    commit_sha: &str,
-    file_path: &str,
+/// Pure carryover reconciliation given already-fetched contents (no git ops).
+/// `parent_content` is the file at the parent commit ("" if absent / initial).
+fn merged_carryover_content_pure(
+    parent_content: &str,
+    committed_content: &str,
     observed_content: &str,
-) -> Result<String, GitAiError> {
-    let committed_content = get_file_content_at_commit(repo, commit_sha, file_path)?;
+) -> String {
     if committed_content == observed_content {
-        return Ok(observed_content.to_string());
+        return observed_content.to_string();
     }
-    if line_sequence_contains(&committed_content, observed_content) {
-        return Ok(observed_content.to_string());
+    if line_sequence_contains(committed_content, observed_content) {
+        return observed_content.to_string();
     }
-    if line_sequence_contains(observed_content, &committed_content) {
-        return Ok(committed_content);
+    if line_sequence_contains(observed_content, committed_content) {
+        return committed_content.to_string();
     }
-
-    let parent_content = get_file_content_at_parent(repo, parent_sha, file_path)?;
     if committed_content == parent_content {
-        return Ok(observed_content.to_string());
+        return observed_content.to_string();
     }
     if observed_content == parent_content {
-        return Ok(committed_content);
+        return committed_content.to_string();
     }
-
-    Ok(carryover_merge_content(
-        &parent_content,
-        &committed_content,
-        observed_content,
-    ))
+    carryover_merge_content(parent_content, committed_content, observed_content)
 }
 
 /// In-memory 3-way line merge replacing a per-file `git merge-file --theirs -p
@@ -1924,6 +1945,25 @@ fn checkout_merge_rebased_content(
     rebased.concat()
 }
 
+/// Batch-read the content of many `(treeish, path)` pairs in a CONSTANT number
+/// of git spawns (one `cat-file --batch-check` + one `cat-file --batch`),
+/// regardless of how many files. Missing paths map to an empty string (the same
+/// degradation `get_file_content_at_commit` produces for an absent path).
+fn batch_file_contents(
+    repo: &Repository,
+    requests: &[(String, String)],
+) -> Result<HashMap<(String, String), String>, GitAiError> {
+    if requests.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut map = batch_read_paths_at_treeishes(repo, requests)?;
+    // Ensure every requested pair has an entry (absent paths → "").
+    for req in requests {
+        map.entry(req.clone()).or_default();
+    }
+    Ok(map)
+}
+
 pub fn checkout_merge_final_state_snapshot(
     repo: &Repository,
     old_head: &str,
@@ -1938,10 +1978,26 @@ pub fn checkout_merge_final_state_snapshot(
 
     let working_log = repo.storage.working_log_for_base_commit(old_head)?;
     let observed_snapshot = working_log.observed_file_snapshot()?;
+
+    // Batch-read base (old_head) + target (new_head) content for every observed
+    // file in two git spawns instead of two spawns PER file.
+    let mut requests: Vec<(String, String)> = Vec::with_capacity(observed_snapshot.len() * 2);
+    for file_path in observed_snapshot.keys() {
+        requests.push((old_head.to_string(), file_path.clone()));
+        requests.push((new_head.to_string(), file_path.clone()));
+    }
+    let contents = batch_file_contents(repo, &requests)?;
+
     let mut final_state = HashMap::new();
     for (file_path, observed_content) in observed_snapshot {
-        let base_content = get_file_content_at_commit(repo, old_head, &file_path)?;
-        let target_content = get_file_content_at_commit(repo, new_head, &file_path)?;
+        let base_content = contents
+            .get(&(old_head.to_string(), file_path.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let target_content = contents
+            .get(&(new_head.to_string(), file_path.clone()))
+            .cloned()
+            .unwrap_or_default();
         let content =
             checkout_merge_rebased_content(&base_content, &target_content, &observed_content);
         final_state.insert(file_path, content);
@@ -1961,12 +2017,36 @@ fn build_carryover_snapshot(
         None => observed_snapshot.keys().cloned().collect(),
     };
 
+    // Batch-read committed (commit_sha) content for every file, plus parent
+    // (parent_sha) content for the files we may need to 3-way reconcile. Two
+    // git spawns total instead of up to ~2 per file.
+    let mut requests: Vec<(String, String)> = Vec::new();
+    for file_path in &file_paths {
+        requests.push((commit_sha.to_string(), file_path.clone()));
+        if parent_sha != "initial" && observed_snapshot.contains_key(file_path) {
+            requests.push((parent_sha.to_string(), file_path.clone()));
+        }
+    }
+    let contents = batch_file_contents(repo, &requests)?;
+
     let mut carryover_snapshot = HashMap::new();
     for file_path in file_paths {
+        let committed_content = contents
+            .get(&(commit_sha.to_string(), file_path.clone()))
+            .cloned()
+            .unwrap_or_default();
         let content = if let Some(observed_content) = observed_snapshot.get(&file_path) {
-            merged_carryover_content(repo, parent_sha, commit_sha, &file_path, observed_content)?
+            let parent_content = if parent_sha == "initial" {
+                String::new()
+            } else {
+                contents
+                    .get(&(parent_sha.to_string(), file_path.clone()))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            merged_carryover_content_pure(&parent_content, &committed_content, observed_content)
         } else {
-            get_file_content_at_commit(repo, commit_sha, &file_path)?
+            committed_content
         };
         carryover_snapshot.insert(file_path, content);
     }
@@ -1987,6 +2067,38 @@ impl VirtualAttributions {
         commit_sha: &str,
         pathspecs: Option<&HashSet<String>>,
         final_state_snapshot: Option<&HashMap<String, String>>,
+    ) -> Result<
+        (
+            crate::authorship::authorship_log_serialization::AuthorshipLog,
+            crate::git::repo_storage::InitialAttributions,
+            HashMap<String, String>,
+        ),
+        GitAiError,
+    > {
+        self.to_authorship_log_and_initial_working_log_with_precomputed_diff(
+            repo,
+            parent_sha,
+            commit_sha,
+            pathspecs,
+            final_state_snapshot,
+            None,
+        )
+    }
+
+    /// As [`Self::to_authorship_log_and_initial_working_log`], but accepts a
+    /// pre-computed parent→commit `DiffTreeResult` so a batched caller (e.g. the
+    /// rebase conflict-resolution driver) can supply renames + committed hunks
+    /// from a single batched `diff-tree` instead of this method spawning its own
+    /// per-commit `git diff` / `git diff-tree`. When `None`, behavior is
+    /// identical to the unbatched path (used by every single-commit caller).
+    pub(crate) fn to_authorship_log_and_initial_working_log_with_precomputed_diff(
+        &self,
+        repo: &Repository,
+        parent_sha: &str,
+        commit_sha: &str,
+        pathspecs: Option<&HashSet<String>>,
+        final_state_snapshot: Option<&HashMap<String, String>>,
+        precomputed_parent_diff: Option<&crate::authorship::rewrite::DiffTreeResult>,
     ) -> Result<
         (
             crate::authorship::authorship_log_serialization::AuthorshipLog,
@@ -2023,8 +2135,11 @@ impl VirtualAttributions {
         let mut initial_file_contents: StdHashMap<String, String> = StdHashMap::new();
 
         // Detect renames so we can look up committed hunks by new path when
-        // the working log references the old path.
-        let rename_map = if parent_sha != "initial" {
+        // the working log references the old path. A batched caller may supply
+        // the parent→commit diff (renames included); otherwise spawn per-commit.
+        let rename_map = if let Some(diff) = precomputed_parent_diff {
+            diff.renames.iter().cloned().collect()
+        } else if parent_sha != "initial" {
             detect_renames_in_commit(repo, parent_sha, commit_sha).unwrap_or_default()
         } else {
             HashMap::new()
@@ -2048,8 +2163,11 @@ impl VirtualAttributions {
         };
 
         // Get committed hunks (in commit coordinates) and unstaged hunks (in working directory coordinates)
-        let committed_hunks =
-            collect_committed_hunks(repo, parent_sha, commit_sha, effective_pathspecs)?;
+        let committed_hunks = if let Some(diff) = precomputed_parent_diff {
+            committed_hunks_from_diff_result(diff, effective_pathspecs)
+        } else {
+            collect_committed_hunks(repo, parent_sha, commit_sha, effective_pathspecs)?
+        };
         let carryover_snapshot = if let Some(snapshot) = final_state_snapshot {
             Some(build_carryover_snapshot(
                 repo,
@@ -3595,7 +3713,7 @@ mod tests {
                         _ => out.push_str(line),                                 // keep
                     }
                 }
-                if seed() % 3 == 0 {
+                if seed().is_multiple_of(3) {
                     out.push_str("tail\n");
                 }
                 out

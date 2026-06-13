@@ -124,6 +124,35 @@ pub(crate) fn post_commit_from_working_log_with_transform_and_options<F>(
 where
     F: FnOnce(AuthorshipLog) -> Result<AuthorshipLog, GitAiError>,
 {
+    post_commit_from_working_log_with_transform_options_and_diff(
+        repo,
+        base_commit,
+        commit_sha,
+        human_author,
+        options,
+        None,
+        transform,
+    )
+}
+
+/// As [`post_commit_from_working_log_with_transform_and_options`], but accepts a
+/// pre-computed parent→commit `DiffTreeResult`. A batched caller (the rebase
+/// conflict-resolution driver) computes every qualifying commit's parent→commit
+/// diff in ONE `diff-tree` and threads each result here, so this function makes
+/// no per-commit `git diff` / `git diff-tree` spawns. With `None` the behavior
+/// is identical to the unbatched single-commit path.
+pub(crate) fn post_commit_from_working_log_with_transform_options_and_diff<F>(
+    repo: &Repository,
+    base_commit: Option<String>,
+    commit_sha: String,
+    human_author: String,
+    options: PostCommitOptions,
+    precomputed_parent_diff: Option<&crate::authorship::rewrite::DiffTreeResult>,
+    transform: F,
+) -> Result<(String, AuthorshipLog), GitAiError>
+where
+    F: FnOnce(AuthorshipLog) -> Result<AuthorshipLog, GitAiError>,
+{
     // Use base_commit parameter if provided, otherwise use "initial" for empty repos
     // This matches the convention in checkpoint.rs
     let parent_sha = base_commit.unwrap_or_else(|| "initial".to_string());
@@ -162,12 +191,13 @@ where
     }
 
     let (mut authorship_log, initial_attributions, initial_file_contents) = working_va
-        .to_authorship_log_and_initial_working_log(
+        .to_authorship_log_and_initial_working_log_with_precomputed_diff(
             repo,
             &parent_sha,
             &commit_sha,
             Some(&pathspecs),
             Some(&observed_snapshot),
+            precomputed_parent_diff,
         )?;
 
     authorship_log.metadata.base_commit_sha = commit_sha.clone();
@@ -180,25 +210,40 @@ where
         crate::authorship::background_agent::BackgroundAgent::None
             | crate::authorship::background_agent::BackgroundAgent::WithHooks { .. }
     ) {
-        let diff_base = if parent_sha == "initial" {
-            "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        // Prefer the batched parent→commit diff when supplied (no extra spawn);
+        // otherwise fall back to a per-commit `git diff`.
+        let committed_hunks: Option<
+            HashMap<String, Vec<crate::authorship::authorship_log::LineRange>>,
+        > = if let Some(diff) = precomputed_parent_diff {
+            Some(
+                crate::authorship::virtual_attribution::committed_hunks_from_diff_result(
+                    diff, None,
+                ),
+            )
         } else {
-            &parent_sha
-        };
-        if let Ok(added_lines) = repo.diff_added_lines(diff_base, &commit_sha, None) {
-            let committed_hunks: HashMap<
-                String,
-                Vec<crate::authorship::authorship_log::LineRange>,
-            > = added_lines
-                .into_iter()
-                .filter(|(_, lines)| !lines.is_empty())
-                .map(|(path, lines)| {
-                    (
-                        path,
-                        crate::authorship::authorship_log::LineRange::compress_lines(&lines),
-                    )
+            let diff_base = if parent_sha == "initial" {
+                "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            } else {
+                &parent_sha
+            };
+            repo.diff_added_lines(diff_base, &commit_sha, None)
+                .ok()
+                .map(|added_lines| {
+                    added_lines
+                        .into_iter()
+                        .filter(|(_, lines)| !lines.is_empty())
+                        .map(|(path, lines)| {
+                            (
+                                path,
+                                crate::authorship::authorship_log::LineRange::compress_lines(
+                                    &lines,
+                                ),
+                            )
+                        })
+                        .collect()
                 })
-                .collect();
+        };
+        if let Some(committed_hunks) = committed_hunks {
             crate::authorship::background_agent::fill_unattributed_lines(
                 &mut authorship_log,
                 &committed_hunks,

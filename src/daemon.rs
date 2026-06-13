@@ -705,16 +705,40 @@ fn process_conflict_resolution_working_logs(
     let existing_notes = crate::git::notes_api::read_notes_batch(repo, &commit_shas)?;
     let author = repo.git_author_identity().formatted_or_unknown();
 
-    for (commit_sha, parent_sha) in commit_parent_pairs {
+    // Only commits whose rebased parent still has a working log incur
+    // attribution reconstruction; restrict the (expensive) parent->commit diffs
+    // to those. Compute ALL of them in ONE batched diff-tree so the per-commit
+    // loop below performs no per-commit git spawns.
+    let qualifying: Vec<&(String, String)> = commit_parent_pairs
+        .iter()
+        .filter(|(_, parent_sha)| repo.storage.has_working_log(parent_sha))
+        .collect();
+    let diff_pairs: Vec<(String, String)> = qualifying
+        .iter()
+        .map(|(commit_sha, parent_sha)| (parent_sha.clone(), commit_sha.clone()))
+        .collect();
+    let diff_results = if diff_pairs.is_empty() {
+        Vec::new()
+    } else {
+        crate::authorship::rewrite::compute_diff_trees_batch(repo, &diff_pairs)?
+    };
+    let diff_by_commit: HashMap<&str, &crate::authorship::rewrite::DiffTreeResult> = qualifying
+        .iter()
+        .zip(diff_results.iter())
+        .map(|((commit_sha, _), result)| (commit_sha.as_str(), result))
+        .collect();
+
+    for (commit_sha, parent_sha) in &commit_parent_pairs {
         let existing_shifted_log = existing_notes
-            .get(&commit_sha)
+            .get(commit_sha)
             .and_then(|raw| AuthorshipLog::deserialize_from_string(raw).ok());
         post_conflict_resolution_working_log(
             repo,
-            &parent_sha,
-            &commit_sha,
+            parent_sha,
+            commit_sha,
             author.clone(),
             existing_shifted_log,
+            diff_by_commit.get(commit_sha.as_str()).copied(),
         )?;
     }
     Ok(())
@@ -726,13 +750,14 @@ fn post_conflict_resolution_working_log(
     commit_sha: &str,
     author: String,
     existing_shifted_log: Option<AuthorshipLog>,
+    precomputed_parent_diff: Option<&crate::authorship::rewrite::DiffTreeResult>,
 ) -> Result<(), GitAiError> {
     if !repo.storage.has_working_log(parent_sha) {
         return Ok(());
     }
 
     let commit_for_transform = commit_sha.to_string();
-    crate::authorship::post_commit::post_commit_from_working_log_with_transform_and_options(
+    crate::authorship::post_commit::post_commit_from_working_log_with_transform_options_and_diff(
         repo,
         Some(parent_sha.to_string()),
         commit_sha.to_string(),
@@ -741,6 +766,7 @@ fn post_conflict_resolution_working_log(
             supress_output: true,
             compute_stats: false,
         },
+        precomputed_parent_diff,
         move |resolution_log| {
             Ok(
                 crate::authorship::conflict_resolution::merge_conflict_resolution_authorship(
@@ -1420,19 +1446,49 @@ fn apply_cherry_pick_complete_rewrite(
 
     let existing_notes = crate::git::notes_api::read_notes_batch(repo, new_commits)?;
     let author = repo.git_author_identity().formatted_or_unknown();
+
+    // The cherry-picked commits form a chain: each commit's parent is the
+    // previous one (the first's parent is original_head). Build the
+    // (commit, parent) pairs, then batch the parent->commit diffs for the
+    // commits that actually need reconstruction into ONE diff-tree so the loop
+    // performs no per-commit git spawns.
+    let mut commit_parent_pairs: Vec<(String, String)> = Vec::new();
     let mut parent = original_head.to_string();
     for commit_sha in new_commits {
+        commit_parent_pairs.push((commit_sha.clone(), parent.clone()));
+        parent = commit_sha.clone();
+    }
+    let qualifying: Vec<&(String, String)> = commit_parent_pairs
+        .iter()
+        .filter(|(_, parent_sha)| repo.storage.has_working_log(parent_sha))
+        .collect();
+    let diff_pairs: Vec<(String, String)> = qualifying
+        .iter()
+        .map(|(commit_sha, parent_sha)| (parent_sha.clone(), commit_sha.clone()))
+        .collect();
+    let diff_results = if diff_pairs.is_empty() {
+        Vec::new()
+    } else {
+        crate::authorship::rewrite::compute_diff_trees_batch(repo, &diff_pairs)?
+    };
+    let diff_by_commit: HashMap<&str, &crate::authorship::rewrite::DiffTreeResult> = qualifying
+        .iter()
+        .zip(diff_results.iter())
+        .map(|((commit_sha, _), result)| (commit_sha.as_str(), result))
+        .collect();
+
+    for (commit_sha, parent_sha) in &commit_parent_pairs {
         let existing_shifted_log = existing_notes
             .get(commit_sha)
             .and_then(|raw| AuthorshipLog::deserialize_from_string(raw).ok());
         post_conflict_resolution_working_log(
             repo,
-            &parent,
+            parent_sha,
             commit_sha,
             author.clone(),
             existing_shifted_log,
+            diff_by_commit.get(commit_sha.as_str()).copied(),
         )?;
-        parent = commit_sha.clone();
     }
 
     Ok(())
