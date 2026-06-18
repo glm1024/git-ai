@@ -24,7 +24,6 @@ use std::time::Instant;
 use tokio::sync::Notify;
 use tokio::time::{Duration, interval};
 
-const PROCESSING_TICK_INTERVAL: Duration = Duration::from_millis(100);
 const TRIGGERED_SWEEP_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Extract a Unix-epoch u32 timestamp from a raw JSON event's "timestamp" field.
@@ -270,11 +269,9 @@ impl StreamWorker {
 
         let sweep_enabled = config::Config::get().get_feature_flags().transcript_sweep;
 
-        let mut processing_ticker = interval(PROCESSING_TICK_INTERVAL);
         let mut sweep_ticker = interval(Duration::from_secs(30 * 60)); // NEW: 30 minutes
 
         // Skip the first immediate tick
-        processing_ticker.tick().await;
         sweep_ticker.tick().await;
 
         // Run initial sweep on startup
@@ -288,6 +285,21 @@ impl StreamWorker {
         }
 
         loop {
+            self.promote_ready_delayed_tasks(Instant::now());
+            let has_ready_task = !self.priority_queue.is_empty();
+            let next_retry_at = if has_ready_task {
+                None
+            } else {
+                self.next_delayed_task_at()
+            };
+            let retry_sleep = async {
+                if let Some(at) = next_retry_at {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+
             tokio::select! {
                 _ = self.shutdown_notify.notified() => {
                     tracing::info!("transcript worker received shutdown signal");
@@ -295,9 +307,10 @@ impl StreamWorker {
                     self.shutdown_flag.store(true, Ordering::Relaxed);
                     break;
                 }
-                _ = processing_ticker.tick() => {
+                _ = async {}, if has_ready_task => {
                     self.process_next_task().await;
                 }
+                _ = retry_sleep => {}
                 _ = sweep_ticker.tick() => {  // NEW: sweep ticker
                     if sweep_enabled
                         && self
@@ -328,6 +341,25 @@ impl StreamWorker {
         }
 
         tracing::info!("transcript worker shutdown complete");
+    }
+
+    fn promote_ready_delayed_tasks(&mut self, now: std::time::Instant) {
+        let mut i = 0;
+        while i < self.delayed_tasks.len() {
+            if self.delayed_tasks[i].next_retry_at.is_none_or(|t| now >= t) {
+                let task = self.delayed_tasks.swap_remove(i);
+                self.priority_queue.push(task);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn next_delayed_task_at(&self) -> Option<std::time::Instant> {
+        self.delayed_tasks
+            .iter()
+            .filter_map(|task| task.next_retry_at)
+            .min()
     }
 
     /// Run a sweep across all agents to discover new/behind sessions.
@@ -796,15 +828,7 @@ impl StreamWorker {
     async fn process_next_task(&mut self) {
         // Move any now-ready delayed tasks back to the priority queue
         let now = std::time::Instant::now();
-        let mut i = 0;
-        while i < self.delayed_tasks.len() {
-            if self.delayed_tasks[i].next_retry_at.is_none_or(|t| now >= t) {
-                let task = self.delayed_tasks.swap_remove(i);
-                self.priority_queue.push(task);
-            } else {
-                i += 1;
-            }
-        }
+        self.promote_ready_delayed_tasks(now);
 
         let Some(task) = self.priority_queue.pop() else {
             return;
@@ -1123,7 +1147,7 @@ impl StreamWorker {
                 let mut retried_task = task.clone();
                 retried_task.retry_count = retry_count;
                 retried_task.next_retry_at = Some(std::time::Instant::now() + delay);
-                self.priority_queue.push(retried_task);
+                self.delayed_tasks.push(retried_task);
             }
             StreamError::Parse { line, message } => {
                 // Parse errors are not retried
@@ -1294,6 +1318,131 @@ mod extract_event_timestamp_tests {
     fn test_empty_string() {
         let event = serde_json::json!({"timestamp": ""});
         assert_eq!(extract_event_timestamp(&event), None);
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_worker() -> (TempDir, StreamWorker, Arc<Notify>) {
+        let temp = TempDir::new().unwrap();
+        let db = Arc::new(StreamsDatabase::open(temp.path().join("streams.db")).unwrap());
+        let (_checkpoint_tx, checkpoint_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_sweep_tx, sweep_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let telemetry = DaemonTelemetryWorkerHandle::new_noop();
+        let sweep_trigger_gate = SweepTriggerGate::new();
+        assert!(sweep_trigger_gate.try_mark_sweep_at(Instant::now(), "test"));
+        let worker = StreamWorker::new(
+            db,
+            telemetry,
+            shutdown.clone(),
+            shutdown_flag,
+            checkpoint_rx,
+            sweep_rx,
+            sweep_trigger_gate,
+        );
+        (temp, worker, shutdown)
+    }
+
+    fn task(session_id: &str, next_retry_at: Option<std::time::Instant>) -> ProcessingTask {
+        ProcessingTask {
+            priority: Priority::Immediate,
+            session_id: session_id.to_string(),
+            stream_kind: "transcript".to_string(),
+            tool: "test".to_string(),
+            trace_id: None,
+            tool_use_id: None,
+            canonical_path: PathBuf::from(format!("/test/{session_id}")),
+            repo_work_dir: None,
+            retry_count: 0,
+            next_retry_at,
+        }
+    }
+
+    #[test]
+    fn promotes_only_ready_delayed_tasks() {
+        let (_temp, mut worker, _shutdown) = make_worker();
+        let now = std::time::Instant::now();
+        worker.delayed_tasks.push(task("ready", Some(now)));
+        worker
+            .delayed_tasks
+            .push(task("future", Some(now + Duration::from_secs(5))));
+
+        worker.promote_ready_delayed_tasks(now);
+
+        assert_eq!(worker.priority_queue.len(), 1);
+        assert_eq!(worker.priority_queue.peek().unwrap().session_id, "ready");
+        assert_eq!(worker.delayed_tasks.len(), 1);
+        assert_eq!(worker.delayed_tasks[0].session_id, "future");
+    }
+
+    #[test]
+    fn next_delayed_task_at_returns_earliest_retry_deadline() {
+        let (_temp, mut worker, _shutdown) = make_worker();
+        let now = std::time::Instant::now();
+        let later = now + Duration::from_secs(30);
+        let earlier = now + Duration::from_secs(5);
+        worker.delayed_tasks.push(task("later", Some(later)));
+        worker.delayed_tasks.push(task("earlier", Some(earlier)));
+
+        assert_eq!(worker.next_delayed_task_at(), Some(earlier));
+    }
+
+    #[tokio::test]
+    async fn transient_errors_are_stored_as_delayed_retries_not_ready_work() {
+        let (_temp, mut worker, _shutdown) = make_worker();
+
+        worker
+            .handle_processing_error(
+                task("retry", None),
+                StreamError::Transient {
+                    message: "temporary".to_string(),
+                    retry_after: Duration::from_secs(1),
+                },
+            )
+            .await;
+
+        assert!(worker.priority_queue.is_empty());
+        assert_eq!(worker.delayed_tasks.len(), 1);
+        assert_eq!(worker.delayed_tasks[0].session_id, "retry");
+        assert_eq!(worker.delayed_tasks[0].retry_count, 1);
+        assert!(worker.delayed_tasks[0].next_retry_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_idle_worker() {
+        let (_temp, worker, shutdown) = make_worker();
+        let handle = tokio::spawn(worker.run());
+        tokio::task::yield_now().await;
+
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("idle worker should exit promptly after shutdown notification")
+            .expect("worker task should not panic");
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_worker_sleeping_until_future_retry() {
+        let (_temp, mut worker, shutdown) = make_worker();
+        worker.delayed_tasks.push(task(
+            "future-retry",
+            Some(std::time::Instant::now() + Duration::from_secs(60 * 60)),
+        ));
+        let handle = tokio::spawn(worker.run());
+        tokio::task::yield_now().await;
+
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("retry-sleeping worker should exit promptly after shutdown notification")
+            .expect("worker task should not panic");
     }
 }
 
