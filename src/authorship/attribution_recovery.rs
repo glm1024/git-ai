@@ -16,6 +16,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BASH_RECOVERY_WINDOW_NS: u128 = 3_000_000_000;
+const BASH_RECOVERY_COARSE_TIMESTAMP_NS: u128 = 1_000_000_000;
 const EDGE_EXTENSION_MAX_LINES: usize = 3;
 
 pub(crate) fn recover_attribution(
@@ -360,8 +361,19 @@ fn recovery_distance_to_call_window(timestamp_ns: u128, call: &BashCheckpointCal
         .end_time_ns
         .unwrap_or_else(|| start.saturating_add(BASH_RECOVERY_WINDOW_NS));
 
-    if timestamp_ns < start || timestamp_ns > end {
+    if timestamp_ns > end {
         return None;
+    }
+
+    if timestamp_ns < start {
+        let start_skew_ns = start.saturating_sub(timestamp_ns);
+        // Low-resolution filesystems can truncate mtimes to whole seconds.
+        // Only grant start-side grace to timestamps that look truncated.
+        if start_skew_ns >= BASH_RECOVERY_COARSE_TIMESTAMP_NS
+            || timestamp_ns % BASH_RECOVERY_COARSE_TIMESTAMP_NS != 0
+        {
+            return None;
+        }
     }
 
     Some(distance_to_call_window(timestamp_ns, call))
@@ -802,6 +814,29 @@ mod tests {
             selection.is_none(),
             "nearby candidates outside their matching bash time range must not recover attribution"
         );
+    }
+
+    #[test]
+    fn bash_candidate_ranking_allows_coarse_timestamp_rounded_before_start() {
+        let candidates = vec![bash_call(
+            1,
+            "coarse-session",
+            "tool-coarse",
+            "/repo",
+            2_500_000_000,
+            Some(3_000_000_000),
+        )];
+
+        let selection = select_best_bash_candidate(
+            &candidates,
+            &[2_000_000_000],
+            &HashSet::new(),
+            "/repo",
+        )
+        .expect("expected coarse timestamp to match");
+
+        assert_eq!(selection.candidate.tool_use_id, "tool-coarse");
+        assert_eq!(selection.distance_ns, 500_000_000);
     }
 
     #[test]
