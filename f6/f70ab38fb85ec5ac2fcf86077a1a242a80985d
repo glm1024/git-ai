@@ -1,0 +1,34 @@
+agent-support/vscode/package.json
+  s_2d7dd0f8942b31::t_b42354ec0ff619 80-81
+agent-support/vscode/src/reporting/reporting-profile-service.ts
+  s_f53c033dc3a8f6::t_c8b9a770e4e8c3 198,209-210,212-214
+  s_f53c033dc3a8f6::t_0014604d19a7fd 211
+  s_f53c033dc3a8f6::t_5cb9355a39b7eb 215-216
+agent-support/vscode/media/git-ai-activity.svg
+  s_2d7dd0f8942b31::t_44d30f2a10444d 1-2
+  s_2d7dd0f8942b31::t_ca68a57dd73323 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "f6f70ab38fb85ec5ac2fcf86077a1a242a80985d",
+  "prompts": {},
+  "sessions": {
+    "s_2d7dd0f8942b31": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4bc3-bd50-78d1-80a9-4c2d64ad044e",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    },
+    "s_f53c033dc3a8f6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4cf4-aabb-7a13-8316-53676399853b",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
