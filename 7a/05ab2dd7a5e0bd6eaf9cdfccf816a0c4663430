@@ -1,0 +1,21 @@
+agent-support/intellij/.gitignore
+  s_2d5cbd44e27d33::t_e24f812dd71bea 8
+.gitignore
+  s_2d5cbd44e27d33::t_264d584d854c78 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "7a05ab2dd7a5e0bd6eaf9cdfccf816a0c4663430",
+  "prompts": {},
+  "sessions": {
+    "s_2d5cbd44e27d33": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "1470bd92-bd15-49b8-9cbd-2e831c22f2e6",
+        "model": "grok-4.5"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
