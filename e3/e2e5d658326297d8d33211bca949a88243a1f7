@@ -1,0 +1,86 @@
+src/commands/config.rs
+  s_2d7dd0f8942b31::t_2f241d5868bffe 983,1237-1243,1346-1352
+  s_2d7dd0f8942b31::t_957b49aa14ea3b 2,5-6,8,11-18,122,138,173,209-229
+  s_2d7dd0f8942b31::t_516abd59dcfbf8 444-455,484-512
+  s_2d7dd0f8942b31::t_cd2cb5db7b34bb 563-566,615
+  s_2d7dd0f8942b31::t_44ab301e9b34a2 824-832,973-982
+  s_2d7dd0f8942b31::t_32bbab718d32af 1697
+  s_2d7dd0f8942b31::t_d13bd325127fe3 513,1680-1696,1698-1726
+  s_2d7dd0f8942b31::t_7e26f527311e76 514,616
+agent-support/vscode/src/test/reporting-profile-utils.test.ts
+  s_2d7dd0f8942b31::t_0c07a120dbb0db 1-45,62-76
+  s_2d7dd0f8942b31::t_7873c22523b3df 46-61
+src/api/metrics.rs
+  s_2d7dd0f8942b31::t_78e60894a12bd3 19-20,22-24
+tests/integration/config_cli_coverage.rs
+  s_2d7dd0f8942b31::t_7e12dd50c86e89 259-263,278-298
+  s_2d7dd0f8942b31::t_044718c1ae1ac6 9,241-247,249-258,264-277,299,348,359-365
+  s_2d7dd0f8942b31::t_d4ffc2c5268aaa 248
+agent-support/vscode/src/reporting/reporting-profile-utils.ts
+  s_2d7dd0f8942b31::t_7873c22523b3df 61-65,75-93
+  s_2d7dd0f8942b31::t_195560351ce14d 1-60,66-74,94-235
+src/api/client.rs
+  s_2d7dd0f8942b31::t_78e60894a12bd3 238-240,243,249-250
+  s_2d7dd0f8942b31::t_fc2e0a09ddec02 246,251-260,447-454
+  s_2d7dd0f8942b31::t_ff02cff662858b 241-242,244-245,247-248
+  s_2d7dd0f8942b31::t_69127cd213d133 455
+agent-support/vscode/src/extension.ts
+  s_2d7dd0f8942b31::t_a5610b652b5e51 13-14,41-48
+  s_2d7dd0f8942b31::t_673f9548f1cf24 49
+src/daemon/rewrite_metrics.rs
+  s_2d7dd0f8942b31::t_4b0d894cd4b2ab 215
+agent-support/vscode/src/reporting/reporting-profile-service.ts
+  s_2d7dd0f8942b31::t_d5082ba5f590d9 1-237
+offline-dist/git-ai-offline-v1.6.12/INSTALL.md
+  s_2d7dd0f8942b31::t_242facd4be0899 155-172,179-185
+src/daemon/checkpoint.rs
+  s_2d7dd0f8942b31::t_4b0d894cd4b2ab 104,147
+src/commands/whoami.rs
+  s_2d7dd0f8942b31::t_b9b5625ba49654 221-223
+agent-support/vscode/media/git-ai-activity.svg
+  s_2d7dd0f8942b31::t_8fdda155f71a08 1-3
+src/api/logs.rs
+  s_2d7dd0f8942b31::t_78e60894a12bd3 9-12
+agent-support/vscode/package.json
+  s_2d7dd0f8942b31::t_242facd4be0899 5
+  s_2d7dd0f8942b31::t_8fdda155f71a08 57-60,74-92
+  s_2d7dd0f8942b31::t_b125b3ef34d653 56
+src/daemon/telemetry_worker.rs
+  s_2d7dd0f8942b31::t_78e60894a12bd3 548,577
+scripts/offline-build/package-offline-dist.sh
+  s_2d7dd0f8942b31::t_242facd4be0899 90,95
+agent-support/vscode/src/reporting/reporting-profile-view.ts
+  s_2d7dd0f8942b31::t_b187051cbc8084 1-256
+src/config.rs
+  s_2d7dd0f8942b31::t_f795c400dd3258 1938,1946-1947,2186,2194-2195,2337,2345-2346
+  s_2d7dd0f8942b31::t_9c6b64c4601da9 1149-1153,1215-1221,1335,1343-1344,1371,1379-1380
+  s_2d7dd0f8942b31::t_cb7e2ff3b1e750 1802-1807,1849-1852
+  s_2d7dd0f8942b31::t_9852ec7f733d58 614-630,766-773
+  s_2d7dd0f8942b31::t_8d09d8af3dd14f 83-137,230,239-241,309-310,325-326,392-395
+  s_2d7dd0f8942b31::t_d2eceeeb4d7b11 774,1860-1914
+  s_2d7dd0f8942b31::t_97d42cd1633bc8 775
+src/authorship/post_commit.rs
+  s_2d7dd0f8942b31::t_4b0d894cd4b2ab 1109
+src/commands/flush_metrics_db.rs
+  s_2d7dd0f8942b31::t_78e60894a12bd3 14
+agent-support/vscode/CHANGELOG.md
+  s_2d7dd0f8942b31::t_242facd4be0899 9-13
+agent-support/vscode/package-lock.json
+  s_2d7dd0f8942b31::t_184b485905345e 3,9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "e3e2e5d658326297d8d33211bca949a88243a1f7",
+  "prompts": {},
+  "sessions": {
+    "s_2d7dd0f8942b31": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4bc3-bd50-78d1-80a9-4c2d64ad044e",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
