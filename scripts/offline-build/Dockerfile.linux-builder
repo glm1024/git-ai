@@ -1,0 +1,17 @@
+ARG RUST_VERSION=1.93.0
+FROM rust:${RUST_VERSION}-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        file \
+        musl-tools \
+        perl \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add \
+        aarch64-unknown-linux-musl \
+        x86_64-unknown-linux-musl
+

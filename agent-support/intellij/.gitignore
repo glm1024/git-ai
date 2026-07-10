@@ -5,4 +5,5 @@
 .kotlin
 .qodana
 .sandbox
+bin
 build
