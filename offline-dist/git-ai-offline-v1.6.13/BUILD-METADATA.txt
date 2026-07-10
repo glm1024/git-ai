@@ -1,0 +1,6 @@
+source_commit=e3e2e5d658326297d8d33211bca949a88243a1f7
+source_dirty=true
+cli_version=1.6.13
+vscode_version=0.1.23
+jetbrains_version=0.1.12
+built_at_utc=2026-07-10T17:22:45Z

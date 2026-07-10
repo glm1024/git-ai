@@ -77,7 +77,8 @@
         {
           "id": "git-ai",
           "title": "Git AI",
-          "icon": "media/git-ai-activity.svg"
+        "icon": "media/git-ai-activity-light.png",
+        "darkIcon": "media/git-ai-activity-dark.png"
         }
       ]
     },

@@ -195,7 +195,7 @@ export class ReportingProfileService {
         if (code === 0) {
           resolve(stdout.trim());
         } else {
-          reject(new Error((stderr || stdout || `Git AI CLI 退出码 ${code}`).trim()));
+          reject(new Error(formatCliError(stderr || stdout || `Git AI CLI 退出码 ${code}`)));
         }
       });
       if (input !== undefined) {
@@ -204,6 +204,14 @@ export class ReportingProfileService {
       child.stdin.end();
     });
   }
+}
+
+function formatCliError(message: string): string {
+  const normalized = message.trim();
+  if (/Unknown config key:\s*reporting[-_]profile/.test(normalized)) {
+    return "当前 Git AI CLI 版本不支持数据上报配置，请升级到 1.6.13 或更高版本，然后重启 VS Code。";
+  }
+  return normalized;
 }
 
 function importedMissingFields(saved: ReportingSettings, kilo: ReportingSettings): string[] {
