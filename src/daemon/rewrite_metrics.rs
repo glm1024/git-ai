@@ -212,7 +212,7 @@ fn rewrite_metric_repo_url(repo: &Repository) -> Option<String> {
 
 fn rewrite_metric_custom_attributes_json() -> Option<String> {
     let config = Config::fresh();
-    let attrs = config.custom_attributes();
+    let attrs = config.metrics_custom_attributes();
     if attrs.is_empty() {
         None
     } else {

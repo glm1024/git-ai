@@ -1106,7 +1106,7 @@ pub(crate) fn commit_metric_attrs(
         attrs = attrs.branch(short_branch);
     }
 
-    attrs.custom_attributes_map(Config::fresh().custom_attributes())
+    attrs.custom_attributes_map(Config::fresh().metrics_custom_attributes())
 }
 
 /// Record metrics for a committed change.

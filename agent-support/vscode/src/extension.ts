@@ -10,6 +10,8 @@ import { Config } from "./utils/config";
 import { BlameLensManager, registerBlameLensCommands } from "./blame-lens-manager";
 import { initBinaryResolver } from "./utils/binary-path";
 import { KnownHumanCheckpointManager } from "./known-human-checkpoint-manager";
+import { ReportingProfileService } from "./reporting/reporting-profile-service";
+import { ReportingProfileViewProvider, REPORTING_PROFILE_VIEW_ID } from "./reporting/reporting-profile-view";
 
 function getDistinctId(): string {
   try {
@@ -35,6 +37,15 @@ export function activate(context: vscode.ExtensionContext) {
 
   // In dev mode, resolve git-ai binary via login shell (debug host has stripped PATH)
   initBinaryResolver(context.extensionMode);
+
+  const reportingProfileView = new ReportingProfileViewProvider(new ReportingProfileService(context));
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(REPORTING_PROFILE_VIEW_ID, reportingProfileView),
+    vscode.commands.registerCommand("git-ai.openReportingSettings", async () => {
+      await vscode.commands.executeCommand("workbench.view.extension.git-ai");
+      await reportingProfileView.reveal();
+    }),
+  );
 
   const ideHostCfg = detectIDEHost();
 

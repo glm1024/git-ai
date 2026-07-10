@@ -152,13 +152,37 @@ git ai install-hooks --verbose
 
 
 
+## 新增或更换 Agent
+
+首次运行 `install.sh` 或 `install.ps1` 时，安装脚本会自动执行一次 `install-hooks`。
+
+后续如果新增或更换 Agent，例如新增 Cursor、Gemini 或其他支持的 Agent，不需要重新运行安装脚本，也不需要重新安装 CLI。只需在对应平台的普通用户终端执行：
+
+```bash
+git ai install-hooks --verbose
+```
+
+Windows PowerShell 中执行同一条命令：
+
+```powershell
+git ai install-hooks --verbose
+```
+
+只有在 CLI 二进制本身需要更新，或需要更换本地离线包时，才重新设置 `GIT_AI_LOCAL_BINARY` 并运行安装脚本。
+
 ## IDE 插件安装
 
 先完成对应平台的 CLI 安装，再安装 IDE 插件。插件安装不替代 CLI。
 
 ### VS Code
 
-安装 vscode 插件
+在 VS Code 或 Cursor 的 Extensions 面板选择“Install from VSIX...”，并安装离线包内的 `vscode/` 文件。
+
+安装后打开左侧 Activity Bar 中的 **Git AI**，进入“数据上报”：
+
+- 页面会只读取本机 Kilo 的已有设置，用来补齐 Git AI 中尚未填写的字段；不会覆盖 Git AI 已保存的信息，也不会改写 Kilo。
+- 选择或修改上报服务器后，部门、处、组下拉项会从该服务器加载。组织架构调整后，重新打开本页即可获得最新选项。
+- 点击“保存”后，组织和人员信息只随 Git AI 指标上报；不会写入 Git Notes，也不会改变 Git AI 登录、更新或诊断服务地址。
 
 ### JetBrains IDE
 
@@ -244,4 +268,3 @@ IDE 插件需要分别在 VS Code/Cursor 的 Extensions 面板或 JetBrains 的 
 - IDE 已安装插件但没有行级展示：先确认 CLI 可执行，再确认 IDE 已重启，并确认当前打开的是 Git 仓库内的文件。
 - Windows 上出现 daemon lock 或后台服务异常：先关闭 IDE/Agent，结束残留 `git-ai` 进程，再执行 `git ai install-hooks --verbose` 并重启 IDE/Agent。
 - 多人共用 Linux 账号时统计归属混乱：为每个开发者分配独立 OS 用户和独立 `$HOME`，不要只依赖 Git 提交作者名区分本地 Git AI 状态。
-

@@ -1,9 +1,20 @@
 use dirs;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read;
+use url::Url;
 
-use crate::config::{AuthorConfig, CodexHooksFormat, NotesBackendKind};
+use crate::config::{AuthorConfig, CodexHooksFormat, NotesBackendKind, ReportingProfile};
 use crate::git::repository::find_repository_in_path;
+
+const METRICS_UPLOAD_PATH: &str = "/worker/metrics/upload";
+
+#[derive(Debug, Deserialize)]
+struct ReportingProfilePayload {
+    metrics_api_base_url: String,
+    reporting_profile: ReportingProfile,
+}
 
 /// Determines the type of pattern value provided
 #[derive(Debug, PartialEq)]
@@ -108,6 +119,7 @@ fn print_config_help() {
     println!("  update_channel               Update channel (latest/next)");
     println!("  feature_flags                Feature flags (object)");
     println!("  api_base_url                 API base URL (default: https://usegitai.com)");
+    println!("  metrics_api_base_url         Enterprise metrics base URL (metrics only)");
     println!("  api_key                      API key for X-API-Key header");
     println!("  author.name                  git-ai author display name override");
     println!("  author.email                 git-ai author email override");
@@ -123,6 +135,7 @@ fn print_config_help() {
     println!("  max_checkpoint_total_size_bytes     Per-checkpoint content limit in bytes");
     println!("  max_checkpoint_total_lines          Per-checkpoint content limit in lines");
     println!("  custom_attributes            Custom telemetry attributes, string->string (object)");
+    println!("  reporting_profile            Enterprise metrics identity (object)");
     println!("  git_ai_hooks                 Hook name -> shell commands map (object)");
     println!("  codex_hooks_format           Codex hook install format (config_toml/hooks_json)");
     println!("  notes_backend.kind           Notes backend kind (git_notes/http)");
@@ -157,6 +170,7 @@ fn print_config_help() {
     println!("  git-ai config set allow_superuser true");
     println!("  git-ai config set transcript_streaming_lookback_days 1");
     println!("  git-ai config set custom_attributes '{{\"team\":\"platform\"}}'");
+    println!("  git-ai config reporting-profile set --stdin");
     println!("  git-ai config --add custom_attributes.team platform");
     println!("  git-ai config unset exclude_repositories");
     println!();
@@ -192,6 +206,27 @@ pub fn handle_config(args: &[String]) {
     }
 
     match filtered_args[0].as_str() {
+        "reporting-profile" => {
+            if filtered_args.len() == 1 {
+                if let Err(e) = show_reporting_profile() {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                return;
+            }
+            if filtered_args.len() == 3
+                && filtered_args[1] == "set"
+                && filtered_args[2] == "--stdin"
+            {
+                if let Err(e) = set_reporting_profile_from_stdin() {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                return;
+            }
+            eprintln!("Error: Usage: git-ai config reporting-profile [set --stdin]");
+            std::process::exit(1);
+        }
         "set" => {
             if filtered_args.len() < 3 {
                 eprintln!("Error: set requires <key> <value>");
@@ -406,6 +441,18 @@ fn show_all_config() -> Result<(), String> {
         "api_base_url".to_string(),
         Value::String(runtime_config.api_base_url().to_string()),
     );
+    effective_config.insert(
+        "metrics_api_base_url".to_string(),
+        runtime_config
+            .metrics_api_base_url()
+            .map(|value| Value::String(value.to_string()))
+            .unwrap_or(Value::Null),
+    );
+    effective_config.insert(
+        "reporting_profile".to_string(),
+        serde_json::to_value(runtime_config.reporting_profile())
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+    );
 
     // API key - show masked value if set
     if let Some(ref key) = file_config.api_key {
@@ -432,6 +479,37 @@ fn show_all_config() -> Result<(), String> {
 
     println!("{}", json);
     Ok(())
+}
+
+fn show_reporting_profile() -> Result<(), String> {
+    let file_config = crate::config::load_file_config_public()?;
+    let payload = serde_json::json!({
+        "metrics_api_base_url": file_config.metrics_api_base_url,
+        "reporting_profile": file_config.reporting_profile.unwrap_or_default().normalized(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|e| format!("Failed to serialize reporting profile: {}", e))?
+    );
+    Ok(())
+}
+
+fn set_reporting_profile_from_stdin() -> Result<(), String> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| format!("Failed to read reporting profile from stdin: {}", e))?;
+    let payload: ReportingProfilePayload = serde_json::from_str(&input)
+        .map_err(|e| format!("Invalid reporting profile JSON: {}", e))?;
+    let metrics_api_base_url = parse_metrics_api_base_url(&payload.metrics_api_base_url)?;
+    let reporting_profile = validate_reporting_profile(payload.reporting_profile)?;
+
+    let mut file_config = crate::config::load_file_config_public()?;
+    file_config.metrics_api_base_url = Some(metrics_api_base_url);
+    file_config.reporting_profile = Some(reporting_profile);
+    crate::config::save_file_config(&file_config)?;
+    show_reporting_profile()
 }
 
 fn get_config_value(key: &str) -> Result<(), String> {
@@ -482,6 +560,10 @@ fn get_config_value(key: &str) -> Result<(), String> {
                     .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
             }
             "api_base_url" => Value::String(runtime_config.api_base_url().to_string()),
+            "metrics_api_base_url" => runtime_config
+                .metrics_api_base_url()
+                .map(|value| Value::String(value.to_string()))
+                .unwrap_or(Value::Null),
             "api_key" => {
                 if let Some(ref key) = file_config.api_key {
                     Value::String(mask_api_key(key))
@@ -529,6 +611,8 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 Value::Number(runtime_config.max_checkpoint_total_lines().into())
             }
             "custom_attributes" => serde_json::to_value(runtime_config.custom_attributes())
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+            "reporting_profile" => serde_json::to_value(runtime_config.reporting_profile())
                 .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
             "notes_backend" => {
                 let nb = runtime_config.notes_backend();
@@ -737,6 +821,15 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 crate::config::save_file_config(&file_config)?;
                 println!("[api_base_url]: {}", value);
             }
+            "metrics_api_base_url" => {
+                if add_mode {
+                    return Err("Cannot use --add with metrics_api_base_url".to_string());
+                }
+                let normalized = parse_metrics_api_base_url(value)?;
+                file_config.metrics_api_base_url = Some(normalized.clone());
+                crate::config::save_file_config(&file_config)?;
+                println!("[metrics_api_base_url]: {}", normalized);
+            }
             "api_key" => {
                 file_config.api_key = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
@@ -876,6 +969,17 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 file_config.custom_attributes = if attrs.is_empty() { None } else { Some(attrs) };
                 crate::config::save_file_config(&file_config)?;
                 println!("[custom_attributes]: {}", value);
+            }
+            "reporting_profile" => {
+                if add_mode {
+                    return Err("Cannot use --add with reporting_profile".to_string());
+                }
+                let profile: ReportingProfile = serde_json::from_str(value)
+                    .map_err(|e| format!("Invalid JSON for reporting_profile: {}", e))?;
+                let profile = validate_reporting_profile(profile)?;
+                file_config.reporting_profile = Some(profile);
+                crate::config::save_file_config(&file_config)?;
+                println!("[reporting_profile]: updated");
             }
             _ => return Err(format!("Unknown config key: {}", key)),
         }
@@ -1130,6 +1234,13 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                     println!("- [api_base_url]: {}", v);
                 }
             }
+            "metrics_api_base_url" => {
+                let old_value = file_config.metrics_api_base_url.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    println!("- [metrics_api_base_url]: {}", v);
+                }
+            }
             "api_key" => {
                 let old_value = file_config.api_key.take();
                 crate::config::save_file_config(&file_config)?;
@@ -1230,6 +1341,13 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                 crate::config::save_file_config(&file_config)?;
                 if let Some(v) = old_value {
                     println!("- [custom_attributes]: {:?}", v);
+                }
+            }
+            "reporting_profile" => {
+                let old_value = file_config.reporting_profile.take();
+                crate::config::save_file_config(&file_config)?;
+                if old_value.is_some() {
+                    println!("- [reporting_profile]: removed");
                 }
             }
             _ => return Err(format!("Unknown config key: {}", key)),
@@ -1557,6 +1675,53 @@ fn parse_custom_attributes_object(value: &str) -> Result<HashMap<String, String>
         attrs.insert(name.to_string(), coerced);
     }
     Ok(attrs)
+}
+
+fn parse_metrics_api_base_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("metrics_api_base_url cannot be empty".to_string());
+    }
+    let mut url = Url::parse(trimmed)
+        .map_err(|e| format!("metrics_api_base_url is not a valid URL: {}", e))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("metrics_api_base_url must use http:// or https://".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("metrics_api_base_url must not include user credentials".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("metrics_api_base_url must not include a query or fragment".to_string());
+    }
+
+    let path = url.path().trim_end_matches('/').to_string();
+    if let Some(prefix) = path.strip_suffix(METRICS_UPLOAD_PATH) {
+        url.set_path(if prefix.is_empty() { "/" } else { prefix });
+    }
+    let normalized = url.as_str().trim_end_matches('/').to_string();
+    Ok(normalized)
+}
+
+fn validate_reporting_profile(profile: ReportingProfile) -> Result<ReportingProfile, String> {
+    let profile = profile.normalized();
+    for (field, value) in [
+        ("department_name", profile.department_name.as_deref()),
+        ("office_name", profile.office_name.as_deref()),
+        ("user_name", profile.user_name.as_deref()),
+        ("user_email", profile.user_email.as_deref()),
+    ] {
+        if value.is_none() {
+            return Err(format!("reporting_profile.{} is required", field));
+        }
+    }
+    let email = profile.user_email.as_deref().unwrap_or_default();
+    let valid_email = email.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty() && domain.contains('.') && !domain.ends_with('.')
+    });
+    if !valid_email {
+        return Err("reporting_profile.user_email must be a valid email address".to_string());
+    }
+    Ok(profile)
 }
 
 fn parse_hook_command_values(value: &str) -> Result<Vec<String>, String> {

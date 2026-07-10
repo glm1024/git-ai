@@ -235,6 +235,29 @@ impl ApiContext {
         }
     }
 
+    /// Create the context used exclusively for metrics delivery.
+    ///
+    /// Enterprise reporting may target an internal server without changing the
+    /// base URL used by authentication, CAS, diagnostics, or updates. Do not
+    /// forward Git AI OAuth/API-key credentials to that independent server.
+    pub fn for_metrics() -> Self {
+        let cfg = config::Config::fresh();
+        if cfg.has_dedicated_metrics_api_base_url() {
+            return Self::anonymous_metrics(cfg.metrics_base_url().to_string());
+        }
+        Self::new(None)
+    }
+
+    fn anonymous_metrics(base_url: String) -> Self {
+        Self {
+            base_url,
+            auth_token: None,
+            api_key: None,
+            author_identity: None,
+            timeout_secs: Some(30),
+        }
+    }
+
     /// Create a new API context explicitly without authentication
     /// Use this when you need to ensure no auth token is sent
     /// Uses Config::fresh() to support runtime config updates (daemon mode)
@@ -419,6 +442,15 @@ mod tests {
     fn test_api_context_default_timeout() {
         let ctx = ApiContext::without_auth(Some("https://example.com".to_string()));
         assert_eq!(ctx.timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn test_enterprise_metrics_context_never_has_git_ai_credentials() {
+        let ctx = ApiContext::anonymous_metrics("https://metrics.example.com/prod-api".to_string());
+        assert_eq!(ctx.base_url, "https://metrics.example.com/prod-api");
+        assert!(ctx.auth_token.is_none());
+        assert!(ctx.api_key.is_none());
+        assert!(ctx.author_identity.is_none());
     }
 
     // ============= ApiClient Tests =============

@@ -80,6 +80,61 @@ impl AuthorConfig {
     }
 }
 
+/// Enterprise reporting identity attached to metrics events only.
+///
+/// This deliberately stays separate from `custom_attributes`: the latter is
+/// also persisted into authorship Git Notes, while organization and corporate
+/// contact information must only travel with metrics delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReportingProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub department_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub office_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_email: Option<String>,
+}
+
+impl ReportingProfile {
+    pub fn normalized(mut self) -> Self {
+        self.department_name = normalize_optional_string(self.department_name);
+        self.office_name = normalize_optional_string(self.office_name);
+        self.team_name = normalize_optional_string(self.team_name);
+        self.user_name = normalize_optional_string(self.user_name);
+        self.user_email =
+            normalize_optional_string(self.user_email).map(|email| email.to_lowercase());
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.department_name.is_none()
+            && self.office_name.is_none()
+            && self.team_name.is_none()
+            && self.user_name.is_none()
+            && self.user_email.is_none()
+    }
+
+    pub fn apply_to_metrics_attributes(&self, attributes: &mut HashMap<String, String>) {
+        for (key, value) in [
+            ("department_name", self.department_name.as_deref()),
+            ("office_name", self.office_name.as_deref()),
+            ("team_name", self.team_name.as_deref()),
+            ("user_name", self.user_name.as_deref()),
+            ("user_email", self.user_email.as_deref()),
+        ] {
+            if let Some(value) = value {
+                attributes.insert(key.to_string(), value.to_string());
+            } else {
+                attributes.remove(key);
+            }
+        }
+    }
+}
+
 /// Which Codex hook file git-ai should use when installing Codex hooks.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +227,7 @@ pub struct Config {
     update_channel: UpdateChannel,
     feature_flags: FeatureFlags,
     api_base_url: String,
+    metrics_api_base_url: Option<String>,
     prompt_storage: String,
     default_prompt_storage: Option<String>,
     #[serde(serialize_with = "serialize_masked_api_key")]
@@ -180,6 +236,9 @@ pub struct Config {
     allow_superuser: bool,
     author: AuthorConfig,
     custom_attributes: HashMap<String, String>,
+    reporting_profile: ReportingProfile,
+    #[serde(skip)]
+    metrics_custom_attributes: HashMap<String, String>,
     git_ai_hooks: HashMap<String, Vec<String>>,
     codex_hooks_format: CodexHooksFormat,
     notes_backend: NotesBackendConfig,
@@ -247,6 +306,8 @@ pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_storage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_prompt_storage: Option<String>,
@@ -260,6 +321,8 @@ pub struct FileConfig {
     pub author: Option<AuthorConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporting_profile: Option<ReportingProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ai_hooks: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +388,10 @@ pub struct ConfigPatch {
     pub author: Option<AuthorConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporting_profile: Option<ReportingProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feature_flags: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -544,6 +611,23 @@ impl Config {
         &self.api_base_url
     }
 
+    /// Returns the dedicated enterprise metrics base URL when configured.
+    /// Other Git AI HTTP APIs must continue using `api_base_url`.
+    pub fn metrics_api_base_url(&self) -> Option<&str> {
+        self.metrics_api_base_url.as_deref()
+    }
+
+    /// Returns the endpoint base used exclusively for metrics delivery.
+    pub fn metrics_base_url(&self) -> &str {
+        self.metrics_api_base_url
+            .as_deref()
+            .unwrap_or(&self.api_base_url)
+    }
+
+    pub fn has_dedicated_metrics_api_base_url(&self) -> bool {
+        self.metrics_api_base_url.is_some()
+    }
+
     /// Returns the prompt storage mode: "default", "notes", or "local"
     /// - "default": Messages uploaded via CAS API
     /// - "notes": Messages stored in git notes
@@ -677,6 +761,16 @@ impl Config {
     /// Returns the custom attributes map (from config file + env var override).
     pub fn custom_attributes(&self) -> &HashMap<String, String> {
         &self.custom_attributes
+    }
+
+    /// Returns custom attributes for metrics only. Reporting profile values
+    /// override the reserved organization keys without leaking into Git Notes.
+    pub fn metrics_custom_attributes(&self) -> &HashMap<String, String> {
+        &self.metrics_custom_attributes
+    }
+
+    pub fn reporting_profile(&self) -> &ReportingProfile {
+        &self.reporting_profile
     }
 
     /// Returns all configured git-ai hook commands.
@@ -1052,6 +1146,11 @@ fn build_config() -> Config {
         .or_else(|| env::var("GIT_AI_API_BASE_URL").ok())
         .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string());
 
+    let metrics_api_base_url = file_cfg
+        .as_ref()
+        .and_then(|c| c.metrics_api_base_url.clone())
+        .and_then(|value| normalize_optional_string(Some(value)));
+
     // Get prompt_storage setting (defaults to "default")
     // Valid values: "default", "notes", "local"
     let prompt_storage = file_cfg
@@ -1113,6 +1212,13 @@ fn build_config() -> Config {
 
     // Build custom attributes: file config as base, env var overrides
     let custom_attributes = build_custom_attributes(&file_cfg);
+    let reporting_profile = file_cfg
+        .as_ref()
+        .and_then(|c| c.reporting_profile.clone())
+        .unwrap_or_default()
+        .normalized();
+    let mut metrics_custom_attributes = custom_attributes.clone();
+    reporting_profile.apply_to_metrics_attributes(&mut metrics_custom_attributes);
 
     let git_ai_hooks = file_cfg
         .as_ref()
@@ -1226,6 +1332,7 @@ fn build_config() -> Config {
             update_channel,
             feature_flags,
             api_base_url,
+            metrics_api_base_url,
             prompt_storage,
             default_prompt_storage,
             api_key,
@@ -1233,6 +1340,8 @@ fn build_config() -> Config {
             allow_superuser,
             author,
             custom_attributes: custom_attributes.clone(),
+            reporting_profile,
+            metrics_custom_attributes,
             git_ai_hooks: git_ai_hooks.clone(),
             codex_hooks_format,
             notes_backend,
@@ -1259,6 +1368,7 @@ fn build_config() -> Config {
         update_channel,
         feature_flags,
         api_base_url,
+        metrics_api_base_url,
         prompt_storage,
         default_prompt_storage,
         api_key,
@@ -1266,6 +1376,8 @@ fn build_config() -> Config {
         allow_superuser,
         author,
         custom_attributes,
+        reporting_profile,
+        metrics_custom_attributes,
         git_ai_hooks,
         codex_hooks_format,
         notes_backend,
@@ -1687,6 +1799,12 @@ fn apply_test_config_patch(config: &mut Config) {
         if let Some(custom_attributes) = patch.custom_attributes {
             config.custom_attributes = custom_attributes;
         }
+        if let Some(reporting_profile) = patch.reporting_profile {
+            config.reporting_profile = reporting_profile.normalized();
+        }
+        if let Some(metrics_api_base_url) = patch.metrics_api_base_url {
+            config.metrics_api_base_url = normalize_optional_string(Some(metrics_api_base_url));
+        }
         if let Some(author) = patch.author {
             config.author = author.normalized();
         }
@@ -1728,12 +1846,71 @@ fn apply_test_config_patch(config: &mut Config) {
         if let Some(max_lines) = patch.max_checkpoint_total_lines {
             config.max_checkpoint_total_lines = max_lines;
         }
+        config.metrics_custom_attributes = config.custom_attributes.clone();
+        config
+            .reporting_profile
+            .apply_to_metrics_attributes(&mut config.metrics_custom_attributes);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reporting_profile_is_metrics_only_and_overrides_reserved_attribute_keys() {
+        let profile = ReportingProfile {
+            department_name: Some(" 云计算研发部 ".to_string()),
+            office_name: Some("研发四处".to_string()),
+            team_name: Some("研发一组".to_string()),
+            user_name: Some(" 郭立民 ".to_string()),
+            user_email: Some(" GUOLIMIN.LC@INSPUR.COM ".to_string()),
+        }
+        .normalized();
+        let mut attributes = HashMap::from([
+            ("department_name".to_string(), "旧部门".to_string()),
+            ("environment".to_string(), "pilot".to_string()),
+        ]);
+
+        profile.apply_to_metrics_attributes(&mut attributes);
+
+        assert_eq!(
+            attributes.get("department_name"),
+            Some(&"云计算研发部".to_string())
+        );
+        assert_eq!(attributes.get("office_name"), Some(&"研发四处".to_string()));
+        assert_eq!(attributes.get("team_name"), Some(&"研发一组".to_string()));
+        assert_eq!(attributes.get("user_name"), Some(&"郭立民".to_string()));
+        assert_eq!(
+            attributes.get("user_email"),
+            Some(&"guolimin.lc@inspur.com".to_string())
+        );
+        assert_eq!(attributes.get("environment"), Some(&"pilot".to_string()));
+    }
+
+    #[test]
+    fn reporting_profile_omits_blank_and_absent_fields_from_metrics_attributes() {
+        let profile = ReportingProfile {
+            department_name: Some("研发部".to_string()),
+            office_name: Some("研发一处".to_string()),
+            team_name: Some("  ".to_string()),
+            user_name: None,
+            user_email: None,
+        }
+        .normalized();
+        let mut attributes = HashMap::new();
+
+        profile.apply_to_metrics_attributes(&mut attributes);
+
+        assert_eq!(
+            attributes.get("department_name"),
+            Some(&"研发部".to_string())
+        );
+        assert_eq!(attributes.get("office_name"), Some(&"研发一处".to_string()));
+        assert!(!attributes.contains_key("team_name"));
+        assert!(!attributes.contains_key("user_name"));
+        assert!(!attributes.contains_key("user_email"));
+    }
 
     fn create_test_config(
         allow_repositories: Vec<String>,
@@ -1758,6 +1935,7 @@ mod tests {
             update_channel: UpdateChannel::Latest,
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            metrics_api_base_url: None,
             prompt_storage: "default".to_string(),
             default_prompt_storage: None,
             api_key: None,
@@ -1765,6 +1943,8 @@ mod tests {
             allow_superuser: false,
             author: AuthorConfig::default(),
             custom_attributes: HashMap::new(),
+            reporting_profile: ReportingProfile::default(),
+            metrics_custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
             codex_hooks_format: CodexHooksFormat::ConfigToml,
             notes_backend: NotesBackendConfig::default(),
@@ -2003,6 +2183,7 @@ mod tests {
             update_channel: UpdateChannel::Latest,
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            metrics_api_base_url: None,
             prompt_storage: "default".to_string(),
             default_prompt_storage: None,
             api_key: None,
@@ -2010,6 +2191,8 @@ mod tests {
             allow_superuser: false,
             author: AuthorConfig::default(),
             custom_attributes: HashMap::new(),
+            reporting_profile: ReportingProfile::default(),
+            metrics_custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
             codex_hooks_format: CodexHooksFormat::ConfigToml,
             notes_backend: NotesBackendConfig::default(),
@@ -2151,6 +2334,7 @@ mod tests {
             update_channel: UpdateChannel::Latest,
             feature_flags: FeatureFlags::default(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            metrics_api_base_url: None,
             prompt_storage: prompt_storage.to_string(),
             default_prompt_storage: default_prompt_storage.map(|s| s.to_string()),
             api_key: None,
@@ -2158,6 +2342,8 @@ mod tests {
             allow_superuser: false,
             author: AuthorConfig::default(),
             custom_attributes: HashMap::new(),
+            reporting_profile: ReportingProfile::default(),
+            metrics_custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
             codex_hooks_format: CodexHooksFormat::ConfigToml,
             notes_backend: NotesBackendConfig::default(),

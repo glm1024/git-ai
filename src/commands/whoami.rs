@@ -218,6 +218,9 @@ fn login_status(auth: &AuthStatus, api_client: &ApiClient) -> String {
 }
 
 fn metrics_delivery_status(api_base_url: &str, api_client: &ApiClient) -> String {
+    if let Some(metrics_url) = config::Config::fresh().metrics_api_base_url() {
+        return format!("on (enterprise reporting: {})", metrics_url);
+    }
     if !metrics_upload_allowed(api_base_url, api_client) {
         return "off (requires an API key or login)".to_string();
     }

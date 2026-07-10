@@ -16,11 +16,12 @@ static LAST_METRICS_UPLOAD_STARTED_AT: OnceLock<Mutex<Option<Instant>>> = OnceLo
 
 /// Returns whether metrics are allowed to upload for the current API context.
 ///
-/// The server always requires authentication (API key or OAuth login).
-/// Without credentials the request will be rejected with 401, so we skip
-/// the upload entirely to avoid wasteful retries and memory pressure.
+/// Hosted metrics require authentication. An explicitly configured enterprise
+/// metrics URL is an opt-in local deployment and may accept anonymous uploads.
 pub fn metrics_upload_allowed(_api_base_url: &str, client: &ApiClient) -> bool {
-    client.is_logged_in() || client.has_api_key()
+    crate::config::Config::fresh().has_dedicated_metrics_api_base_url()
+        || client.is_logged_in()
+        || client.has_api_key()
 }
 
 fn wait_for_metrics_upload_rate_limit() -> Result<(), GitAiError> {

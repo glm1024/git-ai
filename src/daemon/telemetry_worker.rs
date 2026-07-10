@@ -545,7 +545,7 @@ fn flush_telemetry_batch(batch: TelemetryBuffer, daemon_id: &str) -> Vec<DaemonL
 }
 
 fn flush_metrics(events: &[MetricEvent]) {
-    let context = ApiContext::new(None);
+    let context = ApiContext::for_metrics();
     let api_base_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
@@ -574,7 +574,7 @@ fn flush_metrics(events: &[MetricEvent]) {
 }
 
 fn flush_pending_metrics() {
-    let context = ApiContext::new(None);
+    let context = ApiContext::for_metrics();
     let api_base_url = context.base_url.clone();
     let client = ApiClient::new(context);
 

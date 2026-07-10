@@ -6,7 +6,7 @@
 //! writes land in the sandboxed `~/.git-ai/config.json` rather than the user's.
 
 use crate::repos::test_repo::TestRepo;
-use git_ai::config::{AuthorConfig, FileConfig, NotesBackendConfig};
+use git_ai::config::{AuthorConfig, FileConfig, NotesBackendConfig, ReportingProfile};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -238,6 +238,65 @@ fn test_config_show_all_includes_new_keys() {
     assert!(value.get("max_checkpoint_total_size_bytes").is_some());
     assert!(value.get("max_checkpoint_total_lines").is_some());
     assert!(value.get("custom_attributes").is_some());
+    assert!(value.get("metrics_api_base_url").is_some());
+    assert!(value.get("reporting_profile").is_some());
+}
+
+#[test]
+fn test_reporting_profile_stdin_update_is_atomic_and_normalized() {
+    let repo = TestRepo::new();
+    let payload = r#"{
+      "metrics_api_base_url": "http://stats.example.com/prod-api/worker/metrics/upload",
+      "reporting_profile": {
+        "department_name": " 云计算研发部 ",
+        "office_name": "研发四处",
+        "team_name": "研发一组",
+        "user_name": " 郭立民 ",
+        "user_email": " GUOLIMIN.LC@INSPUR.COM "
+      }
+    }"#;
+
+    repo.git_ai_with_stdin(
+        &["config", "reporting-profile", "set", "--stdin"],
+        payload.as_bytes(),
+    )
+    .expect("set reporting profile from stdin");
+
+    assert_eq!(
+        get_json(&repo, "metrics_api_base_url"),
+        Value::String("http://stats.example.com/prod-api".to_string())
+    );
+    assert_eq!(
+        get_json(&repo, "reporting_profile"),
+        serde_json::json!({
+            "department_name": "云计算研发部",
+            "office_name": "研发四处",
+            "team_name": "研发一组",
+            "user_name": "郭立民",
+            "user_email": "guolimin.lc@inspur.com"
+        })
+    );
+
+    let invalid_payload = r#"{
+      "metrics_api_base_url": "http://another.example.com/prod-api",
+      "reporting_profile": {
+        "department_name": "云计算研发部",
+        "office_name": "",
+        "user_name": "郭立民",
+        "user_email": "guolimin.lc@inspur.com"
+      }
+    }"#;
+    let error = repo
+        .git_ai_with_stdin(
+            &["config", "reporting-profile", "set", "--stdin"],
+            invalid_payload.as_bytes(),
+        )
+        .expect_err("invalid reporting profile must not be saved");
+    assert!(error.contains("reporting_profile.office_name is required"));
+    assert_eq!(
+        get_json(&repo, "metrics_api_base_url"),
+        Value::String("http://stats.example.com/prod-api".to_string())
+    );
 }
 
 /// Map a `FileConfig` field name to the CLI key used to read it back, when the
@@ -286,6 +345,7 @@ fn fully_populated_file_config() -> FileConfig {
         update_channel: Some("latest".to_string()),
         feature_flags: Some(serde_json::json!({"transcript_sweep": true})),
         api_base_url: Some("https://usegitai.com".to_string()),
+        metrics_api_base_url: Some("https://stats.example.com".to_string()),
         prompt_storage: Some("default".to_string()),
         default_prompt_storage: Some("local".to_string()),
         api_key: Some("secret-key".to_string()),
@@ -296,6 +356,13 @@ fn fully_populated_file_config() -> FileConfig {
             email: Some("alice@example.com".to_string()),
         }),
         custom_attributes: Some(custom_attributes),
+        reporting_profile: Some(ReportingProfile {
+            department_name: Some("研发部".to_string()),
+            office_name: Some("研发一处".to_string()),
+            team_name: Some("研发一组".to_string()),
+            user_name: Some("Alice".to_string()),
+            user_email: Some("alice@example.com".to_string()),
+        }),
         git_ai_hooks: Some(git_ai_hooks),
         codex_hooks_format: Some("config_toml".to_string()),
         notes_backend: Some(NotesBackendConfig::default()),

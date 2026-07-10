@@ -101,7 +101,7 @@ pub fn build_agent_usage_attrs(
         .tool(&agent_id.tool)
         .model(&agent_id.model)
         .external_session_id(&agent_id.id)
-        .custom_attributes_map(crate::config::Config::fresh().custom_attributes());
+        .custom_attributes_map(crate::config::Config::fresh().metrics_custom_attributes());
 
     if let Some(repo) = repo {
         if let Some(url) = crate::repo_url::resolve_repo_url_from_repo(repo) {
@@ -144,7 +144,7 @@ fn build_checkpoint_attrs(
     }
 
     // Attach custom attributes using Config::fresh() to support runtime config updates
-    attrs = attrs.custom_attributes_map(crate::config::Config::fresh().custom_attributes());
+    attrs = attrs.custom_attributes_map(crate::config::Config::fresh().metrics_custom_attributes());
 
     // Add repo URL
     if let Some(url) = crate::repo_url::resolve_repo_url_from_repo(repo) {

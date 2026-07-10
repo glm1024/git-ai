@@ -87,12 +87,12 @@ awk -v repo="internal/git-ai-offline" -v version="v${OFFLINE_VERSION}" -v checks
 
 awk -v version="v${OFFLINE_VERSION}" -v vsix="${VSCODE_VSIX}" -v jetbrains="${JETBRAINS_ZIP}" '
     {
-        gsub(/v1\.6\.11/, version)
+        gsub(/v[0-9][0-9.]*/, version)
         gsub(/git-ai\.git-ai-vscode-[0-9.]+\.vsix/, vsix)
         gsub(/Git_AI-[0-9.]+\.zip/, jetbrains)
         print
     }
-' "${REPO_ROOT}/offline-dist/git-ai-offline-v1.6.11/INSTALL.md" > "${STAGING_DIR}/INSTALL.md"
+' "${REPO_ROOT}/offline-dist/git-ai-offline-v1.6.12/INSTALL.md" > "${STAGING_DIR}/INSTALL.md"
 
 (
     cd "${STAGING_DIR}/linux"

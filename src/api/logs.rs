@@ -1,16 +1,15 @@
 //! Daemon diagnostics upload API.
 
 use crate::api::client::ApiClient;
-use crate::api::metrics::metrics_upload_allowed;
 use crate::api::types::{ApiErrorResponse, DaemonLogsUploadRequest, DaemonLogsUploadResponse};
 use crate::error::GitAiError;
 
 /// Returns whether daemon log uploads are allowed for the current API context.
 ///
-/// This intentionally matches metrics delivery: the hosted API requires either
-/// OAuth login or an API key, while custom API URLs are assumed to be deliberate.
-pub fn daemon_logs_upload_allowed(api_base_url: &str, client: &ApiClient) -> bool {
-    metrics_upload_allowed(api_base_url, client)
+/// Daemon diagnostics always require normal Git AI authentication. A dedicated
+/// metrics URL must never enable diagnostics delivery to the reporting server.
+pub fn daemon_logs_upload_allowed(_api_base_url: &str, client: &ApiClient) -> bool {
+    client.is_logged_in() || client.has_api_key()
 }
 
 impl ApiClient {
