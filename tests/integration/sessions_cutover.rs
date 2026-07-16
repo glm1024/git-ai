@@ -10,7 +10,7 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
-use git_ai::git::refs::notes_add;
+use git_ai::git::notes_api::write_note;
 use serde_json::Value;
 use std::fs;
 
@@ -53,7 +53,7 @@ fn test_old_format_note_can_be_attached_and_read() {
     // Attach old-format note
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, base_sha, &old_note).expect("add old-format note");
+    write_note(&git_ai_repo, base_sha, &old_note).expect("add old-format note");
 
     // Verify old format note is present and reads correctly
     let read_note = repo
@@ -155,7 +155,7 @@ fn test_mixed_format_note_with_both_prompts_and_sessions() {
     // Attach mixed-format note
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &mixed_note).expect("add mixed-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &mixed_note).expect("add mixed-format note");
 
     // Read and verify the note
     let read_note = repo
@@ -241,7 +241,7 @@ fn test_rebase_chain_with_old_and_new_format_notes() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit_a.commit_sha, &old_note_a).expect("add old-format note A");
+    write_note(&git_ai_repo, &commit_a.commit_sha, &old_note_a).expect("add old-format note A");
 
     // Commit B with AI content (will use new format naturally)
     let mut file_b = repo.filename("file_b.txt");
@@ -353,7 +353,7 @@ fn test_cherry_pick_old_format_note_with_ai_lines_preserved() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &source_commit.commit_sha, &old_note).expect("add old-format note");
+    write_note(&git_ai_repo, &source_commit.commit_sha, &old_note).expect("add old-format note");
 
     // Go back to main and cherry-pick
     repo.git(&["checkout", &default_branch]).unwrap();
@@ -474,7 +474,7 @@ fn test_old_format_note_roundtrips_without_corruption() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &ai_commit.commit_sha, &old_note).expect("add old-format note");
+    write_note(&git_ai_repo, &ai_commit.commit_sha, &old_note).expect("add old-format note");
 
     // Read it back
     let note_v1 = repo
@@ -575,7 +575,7 @@ fn test_reset_preserves_old_format_notes_in_working_log() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("add old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("add old-format note");
 
     // Reset --soft to un-commit but keep changes staged
     repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
@@ -698,7 +698,7 @@ fn test_amend_old_prompts_commit_with_new_session_checkpoints() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 3: Make new edits and checkpoint with new-format (mock_ai produces trace_id)
     let edited = "Human line 1\nAI old line\nAI new line\n";
@@ -1006,7 +1006,7 @@ fn test_reset_soft_old_note_then_new_session_checkpoints() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 4: Reset --soft HEAD~1 (uncommit, triggers working log reconstruction with old prompts)
     repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
@@ -1116,7 +1116,7 @@ fn test_squash_merge_mixed_format_commits() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit_a.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit_a.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 4: Commit C2 with AI content using standard helpers (produces new-format/sessions)
     let mut file_b = repo.filename("feature_b.txt");
@@ -1334,7 +1334,8 @@ fn test_rebase_conflict_old_note_ai_resolves_with_sessions() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &feature_commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &feature_commit.commit_sha, &old_note)
+        .expect("attach old-format note");
 
     // Step 3: Go back to main, make conflicting change
     repo.git(&["checkout", &default_branch]).unwrap();
@@ -1415,7 +1416,7 @@ fn test_show_prompt_finds_old_format_prompt_by_id() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // show-prompt with --commit should find the old-format prompt
     let output = repo
@@ -1464,7 +1465,7 @@ fn test_show_prompt_finds_old_format_prompt_in_history() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // show-prompt without --commit should search history and find it
     let output = repo
@@ -1519,7 +1520,7 @@ fn test_stats_json_works_with_old_format_notes() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Run git-ai stats --json — should not crash on old-format notes
     let output = repo
@@ -1643,7 +1644,7 @@ fn test_diff_json_all_prompts_includes_old_format_prompts() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Run git-ai diff --json --all-prompts
     let output = repo
@@ -1714,7 +1715,7 @@ fn test_amend_old_prompts_delete_ai_line_then_add_new_session_line() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 3: Delete the old AI line and add a new one with new-format checkpoint
     let edited = "Human line\nNew session AI line\n";
@@ -1829,7 +1830,7 @@ fn test_amend_old_prompts_keep_old_line_add_new_session_same_file() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 3: Add a new line at the end (keep existing content) with new-format checkpoint
     let edited = "Human line\nOld AI line\nNew session AI line\n";
@@ -1943,7 +1944,7 @@ fn test_multiple_amends_mixed_format_accumulation() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 3: First amend - add new AI line
     let edit1 = "Line 1\nOld AI line\nFirst session line\n";
@@ -2058,7 +2059,7 @@ fn test_initial_from_old_note_plus_human_and_session_edits() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &ai_commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &ai_commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 4: Reset --soft to bring content back to working tree
     repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
@@ -2165,7 +2166,7 @@ fn test_amend_old_prompts_different_file_gets_session_edits() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 3: Create file_b with new session AI content (different file, not in original commit)
     let content_b = "New session AI line B\n";
@@ -2269,7 +2270,7 @@ fn test_status_counts_ai_lines_from_old_format_initial() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &ai_commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &ai_commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 4: Reset --soft to bring content into working log with old-format INITIAL
     repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
@@ -2340,7 +2341,7 @@ fn test_diff_json_mixed_format_commit_separates_prompts_and_sessions() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 4: Amend with new-format AI content
     fs::write(&file_path, "base line\nold ai line\nnew ai line\n").unwrap();
@@ -2457,7 +2458,7 @@ fn test_diff_json_history_with_mixed_old_and_new_format_commits() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &old_commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &old_commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Step 3: New-format AI commit
     fs::write(&file_path, "base\nold ai line\nnew session line\n").unwrap();
@@ -2576,7 +2577,7 @@ fn test_diff_json_stats_with_old_format_note_only() {
     );
     let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
         .expect("find repository");
-    notes_add(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
+    write_note(&git_ai_repo, &commit.commit_sha, &old_note).expect("attach old-format note");
 
     // Run diff --json --include-stats
     let output = repo
