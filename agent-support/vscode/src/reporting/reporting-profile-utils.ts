@@ -215,7 +215,7 @@ export function validateReportingSettings(settings: ReportingSettings, organizat
   if (office.teams.length > 0 && !normalized.profile.teamName) {
     return "请选择组";
   }
-  if (normalized.profile.teamName && !office.teams.includes(normalized.profile.teamName)) {
+  if (office.teams.length > 0 && normalized.profile.teamName && !office.teams.includes(normalized.profile.teamName)) {
     return "当前组已失效，请重新选择";
   }
   return undefined;

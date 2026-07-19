@@ -642,6 +642,161 @@ impl EventValues for RewriteCommittedValues {
     }
 }
 
+/// Value positions for Event ID 8: a strong Git ref/lifecycle transition.
+pub mod lifecycle_transition_pos {
+    pub const OPERATION_ID: usize = 0;
+    pub const OPERATION_KIND: usize = 1;
+    pub const OLD_TIP: usize = 2;
+    pub const NEW_TIP: usize = 3;
+    pub const INVALIDATED_COMMIT_SHAS: usize = 4;
+    pub const REPLACEMENT_COMMIT_SHAS: usize = 5;
+    pub const CHUNK_INDEX: usize = 6;
+    pub const CHUNK_COUNT: usize = 7;
+    pub const SEMANTICS: usize = 8;
+}
+
+/// Strong lifecycle fact emitted from already-observed trace2/ref transitions.
+/// Lists are bounded and chunked by the producer; old/new tips are always
+/// retained so the server can validate reachability against its repository.
+#[derive(Debug, Clone, Default)]
+pub struct LifecycleTransitionValues {
+    pub operation_id: PosField<String>,
+    pub operation_kind: PosField<String>,
+    pub old_tip: PosField<String>,
+    pub new_tip: PosField<String>,
+    pub invalidated_commit_shas: PosField<Vec<String>>,
+    pub replacement_commit_shas: PosField<Vec<String>>,
+    pub chunk_index: PosField<u32>,
+    pub chunk_count: PosField<u32>,
+    pub semantics: PosField<String>,
+}
+
+impl LifecycleTransitionValues {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn operation_id(mut self, v: impl Into<String>) -> Self {
+        self.operation_id = Some(Some(v.into()));
+        self
+    }
+    pub fn operation_kind(mut self, v: impl Into<String>) -> Self {
+        self.operation_kind = Some(Some(v.into()));
+        self
+    }
+    pub fn old_tip(mut self, v: impl Into<String>) -> Self {
+        self.old_tip = Some(Some(v.into()));
+        self
+    }
+    pub fn new_tip(mut self, v: impl Into<String>) -> Self {
+        self.new_tip = Some(Some(v.into()));
+        self
+    }
+    pub fn invalidated_commit_shas(mut self, v: Vec<String>) -> Self {
+        self.invalidated_commit_shas = Some(Some(v));
+        self
+    }
+    pub fn replacement_commit_shas(mut self, v: Vec<String>) -> Self {
+        self.replacement_commit_shas = Some(Some(v));
+        self
+    }
+    pub fn chunk_index(mut self, v: u32) -> Self {
+        self.chunk_index = Some(Some(v));
+        self
+    }
+    pub fn chunk_count(mut self, v: u32) -> Self {
+        self.chunk_count = Some(Some(v));
+        self
+    }
+    pub fn semantics(mut self, v: impl Into<String>) -> Self {
+        self.semantics = Some(Some(v.into()));
+        self
+    }
+}
+
+impl PosEncoded for LifecycleTransitionValues {
+    fn to_sparse(&self) -> SparseArray {
+        let mut map = SparseArray::new();
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::OPERATION_ID,
+            string_to_json(&self.operation_id),
+        );
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::OPERATION_KIND,
+            string_to_json(&self.operation_kind),
+        );
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::OLD_TIP,
+            string_to_json(&self.old_tip),
+        );
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::NEW_TIP,
+            string_to_json(&self.new_tip),
+        );
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::INVALIDATED_COMMIT_SHAS,
+            vec_string_to_json(&self.invalidated_commit_shas),
+        );
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::REPLACEMENT_COMMIT_SHAS,
+            vec_string_to_json(&self.replacement_commit_shas),
+        );
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::CHUNK_INDEX,
+            u32_to_json(&self.chunk_index),
+        );
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::CHUNK_COUNT,
+            u32_to_json(&self.chunk_count),
+        );
+        sparse_set(
+            &mut map,
+            lifecycle_transition_pos::SEMANTICS,
+            string_to_json(&self.semantics),
+        );
+        map
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        Self {
+            operation_id: sparse_get_string(arr, lifecycle_transition_pos::OPERATION_ID),
+            operation_kind: sparse_get_string(arr, lifecycle_transition_pos::OPERATION_KIND),
+            old_tip: sparse_get_string(arr, lifecycle_transition_pos::OLD_TIP),
+            new_tip: sparse_get_string(arr, lifecycle_transition_pos::NEW_TIP),
+            invalidated_commit_shas: sparse_get_vec_string(
+                arr,
+                lifecycle_transition_pos::INVALIDATED_COMMIT_SHAS,
+            ),
+            replacement_commit_shas: sparse_get_vec_string(
+                arr,
+                lifecycle_transition_pos::REPLACEMENT_COMMIT_SHAS,
+            ),
+            chunk_index: sparse_get_u32(arr, lifecycle_transition_pos::CHUNK_INDEX),
+            chunk_count: sparse_get_u32(arr, lifecycle_transition_pos::CHUNK_COUNT),
+            semantics: sparse_get_string(arr, lifecycle_transition_pos::SEMANTICS),
+        }
+    }
+}
+
+impl EventValues for LifecycleTransitionValues {
+    fn event_id() -> MetricEventId {
+        MetricEventId::LifecycleTransition
+    }
+    fn to_sparse(&self) -> SparseArray {
+        PosEncoded::to_sparse(self)
+    }
+    fn from_sparse(arr: &SparseArray) -> Self {
+        PosEncoded::from_sparse(arr)
+    }
+}
+
 /// Values for Event ID 2: agent_usage
 ///
 /// Recorded on every AI checkpoint to track agent usage.
@@ -1169,6 +1324,33 @@ mod tests {
             MetricEventId::RewriteCommitted
         );
         assert_eq!(RewriteCommittedValues::event_id() as u16, 7);
+    }
+
+    #[test]
+    fn test_lifecycle_transition_values_sparse_roundtrip() {
+        let original = LifecycleTransitionValues::new()
+            .operation_id("sha256:operation")
+            .operation_kind("reset")
+            .old_tip("old")
+            .new_tip("new")
+            .invalidated_commit_shas(vec!["old".to_string()])
+            .replacement_commit_shas(Vec::new())
+            .chunk_index(0)
+            .chunk_count(1)
+            .semantics("ref_transition");
+        let sparse = PosEncoded::to_sparse(&original);
+        let restored = <LifecycleTransitionValues as PosEncoded>::from_sparse(&sparse);
+
+        assert_eq!(LifecycleTransitionValues::event_id() as u16, 8);
+        assert_eq!(
+            restored.operation_id,
+            Some(Some("sha256:operation".to_string()))
+        );
+        assert_eq!(
+            restored.invalidated_commit_shas,
+            Some(Some(vec!["old".to_string()]))
+        );
+        assert_eq!(restored.chunk_count, Some(Some(1)));
     }
 
     #[test]

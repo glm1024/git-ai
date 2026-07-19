@@ -65,6 +65,25 @@ impl std::fmt::Display for StreamFormat {
 }
 
 impl StreamFormat {
+    pub fn from_stored_name(value: &str) -> Option<Self> {
+        Some(match value {
+            "ClaudeJsonl" => Self::ClaudeJsonl,
+            "CursorJsonl" => Self::CursorJsonl,
+            "DroidJsonl" => Self::DroidJsonl,
+            "CopilotSessionJson" => Self::CopilotSessionJson,
+            "CopilotEventStreamJsonl" => Self::CopilotEventStreamJsonl,
+            "GeminiJsonl" => Self::GeminiJsonl,
+            "ContinueJson" => Self::ContinueJson,
+            "WindsurfJsonl" => Self::WindsurfJsonl,
+            "CodexJsonl" => Self::CodexJsonl,
+            "AmpThreadJson" => Self::AmpThreadJson,
+            "OpenCodeSqlite" => Self::OpenCodeSqlite,
+            "PiJsonl" => Self::PiJsonl,
+            "CopilotOtelSqlite" => Self::CopilotOtelSqlite,
+            _ => return None,
+        })
+    }
+
     pub fn watermark_type(self) -> super::watermark::WatermarkType {
         use super::watermark::WatermarkType;
         match self {

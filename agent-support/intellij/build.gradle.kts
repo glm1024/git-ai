@@ -17,7 +17,9 @@ version = providers.gradleProperty("pluginVersion").get()
 
 // Set the JVM language level used to build the project.
 kotlin {
-    jvmToolchain(21)
+    // `pluginSinceBuild = 233` runs on JetBrains Runtime 17.  Keep bytecode
+    // compatible with that baseline even when the build machine has a newer JDK.
+    jvmToolchain(17)
 }
 
 // Configure project's dependencies

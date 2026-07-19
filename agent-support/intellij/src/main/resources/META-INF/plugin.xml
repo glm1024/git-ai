@@ -12,6 +12,11 @@
             serviceImplementation="org.jetbrains.plugins.template.services.DocumentChangeTrackerService"/>
         <applicationService
             serviceImplementation="org.jetbrains.plugins.template.services.GitAiService"/>
+        <toolWindow
+            id="Git AI"
+            anchor="left"
+            factoryClass="org.jetbrains.plugins.template.toolwindow.ReportingToolWindowFactory"
+            icon="/META-INF/pluginIcon.svg"/>
         <postStartupActivity implementation="org.jetbrains.plugins.template.startup.DocumentTrackerStartupActivity"/>
     </extensions>
 </idea-plugin>

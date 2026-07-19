@@ -73,4 +73,19 @@ suite("Reporting Profile Utilities", () => {
 
     assert.strictEqual(error, "请选择组");
   });
+
+  test("ignores a stale saved team when the selected office has no teams", () => {
+    const error = validateReportingSettings({
+      metricsApiBaseUrl: "http://stats.example.com/prod-api",
+      profile: {
+        departmentName: "云计算研发部",
+        officeName: "经理室",
+        teamName: "研发一组",
+        userName: "郭立民",
+        userEmail: "guo@inspur.com",
+      },
+    }, organizationOptions);
+
+    assert.strictEqual(error, undefined);
+  });
 });

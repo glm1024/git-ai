@@ -23,6 +23,7 @@ pub enum MetricEventId {
     SessionEvent = 5,
     OtelTrace = 6,
     RewriteCommitted = 7,
+    LifecycleTransition = 8,
 }
 
 /// Trait for event-specific values.

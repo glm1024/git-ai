@@ -83,7 +83,7 @@ define_feature_flags!(
     transcript_sweep: transcript_sweep, debug = true, release = true,
     checkpoint_debug_log: checkpoint_debug_log, debug = false, release = false,
     daemon_log_upload: daemon_log_upload, debug = true, release = true,
-    rewrite_metrics_events: rewrite_metrics_events, debug = true, release = false,
+    rewrite_metrics_events: rewrite_metrics_events, debug = true, release = true,
 );
 
 impl FeatureFlags {
@@ -147,7 +147,7 @@ mod tests {
             assert!(flags.transcript_sweep);
             assert!(!flags.checkpoint_debug_log);
             assert!(flags.daemon_log_upload);
-            assert!(!flags.rewrite_metrics_events);
+            assert!(flags.rewrite_metrics_events);
         }
     }
 

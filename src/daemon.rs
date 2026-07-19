@@ -4806,9 +4806,17 @@ impl ActorDaemonCoordinator {
                 )?;
                 let metric_commits =
                     rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
+                let branch =
+                    rewrite_metric_branch_for_transition(cmd, &original_head, &new_tip, None);
+                crate::daemon::rewrite_metrics::spawn_ref_lifecycle_transition_metrics(
+                    &repo,
+                    "rebase",
+                    original_head.clone(),
+                    new_tip.clone(),
+                    branch.clone(),
+                    "ref_transition",
+                );
                 if !metric_commits.is_empty() {
-                    let branch =
-                        rewrite_metric_branch_for_transition(cmd, &original_head, &new_tip, None);
                     crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
                         &repo,
                         rewrite_metric_commits_with_branch(metric_commits, branch),
@@ -4867,9 +4875,23 @@ impl ActorDaemonCoordinator {
             };
             let metric_commits =
                 rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
+            let branch =
+                rewrite_metric_branch_for_transition(cmd, old_tip, new_tip, Some(reference));
+            crate::daemon::rewrite_metrics::spawn_ref_lifecycle_transition_metrics(
+                &repo,
+                if is_rebase_cmd {
+                    "rebase"
+                } else if cmd.primary_command.as_deref() == Some("update-ref") {
+                    "update_ref"
+                } else {
+                    "non_fast_forward"
+                },
+                (*old_tip).to_string(),
+                (*new_tip).to_string(),
+                branch.clone(),
+                "ref_transition",
+            );
             if !metric_commits.is_empty() {
-                let branch =
-                    rewrite_metric_branch_for_transition(cmd, old_tip, new_tip, Some(reference));
                 crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
                     &repo,
                     rewrite_metric_commits_with_branch(metric_commits, branch),
@@ -5632,6 +5654,16 @@ impl ActorDaemonCoordinator {
                         new_head,
                     } if !old_head.is_empty() && !new_head.is_empty() && old_head != new_head => {
                         let repo = find_repository_in_path(&worktree)?;
+                        let branch =
+                            rewrite_metric_branch_for_transition(cmd, old_head, new_head, None);
+                        crate::daemon::rewrite_metrics::spawn_ref_lifecycle_transition_metrics(
+                            &repo,
+                            "reset",
+                            old_head.to_string(),
+                            new_head.to_string(),
+                            branch,
+                            "ref_transition",
+                        );
                         match kind {
                             crate::daemon::domain::ResetKind::Hard => {
                                 repo.storage.delete_working_log_for_base_commit(old_head)?;

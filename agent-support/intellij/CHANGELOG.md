@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add the Git AI data-reporting tool window with organization selection, Kilo configuration import, and server-provided organization options.
+
 ## [2.4.0] - 2025-11-25
 
 ### Fixed

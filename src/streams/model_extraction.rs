@@ -11,6 +11,10 @@ pub fn extract_model(
 ) -> Result<Option<String>, StreamError> {
     match format {
         StreamFormat::ClaudeJsonl
+        | StreamFormat::CodexJsonl
+        | StreamFormat::CursorJsonl
+        | StreamFormat::WindsurfJsonl
+        | StreamFormat::PiJsonl
         | StreamFormat::CopilotEventStreamJsonl
         | StreamFormat::GeminiJsonl => extract_model_from_jsonl_tail(path),
         StreamFormat::CopilotSessionJson => extract_model_from_copilot_session_json(path),
@@ -104,6 +108,11 @@ fn extract_model_from_jsonl_line(line: &str) -> Option<String> {
         .get("message")
         .and_then(|m| m.get("model"))
         .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("payload")
+                .and_then(|payload| payload.get("model"))
+                .and_then(|v| v.as_str())
+        })
         .or_else(|| json.get("model").and_then(|v| v.as_str()));
 
     if let Some(model) = candidate
@@ -460,6 +469,13 @@ mod tests {
         let path = fixture_path("example-claude-code.jsonl");
         let result = extract_model(&path, StreamFormat::ClaudeJsonl, None).unwrap();
         assert_eq!(result, Some("claude-sonnet-4-20250514".to_string()));
+    }
+
+    #[test]
+    fn test_extract_model_codex_turn_context_payload() {
+        let path = fixture_path("codex-session-simple.jsonl");
+        let result = extract_model(&path, StreamFormat::CodexJsonl, None).unwrap();
+        assert_eq!(result, Some("gpt-5-codex".to_string()));
     }
 
     #[test]

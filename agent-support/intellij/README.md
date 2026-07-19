@@ -18,6 +18,7 @@ When AI agents like GitHub Copilot make edits, Git AI automatically records whic
 - **AI Blame** - See which lines were written by AI and the prompts that generated them
 - **AI contribution stats** - Track how much of your codebase is AI-generated
 - **Cross-agent tracking** - Works with Copilot, Cursor, Claude Code, and more
+- **Data reporting** - Configure metrics reporting, organization, and identity in the Git AI tool window. Blank Git AI fields can be filled from local Kilo settings; Git AI values take precedence and Kilo is never modified.
 
 Requires the [git-ai CLI](https://github.com/git-ai-project/git-ai) to be installed. Learn more at [usegitai.com](https://usegitai.com).
 <!-- Plugin description end -->

@@ -120,6 +120,13 @@ class GitAiService {
     }
 
     /**
+     * Resolves the CLI for support surfaces that need to run a non-checkpoint
+     * command.  Callers must run the command off the EDT and must not log its
+     * input or output because it may contain reporting identity data.
+     */
+    internal fun resolveGitAiBinary(): String? = findGitAiBinary()
+
+    /**
      * Attempts to find git-ai via PATH using the shell.
      * This may work when IntelliJ is launched from a terminal with proper PATH.
      */

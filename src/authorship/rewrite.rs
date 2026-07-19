@@ -31,8 +31,19 @@ pub enum RewriteEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiffTreeResult {
     pub hunks_by_file: HashMap<String, Vec<DiffHunk>>,
+    /// Deleted/added contents aligned with `hunks_by_file` by file and hunk
+    /// index. Keeping them from the existing batched diff-tree call lets
+    /// rewrite metrics reuse normal committed hunk artifacts without O(n)
+    /// additional git processes.
+    pub hunk_contents_by_file: HashMap<String, Vec<DiffHunkContents>>,
     pub added_lines_by_file: HashMap<String, Vec<u32>>,
     pub renames: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DiffHunkContents {
+    pub deleted: Vec<String>,
+    pub added: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1283,6 +1294,7 @@ fn parse_batched_diff_tree_output(
     while results.len() < tree_pair_keys.len() {
         results.push(DiffTreeResult {
             hunks_by_file: HashMap::new(),
+            hunk_contents_by_file: HashMap::new(),
             added_lines_by_file: HashMap::new(),
             renames: Vec::new(),
         });
@@ -1304,6 +1316,7 @@ fn is_tree_pair_separator(line: &str) -> bool {
 
 fn parse_diff_tree_output(output: &str) -> DiffTreeResult {
     let mut hunks_by_file: HashMap<String, Vec<DiffHunk>> = HashMap::new();
+    let mut hunk_contents_by_file: HashMap<String, Vec<DiffHunkContents>> = HashMap::new();
     let mut added_lines_by_file: HashMap<String, Vec<u32>> = HashMap::new();
     let mut renames: Vec<(String, String)> = Vec::new();
     let mut current_file: Option<String> = None;
@@ -1329,6 +1342,10 @@ fn parse_diff_tree_output(output: &str) -> DiffTreeResult {
         {
             active_hunk_new_line = Some(hunk.new_start);
             hunks_by_file.entry(file.clone()).or_default().push(hunk);
+            hunk_contents_by_file
+                .entry(file.clone())
+                .or_default()
+                .push(DiffHunkContents::default());
         } else if let Some(new_line) = active_hunk_new_line.as_mut() {
             if line.starts_with('+') {
                 if let Some(ref file) = current_file {
@@ -1336,9 +1353,23 @@ fn parse_diff_tree_output(output: &str) -> DiffTreeResult {
                         .entry(file.clone())
                         .or_default()
                         .push(*new_line);
+                    if let Some(contents) = hunk_contents_by_file
+                        .get_mut(file)
+                        .and_then(|hunks| hunks.last_mut())
+                    {
+                        contents.added.push(line[1..].to_string());
+                    }
                 }
                 *new_line += 1;
-            } else if line.starts_with('-') || line.starts_with('\\') {
+            } else if line.starts_with('-') {
+                if let Some(ref file) = current_file
+                    && let Some(contents) = hunk_contents_by_file
+                        .get_mut(file)
+                        .and_then(|hunks| hunks.last_mut())
+                {
+                    contents.deleted.push(line[1..].to_string());
+                }
+            } else if line.starts_with('\\') {
                 // Removed lines and "\ No newline at end of file" markers do
                 // not advance the new-file line cursor.
             } else {
@@ -1354,6 +1385,7 @@ fn parse_diff_tree_output(output: &str) -> DiffTreeResult {
 
     DiffTreeResult {
         hunks_by_file,
+        hunk_contents_by_file,
         added_lines_by_file,
         renames,
     }

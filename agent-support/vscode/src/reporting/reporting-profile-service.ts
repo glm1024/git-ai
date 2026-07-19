@@ -59,12 +59,20 @@ export class ReportingProfileService {
       cliError = toErrorMessage(error, "无法读取 Git AI CLI 配置");
     }
 
-    const settings = mergeReportingSettings(savedSettings, kiloSettings, DEFAULT_METRICS_API_BASE_URL);
-    const importedFields = importedMissingFields(savedSettings, kiloSettings);
+    let settings = mergeReportingSettings(savedSettings, kiloSettings, DEFAULT_METRICS_API_BASE_URL);
+    let importedFields = importedMissingFields(savedSettings, kiloSettings);
+    const organization = await this.loadOrganizationOptions(settings.metricsApiBaseUrl);
+    const selectedOffice = organization.options?.departments
+      .find((department) => department.name === settings.profile.departmentName)?.offices
+      .find((office) => office.name === settings.profile.officeName);
+    if (selectedOffice && selectedOffice.teams.length === 0) {
+      settings = { ...settings, profile: { ...settings.profile, teamName: "" } };
+      importedFields = importedFields.filter((field) => field !== "组");
+    }
     return {
       settings,
       importedFields,
-      organization: await this.loadOrganizationOptions(settings.metricsApiBaseUrl),
+      organization,
       cliError,
     };
   }

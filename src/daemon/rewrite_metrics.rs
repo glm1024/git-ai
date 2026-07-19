@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
@@ -7,7 +8,11 @@ use crate::authorship::rewrite::{DiffTreeResult, RewriteMetricCommit};
 use crate::config::Config;
 use crate::error::GitAiError;
 use crate::git::repository::Repository;
-use crate::metrics::{EventAttributes, MetricEvent, PosEncoded, RewriteCommittedValues};
+use crate::metrics::{
+    EventAttributes, LifecycleTransitionValues, MetricEvent, PosEncoded, RewriteCommittedValues,
+};
+
+const MAX_LIFECYCLE_COMMITS_PER_CHUNK: usize = 512;
 
 pub(crate) fn spawn_rewrite_commit_metrics(
     repo: &Repository,
@@ -101,7 +106,11 @@ fn build_rewrite_metric_events(
 
     let mut events = Vec::new();
     for metric_commit in &metric_commits {
-        match build_rewrite_committed_metric_event(metric_commit, &batch_context) {
+        // Persist the strong replacement fact before the derived replacement
+        // commit. The metrics DB preserves insertion order and retries pending
+        // rows in that order.
+        events.extend(build_mapped_lifecycle_events(metric_commit, &batch_context));
+        match build_rewrite_committed_metric_event(repo, metric_commit, &batch_context) {
             Ok(Some(event)) => events.push(event),
             Ok(None) => {}
             Err(err) => {
@@ -115,6 +124,267 @@ fn build_rewrite_metric_events(
         }
     }
     events
+}
+
+/// Emit a ref transition using only facts already captured by trace2/ref
+/// analysis. This function performs no repository reads on the command
+/// ingestion path; config/repository metadata work happens on a detached
+/// worker before the event is placed in the persistent metrics queue.
+pub(crate) fn spawn_ref_lifecycle_transition_metrics(
+    repo: &Repository,
+    operation_kind: impl Into<String>,
+    old_tip: impl Into<String>,
+    new_tip: impl Into<String>,
+    branch: Option<String>,
+    semantics: impl Into<String>,
+) {
+    if !crate::authorship::rewrite::rewrite_metrics_enabled() {
+        return;
+    }
+    let repo = repo.clone();
+    let operation_kind = operation_kind.into();
+    let old_tip = old_tip.into();
+    let new_tip = new_tip.into();
+    let semantics = semantics.into();
+    std::thread::spawn(move || {
+        let context = RewriteMetricBatchContext::new(&repo);
+        let branch = resolve_lifecycle_branch(&repo, branch);
+        // One detached plumbing call returns both sides of the ref move. This
+        // is outside trace2 ingestion and avoids per-commit subprocesses while
+        // still sending the complete reset/rebase/drop set.
+        let (invalidated, replacements) =
+            exclusive_commits_for_transition(&repo, &old_tip, &new_tip).unwrap_or_default();
+        let events = build_lifecycle_events(
+            &operation_kind,
+            &old_tip,
+            &new_tip,
+            branch.as_deref(),
+            &invalidated,
+            &replacements,
+            &semantics,
+            &context,
+        );
+        submit_events(events);
+    });
+}
+
+fn resolve_lifecycle_branch(repo: &Repository, branch: Option<String>) -> Option<String> {
+    branch.or_else(|| repo.head().ok().and_then(|head| head.shorthand().ok()))
+}
+
+fn exclusive_commits_for_transition(
+    repo: &Repository,
+    old_tip: &str,
+    new_tip: &str,
+) -> Result<(Vec<String>, Vec<String>), GitAiError> {
+    let mut args = repo.global_args_for_exec();
+    args.extend([
+        "rev-list".to_string(),
+        "--left-right".to_string(),
+        "--topo-order".to_string(),
+        format!("{old_tip}...{new_tip}"),
+    ]);
+    let output = crate::git::repository::exec_git_allow_nonzero(&args)?;
+    if !output.status.success() {
+        return Err(GitAiError::Generic(
+            "unable to enumerate lifecycle ref transition".to_string(),
+        ));
+    }
+    let mut invalidated = Vec::new();
+    let mut replacements = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(sha) = line.strip_prefix('<') {
+            invalidated.push(sha.trim().to_string());
+        } else if let Some(sha) = line.strip_prefix('>') {
+            replacements.push(sha.trim().to_string());
+        }
+    }
+    Ok((invalidated, replacements))
+}
+
+fn build_mapped_lifecycle_events(
+    commit: &RewriteMetricCommit,
+    context: &RewriteMetricBatchContext,
+) -> Vec<MetricEvent> {
+    let (invalidated, semantics) = match commit.operation {
+        crate::authorship::rewrite::RewriteMetricOperation::Rebase
+        | crate::authorship::rewrite::RewriteMetricOperation::Amend
+        | crate::authorship::rewrite::RewriteMetricOperation::UpdateRef
+        | crate::authorship::rewrite::RewriteMetricOperation::NonFastForward => {
+            (commit.original_shas.as_slice(), "replacement")
+        }
+        // Copy-like operations create a new attribution-bearing commit but do
+        // not supersede their source commit.
+        crate::authorship::rewrite::RewriteMetricOperation::SquashMerge
+        | crate::authorship::rewrite::RewriteMetricOperation::CherryPick
+        | crate::authorship::rewrite::RewriteMetricOperation::CherryPickNoCommit
+        | crate::authorship::rewrite::RewriteMetricOperation::Revert => return Vec::new(),
+    };
+    build_lifecycle_events(
+        commit.operation.as_str(),
+        invalidated.first().map(String::as_str).unwrap_or(""),
+        &commit.new_sha,
+        commit.branch.as_deref(),
+        invalidated,
+        std::slice::from_ref(&commit.new_sha),
+        semantics,
+        context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_lifecycle_events(
+    operation_kind: &str,
+    old_tip: &str,
+    new_tip: &str,
+    branch: Option<&str>,
+    invalidated: &[String],
+    replacements: &[String],
+    semantics: &str,
+    context: &RewriteMetricBatchContext,
+) -> Vec<MetricEvent> {
+    let operation_id = lifecycle_operation_id(operation_kind, old_tip, new_tip, branch);
+    if semantics == "replacement" && !invalidated.is_empty() && !replacements.is_empty() {
+        return build_replacement_lifecycle_events(
+            operation_kind,
+            old_tip,
+            new_tip,
+            branch,
+            invalidated,
+            replacements,
+            semantics,
+            context,
+            &operation_id,
+        );
+    }
+    let mut tagged = Vec::with_capacity(invalidated.len() + replacements.len());
+    tagged.extend(invalidated.iter().cloned().map(|sha| (true, sha)));
+    tagged.extend(replacements.iter().cloned().map(|sha| (false, sha)));
+    if tagged.is_empty() {
+        tagged.push((true, String::new()));
+    }
+    let chunk_count = tagged.len().div_ceil(MAX_LIFECYCLE_COMMITS_PER_CHUNK) as u32;
+    tagged
+        .chunks(MAX_LIFECYCLE_COMMITS_PER_CHUNK)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let invalidated = chunk
+                .iter()
+                .filter(|(is_old, sha)| *is_old && !sha.is_empty())
+                .map(|(_, sha)| sha.clone())
+                .collect();
+            let replacements = chunk
+                .iter()
+                .filter(|(is_old, _)| !*is_old)
+                .map(|(_, sha)| sha.clone())
+                .collect();
+            let values = LifecycleTransitionValues::new()
+                .operation_id(operation_id.clone())
+                .operation_kind(operation_kind)
+                .old_tip(old_tip)
+                .new_tip(new_tip)
+                .invalidated_commit_shas(invalidated)
+                .replacement_commit_shas(replacements)
+                .chunk_index(index as u32)
+                .chunk_count(chunk_count)
+                .semantics(semantics);
+            let attrs = lifecycle_attrs(new_tip, branch, context);
+            MetricEvent::from_values(values, attrs.to_sparse())
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_replacement_lifecycle_events(
+    operation_kind: &str,
+    old_tip: &str,
+    new_tip: &str,
+    branch: Option<&str>,
+    invalidated: &[String],
+    replacements: &[String],
+    semantics: &str,
+    context: &RewriteMetricBatchContext,
+    operation_id: &str,
+) -> Vec<MetricEvent> {
+    let old_chunk_count = invalidated.len().div_ceil(MAX_LIFECYCLE_COMMITS_PER_CHUNK);
+    let new_chunk_count = replacements.len().div_ceil(MAX_LIFECYCLE_COMMITS_PER_CHUNK);
+    let chunk_count = old_chunk_count.max(new_chunk_count);
+    let old_anchor = invalidated[0].clone();
+    let new_anchor = replacements[0].clone();
+
+    (0..chunk_count)
+        .map(|index| {
+            let old_start = index * MAX_LIFECYCLE_COMMITS_PER_CHUNK;
+            let new_start = index * MAX_LIFECYCLE_COMMITS_PER_CHUNK;
+            let old_chunk = invalidated
+                .get(
+                    old_start
+                        ..invalidated
+                            .len()
+                            .min(old_start + MAX_LIFECYCLE_COMMITS_PER_CHUNK),
+                )
+                .filter(|chunk| !chunk.is_empty())
+                .map(<[String]>::to_vec)
+                .unwrap_or_else(|| vec![old_anchor.clone()]);
+            let new_chunk = replacements
+                .get(
+                    new_start
+                        ..replacements
+                            .len()
+                            .min(new_start + MAX_LIFECYCLE_COMMITS_PER_CHUNK),
+                )
+                .filter(|chunk| !chunk.is_empty())
+                .map(<[String]>::to_vec)
+                .unwrap_or_else(|| vec![new_anchor.clone()]);
+            let values = LifecycleTransitionValues::new()
+                .operation_id(operation_id)
+                .operation_kind(operation_kind)
+                .old_tip(old_tip)
+                .new_tip(new_tip)
+                .invalidated_commit_shas(old_chunk)
+                .replacement_commit_shas(new_chunk)
+                .chunk_index(index as u32)
+                .chunk_count(chunk_count as u32)
+                .semantics(semantics);
+            MetricEvent::from_values(
+                values,
+                lifecycle_attrs(new_tip, branch, context).to_sparse(),
+            )
+        })
+        .collect()
+}
+
+fn lifecycle_operation_id(
+    operation_kind: &str,
+    old_tip: &str,
+    new_tip: &str,
+    branch: Option<&str>,
+) -> String {
+    let mut hash = Sha256::new();
+    for value in [operation_kind, old_tip, new_tip, branch.unwrap_or("")] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    format!("sha256:{:x}", hash.finalize())
+}
+
+fn lifecycle_attrs(
+    new_tip: &str,
+    branch: Option<&str>,
+    context: &RewriteMetricBatchContext,
+) -> EventAttributes {
+    let mut attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION")).commit_sha(new_tip);
+    attrs = attrs.author(&context.author);
+    if let Some(branch) = branch {
+        attrs = attrs.branch(branch);
+    }
+    if let Some(repo_url) = context.repo_url.as_deref() {
+        attrs = attrs.repo_url(repo_url);
+    }
+    if let Some(custom) = context.custom_attributes_json.as_deref() {
+        attrs = attrs.custom_attributes(custom);
+    }
+    attrs
 }
 
 fn hydrate_missing_parent_shas(repo: &Repository, metric_commits: &mut [RewriteMetricCommit]) {
@@ -188,6 +458,7 @@ fn parent_shas_for_commits(
 struct RewriteMetricBatchContext {
     ignore_patterns: Vec<String>,
     repo_url: Option<String>,
+    author: String,
     custom_attributes_json: Option<String>,
 }
 
@@ -196,6 +467,7 @@ impl RewriteMetricBatchContext {
         Self {
             ignore_patterns: effective_ignore_patterns(repo, &[], &[]),
             repo_url: rewrite_metric_repo_url(repo),
+            author: repo.effective_author_identity().formatted_or_unknown(),
             custom_attributes_json: rewrite_metric_custom_attributes_json(),
         }
     }
@@ -246,6 +518,7 @@ fn hydrate_missing_parent_diffs(repo: &Repository, metric_commits: &mut [Rewrite
 }
 
 fn build_rewrite_committed_metric_event(
+    repo: &Repository,
     metric_commit: &RewriteMetricCommit,
     batch_context: &RewriteMetricBatchContext,
 ) -> Result<Option<MetricEvent>, GitAiError> {
@@ -286,7 +559,20 @@ fn build_rewrite_committed_metric_event(
         .operation_kind(metric_commit.operation.as_str())
         .original_commit_shas(metric_commit.original_shas.clone());
 
-    values = values.commit_subject_null().commit_body_null().hunks_null();
+    let hunks_json = crate::commands::diff::build_diff_artifacts_from_hunks(
+        repo,
+        diff_hunks,
+        &metric_commit.new_sha,
+        Some(&authorship_log),
+    )
+    .ok()
+    .and_then(|artifacts| serde_json::to_string(&artifacts.json_hunks).ok());
+
+    values = values.commit_subject_null().commit_body_null();
+    values = match hunks_json {
+        Some(hunks) => values.hunks(hunks),
+        None => values.hunks_null(),
+    };
 
     let attrs = rewrite_metric_attrs(metric_commit, batch_context);
 
@@ -298,7 +584,11 @@ fn diff_hunks_from_diff_tree_result(
 ) -> Vec<crate::commands::diff::DiffHunk> {
     let mut hunks = Vec::new();
     for (file_path, file_hunks) in &result.hunks_by_file {
-        for hunk in file_hunks {
+        for (index, hunk) in file_hunks.iter().enumerate() {
+            let contents = result
+                .hunk_contents_by_file
+                .get(file_path)
+                .and_then(|file_contents| file_contents.get(index));
             hunks.push(crate::commands::diff::DiffHunk {
                 file_path: file_path.clone(),
                 old_file_path: None,
@@ -308,8 +598,8 @@ fn diff_hunks_from_diff_tree_result(
                 new_count: hunk.new_count,
                 deleted_lines: line_numbers(hunk.old_start, hunk.old_count),
                 added_lines: line_numbers(hunk.new_start, hunk.new_count),
-                deleted_contents: Vec::new(),
-                added_contents: Vec::new(),
+                deleted_contents: contents.map(|c| c.deleted.clone()).unwrap_or_default(),
+                added_contents: contents.map(|c| c.added.clone()).unwrap_or_default(),
             });
         }
     }
@@ -364,7 +654,8 @@ fn rewrite_metric_attrs(
     let base_commit_sha = metric_commit.parent_sha.as_deref().unwrap_or("initial");
     let mut attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
         .commit_sha(metric_commit.new_sha.clone())
-        .base_commit_sha(base_commit_sha);
+        .base_commit_sha(base_commit_sha)
+        .author(&batch_context.author);
 
     attrs = apply_rewrite_metric_branch(attrs, metric_commit);
 
@@ -559,6 +850,7 @@ mod tests {
         );
         let parent_diff = DiffTreeResult {
             hunks_by_file,
+            hunk_contents_by_file: HashMap::new(),
             added_lines_by_file: HashMap::new(),
             renames: Vec::new(),
         };
@@ -569,7 +861,7 @@ mod tests {
             .with_parent_diff(parent_diff);
 
         let batch_context = RewriteMetricBatchContext::new(tmp.gitai_repo());
-        let event = build_rewrite_committed_metric_event(&commit, &batch_context)
+        let event = build_rewrite_committed_metric_event(tmp.gitai_repo(), &commit, &batch_context)
             .expect("metric build")
             .expect("event");
 
@@ -625,18 +917,39 @@ mod tests {
 
         let events = build_rewrite_metric_events(tmp.gitai_repo(), &[commit]);
 
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(
-            events[0]
+            events[0].event_id,
+            crate::metrics::types::MetricEventId::LifecycleTransition as u16
+        );
+        assert_eq!(
+            events[1]
                 .attrs
                 .get(&crate::metrics::attrs::attr_pos::BASE_COMMIT_SHA.to_string()),
             Some(&serde_json::json!(parent_sha))
         );
         assert_eq!(
-            events[0]
+            events[1]
                 .values
                 .get(&rewrite_committed_pos::GIT_DIFF_ADDED_LINES.to_string()),
             Some(&serde_json::json!(1))
+        );
+        let hunks = events[1]
+            .values
+            .get(&rewrite_committed_pos::HUNKS.to_string())
+            .and_then(|value| value.as_str())
+            .expect("rewrite event hunks");
+        let hunks: serde_json::Value = serde_json::from_str(hunks).expect("valid hunk json");
+        assert!(hunks.as_array().is_some_and(|items| !items.is_empty()));
+        let expected_content_hash = format!("{:x}", Sha256::digest(b"ai"));
+        assert!(
+            hunks
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| {
+                    item.get("hunk_kind").and_then(|value| value.as_str()) == Some("addition")
+                        && item.get("content_hash").and_then(|value| value.as_str())
+                            == Some(expected_content_hash.as_str())
+                }))
         );
     }
 
@@ -653,18 +966,193 @@ mod tests {
 
         let events = build_rewrite_metric_events(tmp.gitai_repo(), &[commit]);
 
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(
-            events[0]
+            events[1]
                 .attrs
                 .get(&crate::metrics::attrs::attr_pos::BASE_COMMIT_SHA.to_string()),
             Some(&serde_json::json!("initial"))
         );
         assert_eq!(
-            events[0]
+            events[1]
                 .values
                 .get(&rewrite_committed_pos::GIT_DIFF_ADDED_LINES.to_string()),
             Some(&serde_json::json!(1))
+        );
+    }
+
+    #[test]
+    fn lifecycle_operation_id_is_stable_and_branch_sensitive() {
+        let first = lifecycle_operation_id("reset", "old", "new", Some("main"));
+        assert_eq!(
+            first,
+            lifecycle_operation_id("reset", "old", "new", Some("main"))
+        );
+        assert_ne!(
+            first,
+            lifecycle_operation_id("reset", "old", "new", Some("feature"))
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_chunk_at_512_and_never_invalidate_copy_sources() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        let context = RewriteMetricBatchContext::new(tmp.gitai_repo());
+        let invalidated = (0..513).map(|i| format!("old-{i}")).collect::<Vec<_>>();
+        let events = build_lifecycle_events(
+            "rebase",
+            "old-tip",
+            "new-tip",
+            Some("main"),
+            &invalidated,
+            &[],
+            "ref_transition",
+            &context,
+        );
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.event_id == 8));
+        assert_eq!(
+            events[0].values
+                [&crate::metrics::events::lifecycle_transition_pos::INVALIDATED_COMMIT_SHAS
+                    .to_string()]
+                .as_array()
+                .map(Vec::len),
+            Some(512)
+        );
+
+        let cherry = metric_commit("copy", &["source"], RewriteMetricOperation::CherryPick);
+        assert!(build_mapped_lifecycle_events(&cherry, &context).is_empty());
+    }
+
+    #[test]
+    fn replacement_chunks_keep_both_sides_with_anchor_after_one_side_exhausts() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        let context = RewriteMetricBatchContext::new(tmp.gitai_repo());
+        let invalidated = (0..513).map(|i| format!("old-{i}")).collect::<Vec<_>>();
+        let replacements = vec!["new-anchor".to_string()];
+        let events = build_lifecycle_events(
+            "rebase",
+            "old-tip",
+            "new-tip",
+            Some("main"),
+            &invalidated,
+            &replacements,
+            "replacement",
+            &context,
+        );
+
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let old = event.values
+                [&crate::metrics::events::lifecycle_transition_pos::INVALIDATED_COMMIT_SHAS
+                    .to_string()]
+                .as_array()
+                .expect("old side");
+            let new = event.values
+                [&crate::metrics::events::lifecycle_transition_pos::REPLACEMENT_COMMIT_SHAS
+                    .to_string()]
+                .as_array()
+                .expect("new side");
+            assert!(!old.is_empty());
+            assert!(!new.is_empty());
+            assert!(old.len() <= 512);
+            assert!(new.len() <= 512);
+            assert_eq!(new, &vec![serde_json::json!("new-anchor")]);
+        }
+    }
+
+    #[test]
+    fn amend_rebase_and_reset_emit_strong_replacement_or_ref_semantics() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        let context = RewriteMetricBatchContext::new(tmp.gitai_repo());
+
+        for operation in [
+            RewriteMetricOperation::Amend,
+            RewriteMetricOperation::Rebase,
+        ] {
+            let commit = metric_commit("new", &["old"], operation);
+            let events = build_mapped_lifecycle_events(&commit, &context);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].values
+                    [&crate::metrics::events::lifecycle_transition_pos::INVALIDATED_COMMIT_SHAS
+                        .to_string()],
+                serde_json::json!(["old"])
+            );
+            assert_eq!(
+                events[0].values
+                    [&crate::metrics::events::lifecycle_transition_pos::REPLACEMENT_COMMIT_SHAS
+                        .to_string()],
+                serde_json::json!(["new"])
+            );
+        }
+
+        let reset = build_lifecycle_events(
+            "reset",
+            "old-tip",
+            "new-tip",
+            Some("main"),
+            &[],
+            &[],
+            "ref_transition",
+            &context,
+        );
+        assert_eq!(reset.len(), 1);
+        assert_eq!(
+            reset[0].values[&crate::metrics::events::lifecycle_transition_pos::OLD_TIP.to_string()],
+            serde_json::json!("old-tip")
+        );
+        assert_eq!(
+            reset[0].values[&crate::metrics::events::lifecycle_transition_pos::NEW_TIP.to_string()],
+            serde_json::json!("new-tip")
+        );
+    }
+
+    #[test]
+    fn reset_transition_enumeration_captures_all_backward_and_forward_commits() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "a\n", false).expect("write a");
+        let first = tmp.commit_all("first").expect("first");
+        tmp.write_file("file.txt", "a\nb\n", false)
+            .expect("write b");
+        let second = tmp.commit_all("second").expect("second");
+        tmp.write_file("file.txt", "a\nb\nc\n", false)
+            .expect("write c");
+        let third = tmp.commit_all("third").expect("third");
+
+        let (invalidated, replacements) =
+            exclusive_commits_for_transition(tmp.gitai_repo(), &third, &first)
+                .expect("backward reset range");
+        assert_eq!(invalidated, vec![third.clone(), second.clone()]);
+        assert!(replacements.is_empty());
+
+        let (invalidated, replacements) =
+            exclusive_commits_for_transition(tmp.gitai_repo(), &first, &third)
+                .expect("forward reset range");
+        assert!(invalidated.is_empty());
+        assert_eq!(replacements, vec![third, second]);
+    }
+
+    #[test]
+    fn reset_lifecycle_branch_falls_back_to_current_head_off_ingestion_path() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "a\n", false).expect("write");
+        tmp.commit_all("first").expect("commit");
+        let expected = tmp
+            .gitai_repo()
+            .head()
+            .expect("head")
+            .shorthand()
+            .expect("branch")
+            .to_string();
+
+        assert_eq!(
+            resolve_lifecycle_branch(tmp.gitai_repo(), None),
+            Some(expected)
+        );
+        assert_eq!(
+            resolve_lifecycle_branch(tmp.gitai_repo(), Some("captured".to_string())),
+            Some("captured".to_string())
         );
     }
 }

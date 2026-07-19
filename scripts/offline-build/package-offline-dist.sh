@@ -85,6 +85,21 @@ awk -v repo="internal/git-ai-offline" -v version="v${OFFLINE_VERSION}" -v checks
     { print }
 ' "${REPO_ROOT}/install.ps1" > "${STAGING_DIR}/install.ps1"
 
+INSTALL_TEMPLATE=${GIT_AI_INSTALL_TEMPLATE:-}
+if [ -z "${INSTALL_TEMPLATE}" ] && [ -f "${DIST_DIR}/INSTALL.md" ]; then
+    INSTALL_TEMPLATE="${DIST_DIR}/INSTALL.md"
+fi
+if [ -z "${INSTALL_TEMPLATE}" ]; then
+    INSTALL_TEMPLATE=$(
+        find "${REPO_ROOT}/offline-dist" -mindepth 2 -maxdepth 2 -type f -name INSTALL.md -print 2>/dev/null \
+            | LC_ALL=C sort \
+            | tail -n 1
+    ) || true
+fi
+if [ -z "${INSTALL_TEMPLATE}" ] || [ ! -f "${INSTALL_TEMPLATE}" ]; then
+    fail "INSTALL.md template not found under offline-dist/. Set GIT_AI_INSTALL_TEMPLATE or keep a previous offline bundle."
+fi
+
 awk -v version="v${OFFLINE_VERSION}" -v vsix="${VSCODE_VSIX}" -v jetbrains="${JETBRAINS_ZIP}" '
     {
         gsub(/v[0-9][0-9.]*/, version)
@@ -92,7 +107,7 @@ awk -v version="v${OFFLINE_VERSION}" -v vsix="${VSCODE_VSIX}" -v jetbrains="${JE
         gsub(/Git_AI-[0-9.]+\.zip/, jetbrains)
         print
     }
-' "${REPO_ROOT}/offline-dist/git-ai-offline-v1.6.12/INSTALL.md" > "${STAGING_DIR}/INSTALL.md"
+' "${INSTALL_TEMPLATE}" > "${STAGING_DIR}/INSTALL.md"
 
 (
     cd "${STAGING_DIR}/linux"

@@ -1018,7 +1018,19 @@ impl StreamWorker {
 
         let mut base_attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
             .session_id(stream.session_id.clone())
-            .tool(&stream.tool);
+            .tool(&stream.tool)
+            .custom_attributes_map(config::Config::fresh().metrics_custom_attributes());
+
+        if let Some(format) =
+            crate::streams::sweep::StreamFormat::from_stored_name(&stream.stream_format)
+            && let Ok(Some(model)) = crate::streams::model_extraction::extract_model(
+                &path,
+                format,
+                Some(&stream.external_session_id),
+            )
+        {
+            base_attrs = base_attrs.model(model);
+        }
 
         if !is_shared_stream {
             base_attrs = base_attrs
@@ -1031,6 +1043,18 @@ impl StreamWorker {
             && let Some(url) = crate::repo_url::resolve_repo_url_from_path(work_dir)
         {
             base_attrs = base_attrs.repo_url(url);
+        }
+
+        if let Some(ref work_dir) = resolved_work_dir
+            && let Ok(repo) =
+                crate::git::repository::find_repository_in_path(&work_dir.to_string_lossy())
+        {
+            base_attrs = base_attrs.author(repo.effective_author_identity().formatted_or_unknown());
+            if let Ok(head) = repo.head()
+                && let Ok(branch) = head.shorthand()
+            {
+                base_attrs = base_attrs.branch(branch);
+            }
         }
 
         let file_meta = std::fs::metadata(&path).ok();

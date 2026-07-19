@@ -24,7 +24,7 @@ git-ai-offline-v1.6.13/
   vscode/
     git-ai.git-ai-vscode-0.1.23.vsix
   jetbrains/
-    Git_AI-0.1.12.zip
+    Git_AI-0.1.13.zip
 ```
 
 当前离线包支持：
@@ -34,7 +34,7 @@ git-ai-offline-v1.6.13/
 - macOS Apple Silicon `arm64`：`macos/git-ai-macos-arm64`
 - Windows `AMD64` / `x64`：`windows/git-ai-windows-x64.exe`
 - VS Code 和 Cursor：`vscode/git-ai.git-ai-vscode-0.1.23.vsix`
-- IntelliJ IDEA、PyCharm、WebStorm 等 JetBrains IDE：`jetbrains/Git_AI-0.1.12.zip`
+- IntelliJ IDEA、PyCharm、WebStorm 等 JetBrains IDE：`jetbrains/Git_AI-0.1.13.zip`
 
 ## 安装前注意事项
 
