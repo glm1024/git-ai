@@ -6003,33 +6003,53 @@ impl ActorDaemonCoordinator {
         let result = match request {
             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
             ControlRequest::CheckpointRun { request } => {
-                if let Some(worker) = &self.stream_worker
-                    && let Some(stream_source) = &request.stream_source
-                {
-                    let session_id = stream_source.session_id.clone();
+                let stream_notification = request.stream_source.as_ref().map(|stream_source| {
                     let tool = request
                         .agent_id
                         .as_ref()
                         .map(|aid| aid.tool.clone())
                         .unwrap_or_else(|| "unknown".to_string());
-                    let trace_id = request.trace_id.clone();
-                    let tool_use_id = request.metadata.get("tool_use_id").cloned();
+                    (
+                        stream_source.session_id.clone(),
+                        tool,
+                        request.trace_id.clone(),
+                        request.metadata.get("tool_use_id").cloned(),
+                        stream_source.path.clone(),
+                        request.files.first().map(|f| f.repo_work_dir.clone()),
+                        stream_source.external_session_id.clone(),
+                        stream_source.external_parent_session_id.clone(),
+                    )
+                });
 
-                    let repo_work_dir = request.files.first().map(|f| f.repo_work_dir.clone());
-
+                // Persist checkpoint metrics before the transcript worker can emit
+                // session/token events. Backends can then deterministically enrich
+                // those later events from checkpoint context (Kilo IDE/runtime data).
+                let result = self.ingest_checkpoint_payload(*request).await;
+                if result.is_ok()
+                    && let Some(worker) = &self.stream_worker
+                    && let Some((
+                        session_id,
+                        tool,
+                        trace_id,
+                        tool_use_id,
+                        stream_path,
+                        repo_work_dir,
+                        external_session_id,
+                        external_parent_session_id,
+                    )) = stream_notification
+                {
                     worker.notify_checkpoint(
                         session_id,
                         tool,
                         trace_id,
                         tool_use_id,
-                        stream_source.path.clone(),
+                        stream_path,
                         repo_work_dir,
-                        stream_source.external_session_id.clone(),
-                        stream_source.external_parent_session_id.clone(),
+                        external_session_id,
+                        external_parent_session_id,
                     );
                 }
-
-                self.ingest_checkpoint_payload(*request).await
+                result
             }
             ControlRequest::SyncFamily { repo_working_dir } => {
                 self.sync_family(repo_working_dir).await.and_then(|status| {

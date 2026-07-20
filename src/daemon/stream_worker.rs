@@ -1071,7 +1071,15 @@ impl StreamWorker {
                 break;
             }
 
-            let batch = agent.read_incremental(&path, current_watermark, &stream.session_id)?;
+            // `stream.session_id` is Git AI's stable hashed identifier. Readers
+            // for agent-owned databases (OpenCode/Kilo SQLite in particular)
+            // must query with the agent's raw session identifier instead.
+            let reader_session_id = if stream.external_session_id.is_empty() {
+                &stream.session_id
+            } else {
+                &stream.external_session_id
+            };
+            let batch = agent.read_incremental(&path, current_watermark, reader_session_id)?;
 
             if batch.events.is_empty() {
                 db.update_watermark(

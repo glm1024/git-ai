@@ -124,6 +124,7 @@ fn build_checkpoint_attrs(
     repo: &Repository,
     base_commit: &str,
     agent_id: Option<&AgentId>,
+    checkpoint_metadata: &HashMap<String, String>,
 ) -> crate::metrics::EventAttributes {
     // Extract session_id from agent_id if available
     let session_id = agent_id
@@ -143,8 +144,15 @@ fn build_checkpoint_attrs(
             .external_session_id(&agent_id.id);
     }
 
-    // Attach custom attributes using Config::fresh() to support runtime config updates
-    attrs = attrs.custom_attributes_map(crate::config::Config::fresh().metrics_custom_attributes());
+    // Attach custom attributes using Config::fresh() to support runtime config updates.
+    // Kilo runtime metadata is added through a narrow allowlist so paths, raw session
+    // IDs, and arbitrary hook input never leak into telemetry custom attributes.
+    let config = crate::config::Config::fresh();
+    let custom_attributes = checkpoint_metric_custom_attributes(
+        config.metrics_custom_attributes(),
+        checkpoint_metadata,
+    );
+    attrs = attrs.custom_attributes_map(&custom_attributes);
 
     // Add repo URL
     if let Some(url) = crate::repo_url::resolve_repo_url_from_repo(repo) {
@@ -159,6 +167,34 @@ fn build_checkpoint_attrs(
     }
 
     attrs
+}
+
+fn checkpoint_metric_custom_attributes(
+    configured: &HashMap<String, String>,
+    checkpoint_metadata: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = configured.clone();
+    if checkpoint_metadata.get("integration").map(String::as_str) != Some("kilo-v7") {
+        return merged;
+    }
+
+    let mut copy = |source: &str, target: &str| {
+        if let Some(value) = checkpoint_metadata
+            .get(source)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            merged.insert(target.to_string(), value.to_string());
+        }
+    };
+    copy("platform", "ide");
+    copy("platform", "kilo_platform");
+    copy("client", "kilo_client");
+    copy("editor_name", "editor_name");
+    copy("kilo_version", "kilo_version");
+    copy("integration", "integration");
+    copy("model_provider", "model_provider");
+    merged
 }
 
 pub fn execute_resolved_checkpoint_from_daemon(
@@ -340,8 +376,12 @@ fn execute_resolved_checkpoint(
         );
         checkpoints.push(checkpoint.clone());
 
-        let mut attrs =
-            build_checkpoint_attrs(repo, &resolved.base_commit, checkpoint.agent_id.as_ref());
+        let mut attrs = build_checkpoint_attrs(
+            repo,
+            &resolved.base_commit,
+            checkpoint.agent_id.as_ref(),
+            &checkpoint_request.metadata,
+        );
 
         // Add trace_id to attributes - links all checkpoint events together
         if let Some(ref tid) = checkpoint.trace_id {
@@ -1120,4 +1160,61 @@ fn compute_line_stats(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod kilo_runtime_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_metrics_merge_only_allowlisted_kilo_runtime_metadata() {
+        let configured = HashMap::from([
+            ("organization_id".to_string(), "org-1".to_string()),
+            ("ide".to_string(), "configured".to_string()),
+        ]);
+        let metadata = HashMap::from([
+            ("platform".to_string(), "jetbrains".to_string()),
+            ("client".to_string(), "jetbrains".to_string()),
+            ("editor_name".to_string(), "IntelliJ IDEA".to_string()),
+            ("kilo_version".to_string(), "7.4.11".to_string()),
+            ("integration".to_string(), "kilo-v7".to_string()),
+            ("model_provider".to_string(), "openai".to_string()),
+            ("database_path".to_string(), "/secret/kilo.db".to_string()),
+            ("session_id".to_string(), "raw-session".to_string()),
+        ]);
+
+        let merged = checkpoint_metric_custom_attributes(&configured, &metadata);
+
+        assert_eq!(
+            merged.get("organization_id").map(String::as_str),
+            Some("org-1")
+        );
+        assert_eq!(merged.get("ide").map(String::as_str), Some("jetbrains"));
+        assert_eq!(
+            merged.get("kilo_platform").map(String::as_str),
+            Some("jetbrains")
+        );
+        assert_eq!(
+            merged.get("kilo_client").map(String::as_str),
+            Some("jetbrains")
+        );
+        assert_eq!(
+            merged.get("editor_name").map(String::as_str),
+            Some("IntelliJ IDEA")
+        );
+        assert_eq!(
+            merged.get("kilo_version").map(String::as_str),
+            Some("7.4.11")
+        );
+        assert_eq!(
+            merged.get("integration").map(String::as_str),
+            Some("kilo-v7")
+        );
+        assert_eq!(
+            merged.get("model_provider").map(String::as_str),
+            Some("openai")
+        );
+        assert!(!merged.contains_key("database_path"));
+        assert!(!merged.contains_key("session_id"));
+    }
 }

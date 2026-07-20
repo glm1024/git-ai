@@ -1013,6 +1013,7 @@ fn is_known_checkpoint_preset(arg: &str) -> bool {
             | "amp"
             | "windsurf"
             | "opencode"
+            | "kilo"
             | "pi"
             | "ai_tab"
             | "firebender"
