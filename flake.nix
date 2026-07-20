@@ -36,7 +36,7 @@
         # Build the git-ai binary using the pinned Rust toolchain
         git-ai-unwrapped = rustPlatform.buildRustPackage {
           pname = "git-ai";
-          version = "1.6.13";
+          version = "1.6.16";
 
           src = ./.;
 

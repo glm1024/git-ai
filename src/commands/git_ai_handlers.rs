@@ -191,6 +191,9 @@ pub fn handle_git_ai(args: &[String]) {
         "flush-metrics-db" => {
             commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
         }
+        "await" => {
+            commands::r#await::handle_await(&args[1..]);
+        }
         "login" => {
             commands::login::handle_login(&args[1..]);
         }
@@ -317,7 +320,7 @@ fn print_help() {
     eprintln!("Commands:");
     eprintln!("  checkpoint         Checkpoint working changes and attribute author");
     eprintln!(
-        "    Presets: claude, codex, continue-cli, cursor, gemini, github-copilot, amp, windsurf, opencode, pi, ai_tab, firebender, human, mock_ai, mock_known_human, known_human"
+        "    Presets: claude, cline, codex, continue-cli, cursor, gemini, github-copilot, amp, windsurf, opencode, pi, ai_tab, firebender, human, mock_ai, mock_known_human, known_human"
     );
     eprintln!(
         "    --hook-input <json|stdin>   JSON payload required by presets, or 'stdin' to read from stdin"
@@ -371,6 +374,8 @@ fn print_help() {
     eprintln!("  ci                 Continuous integration utilities");
     eprintln!("    github                 GitHub CI helpers");
     eprintln!("  git-path           Print the path to the underlying git executable");
+    eprintln!("  await [beta]       Wait for the background service to finish all work");
+    eprintln!("    --timeout <seconds>    Maximum time to wait (default: 30)");
     eprintln!("  upgrade            Check for updates and install if available");
     eprintln!("    --force               Reinstall latest version even if already up to date");
     eprintln!("  fetch-notes [remote] Synchronously fetch AI authorship notes");
@@ -1209,11 +1214,14 @@ fn discover_dirty_files_from_status(cwd: &std::path::Path) -> Vec<String> {
         .and_then(|r| r.workdir().ok())
         .unwrap_or_else(|| cwd.to_path_buf());
 
-    let output = std::process::Command::new(crate::config::Config::get().git_cmd())
-        .args(["status", "--porcelain", "-uall"])
-        .current_dir(cwd)
-        .output()
-        .ok();
+    let args = vec![
+        "-C".to_string(),
+        cwd.to_string_lossy().to_string(),
+        "status".to_string(),
+        "--porcelain".to_string(),
+        "-uall".to_string(),
+    ];
+    let output = crate::git::repository::exec_git(&args).ok();
     let Some(output) = output else {
         return vec![];
     };

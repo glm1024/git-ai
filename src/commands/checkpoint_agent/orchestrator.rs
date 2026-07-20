@@ -454,6 +454,28 @@ fn execute_pre_bash_call(e: PreBashCall) -> Result<Vec<CheckpointRequest>, GitAi
         }
     };
 
+    if config::Config::get()
+        .get_feature_flags()
+        .bash_checkpoints_v2
+    {
+        bash_tool::signal_daemon_bash_hook_attempt(
+            BashHookAttemptPhase::Start,
+            BashHookAttemptSignal {
+                original_cwd: e.context.cwd.as_path(),
+                discovered_repo_work_dir: Some(&repo_work_dir),
+                repo_discovery_error: None,
+                session_id: &e.context.external_session_id,
+                tool_use_id: &e.tool_use_id,
+                agent_id: &e.context.agent_id,
+                metadata: &e.context.metadata,
+                trace_id: &e.context.trace_id,
+                timestamp_ns: started_at_ns,
+                command: e.command.as_deref(),
+            },
+        );
+        return Ok(vec![]);
+    }
+
     let dirty_paths = match bash_tool::handle_bash_pre_tool_use_with_context_and_cwd(
         &repo_work_dir,
         e.context.cwd.as_path(),
@@ -528,6 +550,28 @@ fn execute_post_bash_call(e: PostBashCall) -> Result<Vec<CheckpointRequest>, Git
             return Ok(vec![]);
         }
     };
+
+    if config::Config::get()
+        .get_feature_flags()
+        .bash_checkpoints_v2
+    {
+        bash_tool::signal_daemon_bash_hook_attempt(
+            BashHookAttemptPhase::End,
+            BashHookAttemptSignal {
+                original_cwd: e.context.cwd.as_path(),
+                discovered_repo_work_dir: Some(&repo_work_dir),
+                repo_discovery_error: None,
+                session_id: &e.context.external_session_id,
+                tool_use_id: &e.tool_use_id,
+                agent_id: &e.context.agent_id,
+                metadata: &e.context.metadata,
+                trace_id: &e.context.trace_id,
+                timestamp_ns: ended_at_ns,
+                command: e.command.as_deref(),
+            },
+        );
+        return Ok(vec![]);
+    }
 
     let bash_result = bash_tool::handle_bash_post_tool_use_with_cwd(
         &repo_work_dir,
