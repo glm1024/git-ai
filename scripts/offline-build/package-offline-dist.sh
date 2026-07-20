@@ -110,18 +110,16 @@ awk -v version="v${OFFLINE_VERSION}" -v vsix="${VSCODE_VSIX}" -v jetbrains="${JE
 ' "${INSTALL_TEMPLATE}" > "${STAGING_DIR}/INSTALL.md"
 
 (
-    cd "${STAGING_DIR}/linux"
-    shasum -a 256 git-ai-linux-arm64 git-ai-linux-x64
-    cd "${STAGING_DIR}/macos"
-    shasum -a 256 git-ai-macos-arm64
-    cd "${STAGING_DIR}/windows"
-    shasum -a 256 git-ai-windows-x64.exe
-    cd "${STAGING_DIR}/vscode"
-    shasum -a 256 "${VSCODE_VSIX}"
-    cd "${STAGING_DIR}/jetbrains"
-    shasum -a 256 "${JETBRAINS_ZIP}"
     cd "${STAGING_DIR}"
-    shasum -a 256 install.sh install.ps1
+    shasum -a 256 \
+        linux/git-ai-linux-arm64 \
+        linux/git-ai-linux-x64 \
+        macos/git-ai-macos-arm64 \
+        windows/git-ai-windows-x64.exe \
+        "vscode/${VSCODE_VSIX}" \
+        "jetbrains/${JETBRAINS_ZIP}" \
+        install.sh \
+        install.ps1
 ) | LC_ALL=C sort > "${STAGING_DIR}/SHA256SUMS"
 
 {
