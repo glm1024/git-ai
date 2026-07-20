@@ -1,6 +1,6 @@
-source_commit=d078ea2705055859daca52709d422904fd2b2570
+source_commit=08594b6ef4af8f3cdcd228047c601a94c3e892ec
 source_dirty=false
 cli_version=1.6.16
 vscode_version=0.1.23
 jetbrains_version=0.1.13
-built_at_utc=2026-07-20T09:24:43Z
+built_at_utc=2026-07-20T09:35:42Z
