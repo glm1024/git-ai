@@ -18,7 +18,7 @@ export class BlameQueue<T> {
   private static readonly MAX_CONCURRENT = 2;
   
   private queue: BlameTask<T>[] = [];
-  private running: Map<string, BlameTask<T>> = new Map();
+  private running: Set<BlameTask<T>> = new Set();
   
   /**
    * Enqueue a blame task. Returns a promise that resolves when the task completes.
@@ -70,10 +70,11 @@ export class BlameQueue<T> {
     });
     
     // Cancel running task if exists
-    const runningTask = this.running.get(uriString);
-    if (runningTask) {
-      runningTask.abortController.abort();
-      // Don't remove from running map here - let the task complete and clean up
+    for (const task of this.running) {
+      if (task.uri.toString() === uriString) {
+        task.abortController.abort();
+        // Don't remove from the running set here - let the task complete and clean up
+      }
     }
   }
   
@@ -111,12 +112,11 @@ export class BlameQueue<T> {
   private processQueue(): void {
     while (this.running.size < BlameQueue.MAX_CONCURRENT && this.queue.length > 0) {
       const task = this.queue.shift()!;
-      const uriString = task.uri.toString();
       
-      this.running.set(uriString, task);
+      this.running.add(task);
       
       this.executeTask(task).finally(() => {
-        this.running.delete(uriString);
+        this.running.delete(task);
         this.processQueue();
       });
     }
@@ -160,7 +160,6 @@ export class BlameQueue<T> {
     return this.running.size;
   }
 }
-
 
 
 

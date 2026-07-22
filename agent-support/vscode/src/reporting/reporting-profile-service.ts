@@ -4,9 +4,12 @@ import { getGitAiBinary, resolveGitAiBinary } from "../utils/binary-path";
 import {
   DEFAULT_METRICS_API_BASE_URL,
   emptyReportingProfile,
+  formatOrganizationHttpError,
+  formatOrganizationRequestError,
   mergeReportingSettings,
   normalizeOrganizationOptions,
   normalizeReportingSettings,
+  ORGANIZATION_UNAVAILABLE_MESSAGE,
   resolveOrganizationOptionsUrl,
   type OrganizationOptions,
   type ReportingProfile,
@@ -82,7 +85,8 @@ export class ReportingProfileService {
     try {
       endpoint = resolveOrganizationOptionsUrl(rawUrl);
     } catch (error) {
-      return { error: toErrorMessage(error, "上报服务器地址无效") };
+      console.warn("[git-ai] Reporting organization address is invalid:", toErrorMessage(error, "上报服务器地址无效"));
+      return { error: ORGANIZATION_UNAVAILABLE_MESSAGE };
     }
 
     try {
@@ -95,7 +99,7 @@ export class ReportingProfileService {
         clearTimeout(timeout);
       }
       if (!response.ok) {
-        throw new Error(`组织架构服务返回 HTTP ${response.status}`);
+        throw new Error(formatOrganizationHttpError(response.status));
       }
       const options = normalizeOrganizationOptions(await response.json());
       const fetchedAt = Date.now();
@@ -104,6 +108,8 @@ export class ReportingProfileService {
       await this.context.globalState.update(ORGANIZATION_CACHE_KEY, cache);
       return { endpoint, options, source: "server", fetchedAt };
     } catch (error) {
+      const errorMessage = formatOrganizationRequestError(error);
+      console.warn(`[git-ai] Failed to load reporting organization options from ${endpoint}: ${errorMessage}`);
       const cache = this.context.globalState.get<OrganizationCache>(ORGANIZATION_CACHE_KEY) ?? {};
       const cached = cache[endpoint];
       if (cached && Date.now() - cached.fetchedAt <= ORGANIZATION_CACHE_MAX_AGE_MS) {
@@ -112,10 +118,10 @@ export class ReportingProfileService {
           options: cached.options,
           source: "cache",
           fetchedAt: cached.fetchedAt,
-          error: `${toErrorMessage(error, "组织架构服务不可用")}；正在使用上次成功加载的数据`,
+          error: ORGANIZATION_UNAVAILABLE_MESSAGE,
         };
       }
-      return { endpoint, error: toErrorMessage(error, "无法加载组织架构") };
+      return { endpoint, error: ORGANIZATION_UNAVAILABLE_MESSAGE };
     }
   }
 

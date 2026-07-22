@@ -147,25 +147,56 @@ pub(crate) fn spawn_ref_lifecycle_transition_metrics(
     let new_tip = new_tip.into();
     let semantics = semantics.into();
     std::thread::spawn(move || {
-        let context = RewriteMetricBatchContext::new(&repo);
-        let branch = resolve_lifecycle_branch(&repo, branch);
-        // One detached plumbing call returns both sides of the ref move. This
-        // is outside trace2 ingestion and avoids per-commit subprocesses while
-        // still sending the complete reset/rebase/drop set.
-        let (invalidated, replacements) =
-            exclusive_commits_for_transition(&repo, &old_tip, &new_tip).unwrap_or_default();
-        let events = build_lifecycle_events(
+        match build_ref_lifecycle_transition_events(
+            &repo,
             &operation_kind,
             &old_tip,
             &new_tip,
-            branch.as_deref(),
-            &invalidated,
-            &replacements,
+            branch,
             &semantics,
-            &context,
-        );
-        submit_events(events);
+        ) {
+            Ok(events) => submit_events(events),
+            Err(error) => tracing::warn!(
+                %error,
+                operation_kind,
+                old_tip,
+                new_tip,
+                "skipping lifecycle transition metric because commit enumeration failed"
+            ),
+        }
     });
+}
+
+/// Build a ref transition only when both exclusive commit sets were observed.
+/// A tip-only event is not a safe fallback because downstream consumers may
+/// interpret its old/new tips as authoritative lifecycle replacements.
+fn build_ref_lifecycle_transition_events(
+    repo: &Repository,
+    operation_kind: &str,
+    old_tip: &str,
+    new_tip: &str,
+    branch: Option<String>,
+    semantics: &str,
+) -> Result<Vec<MetricEvent>, GitAiError> {
+    // One detached plumbing call returns both sides of the ref move. This is
+    // outside trace2 ingestion and avoids per-commit subprocesses while still
+    // sending the complete reset/rebase/drop set.
+    let (invalidated, replacements) = exclusive_commits_for_transition(repo, old_tip, new_tip)?;
+    if invalidated.is_empty() && replacements.is_empty() {
+        return Ok(Vec::new());
+    }
+    let context = RewriteMetricBatchContext::new(repo);
+    let branch = resolve_lifecycle_branch(repo, branch);
+    Ok(build_lifecycle_events(
+        operation_kind,
+        old_tip,
+        new_tip,
+        branch.as_deref(),
+        &invalidated,
+        &replacements,
+        semantics,
+        &context,
+    ))
 }
 
 fn resolve_lifecycle_branch(repo: &Repository, branch: Option<String>) -> Option<String> {
@@ -1131,6 +1162,43 @@ mod tests {
                 .expect("forward reset range");
         assert!(invalidated.is_empty());
         assert_eq!(replacements, vec![third, second]);
+    }
+
+    #[test]
+    fn failed_ref_transition_enumeration_does_not_build_tip_only_lifecycle_event() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "a\n", false).expect("write");
+        tmp.commit_all("first").expect("commit");
+
+        let result = build_ref_lifecycle_transition_events(
+            tmp.gitai_repo(),
+            "reset",
+            "missing-old-tip",
+            "missing-new-tip",
+            Some("main".to_string()),
+            "ref_transition",
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn no_op_ref_transition_does_not_build_tip_only_lifecycle_event() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "a\n", false).expect("write");
+        let tip = tmp.commit_all("first").expect("commit");
+
+        let events = build_ref_lifecycle_transition_events(
+            tmp.gitai_repo(),
+            "reset",
+            &tip,
+            &tip,
+            Some("main".to_string()),
+            "ref_transition",
+        )
+        .expect("enumerate no-op transition");
+
+        assert!(events.is_empty());
     }
 
     #[test]

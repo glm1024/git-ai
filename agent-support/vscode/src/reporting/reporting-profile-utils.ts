@@ -1,4 +1,5 @@
 export const DEFAULT_METRICS_API_BASE_URL = "http://100.7.132.102:8081/prod-api";
+export const ORGANIZATION_UNAVAILABLE_MESSAGE = "上报地址不可用";
 
 const ORGANIZATION_OPTIONS_PATH = "/api/v1/ai-code-stats/organization-options";
 const KNOWN_ENDPOINT_PATHS = [
@@ -53,6 +54,26 @@ export function normalizeReportingSettings(settings: ReportingSettings): Reporti
   };
 }
 
+export function normalizeReportingSettingsForOrganization(
+  settings: ReportingSettings,
+  organizationOptions?: OrganizationOptions,
+): ReportingSettings {
+  const normalized = normalizeReportingSettings(settings);
+  if (!organizationOptions || !normalized.profile.teamName) {
+    return normalized;
+  }
+  const office = organizationOptions.departments
+    .find((department) => department.name === normalized.profile.departmentName)?.offices
+    .find((item) => item.name === normalized.profile.officeName);
+  if (!office || office.teams.length > 0) {
+    return normalized;
+  }
+  return {
+    ...normalized,
+    profile: { ...normalized.profile, teamName: "" },
+  };
+}
+
 export function mergeReportingSettings(
   saved: ReportingSettings,
   kilo: ReportingSettings,
@@ -100,7 +121,12 @@ export function normalizeMetricsApiBaseUrl(rawValue: string): string {
   if (!trimmed) {
     return "";
   }
-  const url = new URL(trimmed);
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new Error("上报服务器地址格式不正确，请填写以 http:// 或 https:// 开头的地址");
+  }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("上报服务器地址必须以 http:// 或 https:// 开头");
   }
@@ -179,15 +205,62 @@ export function normalizeOrganizationOptions(value: unknown): OrganizationOption
   };
 }
 
+export function formatOrganizationHttpError(status: number): string {
+  if (status === 401 || status === 403) {
+    return `无权访问组织架构服务（HTTP ${status}），请联系管理员检查服务权限`;
+  }
+  if (status === 404) {
+    return "找不到组织架构接口（HTTP 404），请检查上报服务器地址或联系管理员确认服务版本";
+  }
+  if (status === 429) {
+    return "组织架构服务请求过于频繁（HTTP 429），请稍后重试";
+  }
+  if (status >= 500) {
+    return `组织架构服务暂时不可用（HTTP ${status}），请稍后重试或联系管理员`;
+  }
+  return `组织架构服务请求失败（HTTP ${status}），请检查上报服务器地址和服务配置`;
+}
+
+export function formatOrganizationRequestError(error: unknown): string {
+  const name = objectStringField(error, "name");
+  const code = nestedErrorCode(error);
+  if (name === "AbortError" || ["ABORT_ERR", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"].includes(code)) {
+    return "连接上报服务器超时，请检查服务器地址和网络后重试";
+  }
+  if (code === "ENOTFOUND") {
+    return "无法解析上报服务器地址，请检查域名和网络后重试";
+  }
+  if (code === "ECONNREFUSED") {
+    return "无法连接上报服务器，请检查服务器地址、端口以及服务是否已启动";
+  }
+  if (["EHOSTUNREACH", "ENETUNREACH", "ECONNRESET", "UND_ERR_SOCKET"].includes(code)) {
+    return "无法连接上报服务器，请检查服务器地址和网络后重试";
+  }
+  if (["DEPTH_ZERO_SELF_SIGNED_CERT", "CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"].includes(code)) {
+    return "无法建立安全连接，请联系管理员检查上报服务器的 HTTPS 证书";
+  }
+  const message = error instanceof Error ? error.message.trim() : "";
+  if (error instanceof SyntaxError) {
+    return "组织架构服务返回的数据格式不正确，请联系管理员检查服务配置";
+  }
+  if (/^(fetch failed|failed to fetch)$/i.test(message)) {
+    return "无法连接上报服务器，请检查服务器地址、端口和网络后重试";
+  }
+  if (/[\u3400-\u9fff]/.test(message)) {
+    return message;
+  }
+  return "无法加载组织架构，请检查服务器地址和网络后重试";
+}
+
 export function validateReportingSettings(settings: ReportingSettings, organizationOptions?: OrganizationOptions): string | undefined {
   let normalized: ReportingSettings;
   try {
     normalized = normalizeReportingSettings(settings);
-  } catch (error) {
-    return error instanceof Error ? error.message : "上报服务器地址无效";
+  } catch {
+    return ORGANIZATION_UNAVAILABLE_MESSAGE;
   }
   if (!normalized.metricsApiBaseUrl) {
-    return "请填写上报服务器地址";
+    return ORGANIZATION_UNAVAILABLE_MESSAGE;
   }
   if (!normalized.profile.departmentName) {
     return "请选择部门";
@@ -232,4 +305,23 @@ export function teamOptions(settings: ReportingSettings, options?: OrganizationO
 function isValidEmail(value: string): boolean {
   const at = value.indexOf("@");
   return at > 0 && at < value.length - 3 && value.slice(at + 1).includes(".");
+}
+
+function nestedErrorCode(value: unknown, depth = 0): string {
+  if (!value || typeof value !== "object" || depth > 3) {
+    return "";
+  }
+  const code = objectStringField(value, "code");
+  if (code) {
+    return code;
+  }
+  return nestedErrorCode((value as { cause?: unknown }).cause, depth + 1);
+}
+
+function objectStringField(value: unknown, key: string): string {
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === "string" ? field : "";
 }

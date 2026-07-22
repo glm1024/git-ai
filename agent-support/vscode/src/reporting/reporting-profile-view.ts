@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import {
-  normalizeReportingSettings,
+  normalizeReportingSettingsForOrganization,
   validateReportingSettings,
   type ReportingSettings,
 } from "./reporting-profile-utils";
@@ -77,8 +77,9 @@ export class ReportingProfileViewProvider implements vscode.WebviewViewProvider 
       await this.postMessage({ type: "saveResult", ok: false, error });
       return;
     }
+    const settingsForSave = normalizeReportingSettingsForOrganization(settings, this.organization?.options);
     try {
-      const saved = await this.service.save(normalizeReportingSettings(settings));
+      const saved = await this.service.save(settingsForSave);
       await this.postMessage({ type: "saveResult", ok: true, settings: saved });
     } catch (saveError) {
       await this.postMessage({
@@ -137,11 +138,12 @@ function getHtml(webview: vscode.Webview): string {
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--vscode-sideBar-background); color: var(--vscode-foreground); }
     main { min-height: 100vh; padding: 18px 16px 24px; }
-    .page-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 0 0 22px; }
-    h1 { margin: 0; font-size: 18px; font-weight: 600; }
-    .header-actions { display: inline-flex; align-items: center; gap: 12px; }
-    .save-state { display: inline-flex; align-items: center; gap: 6px; color: var(--vscode-descriptionForeground); font-size: 12px; white-space: nowrap; }
-    .save-state::before { content: ""; width: 7px; height: 7px; border-radius: 999px; background: var(--vscode-descriptionForeground); }
+    .page-header { display: flex; align-items: center; gap: 16px; margin: 0 0 22px; }
+    h1 { flex: 0 0 auto; margin: 0; font-size: 18px; font-weight: 600; white-space: nowrap; }
+    .header-actions { display: flex; flex: 1 1 auto; min-width: 0; align-items: center; justify-content: flex-end; gap: 12px; }
+    .save-state { display: flex; flex: 1 1 auto; min-width: 0; align-items: center; justify-content: flex-end; gap: 6px; color: var(--vscode-descriptionForeground); font-size: 12px; }
+    .save-state::before { content: ""; flex: 0 0 auto; width: 7px; height: 7px; border-radius: 999px; background: var(--vscode-descriptionForeground); }
+    .save-state-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .save-state.saved { color: #72d69a; }.save-state.saved::before { background: #72d69a; }
     .save-state.dirty { color: #e7b864; }.save-state.dirty::before { background: #e7b864; }
     .save-state.error { color: var(--vscode-errorForeground); }.save-state.error::before { background: var(--vscode-errorForeground); }
@@ -174,14 +176,18 @@ function getHtml(webview: vscode.Webview): string {
     button:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
     button:active:not(:disabled) { transform: translateY(1px); }
-    #save { min-width: 104px; padding: 0 24px; color: #1f1f1f; font-weight: 400; }
+    #save { flex: 0 0 auto; min-width: 104px; padding: 0 24px; color: #1f1f1f; font-weight: 400; }
+    @media (max-width: 360px) {
+      .page-header { flex-direction: column; align-items: stretch; gap: 10px; }
+      .save-state { justify-content: flex-start; }
+    }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 1ms !important; transition-duration: 1ms !important; } }
     #team-field[hidden] { display: none; }
   </style>
 </head>
 <body>
   <main>
-    <div class="page-header"><h1>数据上报</h1><div class="header-actions"><div id="save-state" class="save-state saved" role="status" aria-live="polite">已保存</div><button id="save" type="button"><span id="save-label">保存</span></button></div></div>
+    <div class="page-header"><h1>数据上报</h1><div class="header-actions"><div id="save-state" class="save-state saved" role="status" aria-live="polite"><span id="save-state-text" class="save-state-text">已保存</span></div><button id="save" type="button"><span id="save-label">保存</span></button></div></div>
     <div class="header-rule"></div>
     <div class="field-cluster">
       <div class="field"><label for="department">部门</label><div class="select-control"><button id="department" class="select-trigger" type="button" role="combobox" aria-expanded="false" aria-controls="department-menu"><span id="department-value">请选择部门</span></button><div id="department-menu" class="select-menu" role="listbox" hidden></div></div></div>
@@ -199,7 +205,7 @@ function getHtml(webview: vscode.Webview): string {
     const state = { settings: { metricsApiBaseUrl: '', profile: { departmentName: '', officeName: '', teamName: '', userName: '', userEmail: '' } }, organization: undefined, cliError: '', saveError: '', saving: false, dirty: false, openMenu: '' };
     let serverTimer;
     const element = (id) => document.getElementById(id);
-    const setSaveState = (text, kind) => { const node = element('save-state'); node.textContent = text; node.className = 'save-state ' + kind; };
+    const setSaveState = (text, kind) => { const node = element('save-state'); element('save-state-text').textContent = text; node.className = 'save-state ' + kind; node.title = text; };
     const updateSelect = (id, placeholder, items, selected) => {
       const trigger = element(id); const value = element(id + '-value'); const menu = element(id + '-menu');
       value.textContent = selected || placeholder; menu.replaceChildren();
@@ -210,7 +216,6 @@ function getHtml(webview: vscode.Webview): string {
       const isOpen = state.openMenu === id && !trigger.disabled; trigger.setAttribute('aria-expanded', String(isOpen)); trigger.parentElement.classList.toggle('is-open', isOpen); menu.hidden = !isOpen;
     };
     const offices = () => state.organization?.options?.departments.find((department) => department.name === state.settings.profile.departmentName)?.offices || [];
-    const teams = () => offices().find((office) => office.name === state.settings.profile.officeName)?.teams || [];
     const renderSaveState = () => {
       if (state.cliError) setSaveState(state.cliError, 'error');
       else if (state.saveError) setSaveState(state.saveError, 'error');
@@ -223,11 +228,11 @@ function getHtml(webview: vscode.Webview): string {
       const options = state.organization?.options;
       updateSelect('department', '请选择部门', options?.departments.map((department) => department.name) || [], state.settings.profile.departmentName);
       updateSelect('office', state.settings.profile.departmentName ? '请选择处' : '请先选择部门', offices().map((office) => office.name), state.settings.profile.officeName);
-      const availableTeams = teams(); const teamField = element('team-field'); teamField.hidden = availableTeams.length === 0;
-      if (availableTeams.length === 0 && state.settings.profile.teamName) { state.settings.profile.teamName = ''; state.saveError = ''; state.dirty = true; }
+      const selectedOffice = offices().find((office) => office.name === state.settings.profile.officeName);
+      const availableTeams = selectedOffice?.teams || []; const teamField = element('team-field'); teamField.hidden = selectedOffice ? availableTeams.length === 0 : !state.settings.profile.teamName;
       updateSelect('team', '请选择组', availableTeams, state.settings.profile.teamName);
       element('office').disabled = !state.settings.profile.departmentName || !options;
-      element('team').disabled = !state.settings.profile.officeName || !options;
+      element('team').disabled = !selectedOffice || availableTeams.length === 0;
       element('user-name').value = state.settings.profile.userName;
       element('user-email').value = state.settings.profile.userEmail;
       element('server-url').value = state.settings.metricsApiBaseUrl;

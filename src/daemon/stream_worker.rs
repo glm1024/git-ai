@@ -40,6 +40,21 @@ pub fn extract_event_timestamp(event: &serde_json::Value) -> Option<u32> {
     }
 }
 
+fn persist_metrics_before_advancing_watermark<Persist, Advance>(
+    persist: Persist,
+    advance: Advance,
+) -> Result<(), StreamError>
+where
+    Persist: FnOnce() -> Result<(), crate::error::GitAiError>,
+    Advance: FnOnce() -> Result<(), StreamError>,
+{
+    persist().map_err(|error| StreamError::Transient {
+        message: format!("failed to persist transcript metrics locally: {error}"),
+        retry_after: Duration::from_secs(5),
+    })?;
+    advance()
+}
+
 /// Priority levels for processing tasks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
@@ -1201,9 +1216,21 @@ impl StreamWorker {
                 })
                 .collect();
 
-            if let Err(e) = telemetry.persist_metrics_blocking(&metric_events) {
-                tracing::warn!(%e, "telemetry: failed to persist transcript metrics locally");
-            }
+            persist_metrics_before_advancing_watermark(
+                || {
+                    telemetry
+                        .persist_metrics_blocking(&metric_events)
+                        .map(|_| ())
+                },
+                || {
+                    db.update_watermark(
+                        &stream.session_id,
+                        &task.stream_kind,
+                        &stream.stream_path,
+                        batch.new_watermark.as_ref(),
+                    )
+                },
+            )?;
 
             // Backpressure: after synchronous local persistence, this mainly
             // throttles when metrics upload is available and pending DB rows
@@ -1223,12 +1250,6 @@ impl StreamWorker {
             }
 
             total_events += batch_count;
-            db.update_watermark(
-                &stream.session_id,
-                &task.stream_kind,
-                &stream.stream_path,
-                batch.new_watermark.as_ref(),
-            )?;
             current_watermark = batch.new_watermark;
         }
 
@@ -1492,7 +1513,28 @@ mod extract_event_timestamp_tests {
 #[cfg(test)]
 mod scheduling_tests {
     use super::*;
+    use std::cell::Cell;
     use tempfile::TempDir;
+
+    #[test]
+    fn failed_metric_persistence_does_not_advance_transcript_watermark() {
+        let watermark_advanced = Cell::new(false);
+
+        let result = persist_metrics_before_advancing_watermark(
+            || {
+                Err(crate::error::GitAiError::Generic(
+                    "metrics db unavailable".to_string(),
+                ))
+            },
+            || {
+                watermark_advanced.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(StreamError::Transient { .. })));
+        assert!(!watermark_advanced.get());
+    }
 
     fn make_worker() -> (
         TempDir,
