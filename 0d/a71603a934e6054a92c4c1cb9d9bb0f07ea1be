@@ -1,0 +1,68 @@
+agent-support/vscode/src/reporting/reporting-profile-service.ts
+  s_b48871ba8817f4::t_5998ed0b00b5d3 7-8,102,111
+  s_b48871ba8817f4::t_dd8dd5740e79db 12,88-89,112,121,124
+agent-support/vscode/src/reporting/reporting-profile-view.ts
+  s_b48871ba8817f4::t_5998ed0b00b5d3 3,82,231-232,235
+  s_b48871ba8817f4::t_dd8dd5740e79db 80
+  s_b48871ba8817f4::t_a3623ad9559c5b 141-146,179-183,190,208
+产品业务.md
+  s_b48871ba8817f4::t_dd8dd5740e79db 30
+  s_b48871ba8817f4::t_a3623ad9559c5b 28
+  s_b48871ba8817f4::t_5998ed0b00b5d3 29
+agent-support/vscode/src/reporting/reporting-profile-utils.ts
+  s_b48871ba8817f4::t_5998ed0b00b5d3 57-76,208-214,218-226,228-235,237-247,251,253,309-327
+  s_b48871ba8817f4::t_dd8dd5740e79db 2,259-260,263
+  s_b48871ba8817f4::t_fc73ab0233219a 124-129,215-217,227,236,248-250,252
+  s_b48871ba8817f4::t_7338ffab528c9d 254
+src/daemon/stream_worker.rs
+  s_7c716466035312::t_c97c1f87cc5b16 43-57,1219-1229
+  s_7c716466035312::t_e57dfe1204120b 1516,1519-1533
+  s_7c716466035312::t_86aa13c77eb8bc 1230-1233,1534-1538
+构建方法.md
+  h_4078690cfc5c9e 1-18
+agent-support/vscode/src/test/reporting-profile-utils.test.ts
+  s_b48871ba8817f4::t_5998ed0b00b5d3 3-4,6,90,121-168
+  s_b48871ba8817f4::t_fc73ab0233219a 50-56
+  s_b48871ba8817f4::t_dd8dd5740e79db 7,73-89
+  s_b48871ba8817f4::t_b03aa47c2a7383 91
+agent-support/vscode/src/blame-queue.ts
+  s_7c716466035312::t_12c3ef4cadf707 21,73-77,116,119
+src/daemon/rewrite_metrics.rs
+  s_7c716466035312::t_e0e57da8e98ec0 150-151,155,157-166,170-184,188-199
+  s_7c716466035312::t_7400ce32034dde 185-187
+  s_7c716466035312::t_eb7a15cd3bbb4e 1167-1185
+  s_7c716466035312::t_aca6ac833075d4 1186-1203
+  s_7c716466035312::t_e9bbb170ec5866 200-201
+agent-support/vscode/src/test/blame-queue.test.ts
+  s_7c716466035312::t_9cf2d331f445fe 1,3-5,7-10,13-35
+  s_7c716466035312::t_5a19bd016b737f 2,6,11-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "0da71603a934e6054a92c4c1cb9d9bb0f07ea1be",
+  "prompts": {},
+  "humans": {
+    "h_4078690cfc5c9e": {
+      "author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_7c716466035312": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f87be-ee1a-70f1-b796-112437d1b351",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    },
+    "s_b48871ba8817f4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f83df-62c7-7581-b605-35568b0cf01e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
