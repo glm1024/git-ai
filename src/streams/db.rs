@@ -118,6 +118,33 @@ const MIGRATIONS: &[&str] = &[
     INSERT INTO schema_version (version) VALUES (4);
     COMMIT;
     "#,
+    // Version 5: Codex fork-aware token accounting needs to replay each
+    // transcript once into the v2 projection. The old byte offset cannot tell
+    // whether an inherited subagent prefix has already been rebased.
+    r#"
+    UPDATE tracked_streams
+    SET watermark_type = 'CodexByteOffset',
+        watermark_value = '0|0',
+        last_processed_at = 0
+    WHERE stream_format = 'CodexJsonl';
+
+    INSERT INTO schema_version (version) VALUES (5);
+    "#,
+    // Version 6: Version 5 reset Codex watermarks but left the cached file
+    // metadata unchanged. The sweep coordinator therefore considered
+    // unchanged historical transcripts up to date and never enqueued them for
+    // the required replay. Invalidate metadata only for streams that are still
+    // waiting at the v2 replay watermark; already-replayed streams stay intact.
+    r#"
+    UPDATE tracked_streams
+    SET last_known_size = -1,
+        last_modified = NULL
+    WHERE stream_format = 'CodexJsonl'
+      AND watermark_type = 'CodexByteOffset'
+      AND watermark_value = '0|0';
+
+    INSERT INTO schema_version (version) VALUES (6);
+    "#,
 ];
 
 /// Record representing a tracked stream cursor in the database.
@@ -734,7 +761,81 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 4); // Current schema version
+        assert_eq!(version, 6); // Current schema version
+    }
+
+    #[test]
+    fn test_migrations_v5_v6_requeue_only_pending_codex_streams_for_fork_aware_replay() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration_v6.db");
+
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+            for migration in &MIGRATIONS[..4] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                r#"
+                INSERT INTO tracked_streams (
+                    session_id, stream_kind, tool, stream_path, stream_format,
+                    watermark_type, watermark_value, external_session_id,
+                    first_seen_at, last_processed_at, last_known_size
+                ) VALUES
+                    ('codex-session', 'transcript', 'codex', '/codex.jsonl',
+                     'CodexJsonl', 'ByteOffset', '4321', 'codex-session',
+                     100, 200, 4321),
+                    ('codex-complete', 'transcript', 'codex', '/codex-complete.jsonl',
+                     'CodexJsonl', 'CodexByteOffset', '9876|1', 'codex-complete',
+                     100, 300, 9876),
+                    ('claude-session', 'transcript', 'claude', '/claude.jsonl',
+                     'ClaudeJsonl', 'ByteOffset', '9876', 'claude-session',
+                     100, 200, 9876)
+                "#,
+                [],
+            )
+            .unwrap();
+
+            // Apply v5, then simulate a stream that completed replay before the
+            // process was interrupted and v6 became available.
+            conn.execute_batch(MIGRATIONS[4]).unwrap();
+            conn.execute(
+                r#"
+                UPDATE tracked_streams
+                SET watermark_value = '9876|1',
+                    last_processed_at = 300
+                WHERE session_id = 'codex-complete'
+                "#,
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = StreamsDatabase::open(&db_path).unwrap();
+        let codex = db
+            .get_stream("codex-session", "transcript", "/codex.jsonl")
+            .unwrap()
+            .unwrap();
+        assert_eq!(codex.watermark_type, "CodexByteOffset");
+        assert_eq!(codex.watermark_value, "0|0");
+        assert_eq!(codex.last_processed_at, 0);
+        assert_eq!(codex.last_known_size, -1);
+        assert_eq!(codex.last_modified, None);
+
+        let codex_complete = db
+            .get_stream("codex-complete", "transcript", "/codex-complete.jsonl")
+            .unwrap()
+            .unwrap();
+        assert_eq!(codex_complete.watermark_value, "9876|1");
+        assert_eq!(codex_complete.last_processed_at, 300);
+        assert_eq!(codex_complete.last_known_size, 9876);
+
+        let claude = db
+            .get_stream("claude-session", "transcript", "/claude.jsonl")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claude.watermark_type, "ByteOffset");
+        assert_eq!(claude.watermark_value, "9876");
+        assert_eq!(claude.last_processed_at, 200);
     }
 
     #[test]

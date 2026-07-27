@@ -6,6 +6,7 @@ use crate::error::GitAiError;
 use crate::metrics::MetricsBatch;
 use crate::observability::log_error;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,53 @@ pub struct MetricsUploadResponse {
     pub errors: Vec<MetricsUploadError>,
 }
 
+/// Wire acknowledgement for the enterprise Git AI metrics endpoint.
+///
+/// The acknowledgement fields are optional only so older responses remain
+/// deserializable and can fail with a precise protocol error. They are all
+/// mandatory before any local fact may be marked delivered.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetricsUploadWireResponse {
+    accepted: Option<bool>,
+    kind: Option<String>,
+    item_count: Option<usize>,
+    payload_sha256: Option<String>,
+    errors: Vec<MetricsUploadError>,
+}
+
+struct PreparedMetricsUpload {
+    body: String,
+    payload_sha256: String,
+}
+
+/// Whether a failed upload should consume the helper's one short, in-process
+/// retry. Payload/configuration rejections will not improve after 60 seconds.
+pub fn metrics_upload_error_should_retry_immediately(error: &GitAiError) -> bool {
+    match error {
+        GitAiError::HttpStatusError { status, .. } => {
+            *status == 408 || *status == 425 || *status == 429 || *status >= 500
+        }
+        _ => true,
+    }
+}
+
+/// Whether every event in the request is deterministically undeliverable.
+///
+/// Authentication failures remain queued for configuration recovery. A 413 is
+/// also deliberately non-permanent: the byte-aware dequeuer prevents normal
+/// batches from reaching it, while a single legacy oversized commit must stay
+/// on disk with a visible error instead of being silently discarded.
+pub fn metrics_upload_error_is_permanent(error: &GitAiError) -> bool {
+    matches!(
+        error,
+        GitAiError::HttpStatusError {
+            status: 400 | 415 | 422,
+            ..
+        }
+    )
+}
+
 impl MetricsUploadResponse {
     /// Validate that all failed-event indices refer to events in this batch.
     pub fn validate_error_indices(&self, batch_size: usize) -> Result<(), GitAiError> {
@@ -91,6 +139,59 @@ impl MetricsUploadResponse {
             .filter(|i| !error_indices.contains(i))
             .collect()
     }
+}
+
+fn validate_metrics_upload_response(
+    response: MetricsUploadWireResponse,
+    batch_size: usize,
+    expected_payload_sha256: &str,
+) -> Result<MetricsUploadResponse, GitAiError> {
+    if response.accepted != Some(true) {
+        return Err(GitAiError::Generic(
+            "Metrics upload response must include accepted=true".to_string(),
+        ));
+    }
+    if response.kind.as_deref() != Some("git_ai_metrics") {
+        return Err(GitAiError::Generic(
+            "Metrics upload response must include kind=git_ai_metrics".to_string(),
+        ));
+    }
+    if response.item_count != Some(batch_size) {
+        return Err(GitAiError::Generic(format!(
+            "Metrics upload response itemCount {:?} does not match request event count {}",
+            response.item_count, batch_size
+        )));
+    }
+    if response.payload_sha256.as_deref() != Some(expected_payload_sha256) {
+        return Err(GitAiError::Generic(
+            "Metrics upload response payloadSha256 does not match the request body".to_string(),
+        ));
+    }
+
+    let response = MetricsUploadResponse {
+        errors: response.errors,
+    };
+    response.validate_error_indices(batch_size)?;
+    Ok(response)
+}
+
+fn prepare_metrics_upload(batch: &MetricsBatch) -> Result<PreparedMetricsUpload, GitAiError> {
+    let body = serde_json::to_string(batch).map_err(GitAiError::JsonError)?;
+    let payload_sha256 = format!("{:x}", Sha256::digest(body.as_bytes()));
+    Ok(PreparedMetricsUpload {
+        body,
+        payload_sha256,
+    })
+}
+
+fn parse_metrics_upload_response(
+    body: &str,
+    batch_size: usize,
+    expected_payload_sha256: &str,
+) -> Result<MetricsUploadResponse, GitAiError> {
+    let response: MetricsUploadWireResponse =
+        serde_json::from_str(body).map_err(GitAiError::JsonError)?;
+    validate_metrics_upload_response(response, batch_size, expected_payload_sha256)
 }
 
 /// Upload metrics batch with retry logic.
@@ -138,9 +239,16 @@ pub fn upload_metrics_with_retry(
                 return Ok(response);
             }
             Err(e) => {
-                // Non-200 - will retry if attempts remain
-                if attempt == RETRY_DELAYS_SECS.len() {
-                    eprintln!("[metrics] All retries exhausted, giving up");
+                let should_retry = metrics_upload_error_should_retry_immediately(&e);
+                if attempt == RETRY_DELAYS_SECS.len() || !should_retry {
+                    if !should_retry {
+                        eprintln!(
+                            "[metrics] Upload rejected without an immediate retry: {}",
+                            e
+                        );
+                    } else {
+                        eprintln!("[metrics] All retries exhausted, giving up");
+                    }
                     return Err(e);
                 }
                 eprintln!("[metrics] Upload failed: {}, will retry...", e);
@@ -168,7 +276,10 @@ impl ApiClient {
         batch: &MetricsBatch,
     ) -> Result<MetricsUploadResponse, GitAiError> {
         wait_for_metrics_upload_rate_limit()?;
-        let response = self.context().post_json("/worker/metrics/upload", batch)?;
+        let prepared = prepare_metrics_upload(batch)?;
+        let response = self
+            .context()
+            .post_serialized_json("/worker/metrics/upload", &prepared.body)?;
         let status_code = response.status_code;
 
         let body = response
@@ -176,38 +287,22 @@ impl ApiClient {
             .map_err(|e| GitAiError::Generic(format!("Failed to read response body: {}", e)))?;
 
         match status_code {
-            200 => {
-                let metrics_response: MetricsUploadResponse =
-                    serde_json::from_str(body).map_err(GitAiError::JsonError)?;
-                Ok(metrics_response)
+            200 => parse_metrics_upload_response(
+                body,
+                batch.events.len(),
+                &prepared.payload_sha256,
+            ),
+            _ => {
+                let message = serde_json::from_str::<ApiErrorResponse>(body)
+                    .ok()
+                    .map(|response| response.error)
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or_else(|| "metrics upload request was rejected".to_string());
+                Err(GitAiError::HttpStatusError {
+                    status: status_code,
+                    message,
+                })
             }
-            400 => {
-                let error_response: ApiErrorResponse =
-                    serde_json::from_str(body).unwrap_or_else(|_| ApiErrorResponse {
-                        error: "Invalid request body".to_string(),
-                        details: Some(serde_json::Value::String(body.to_string())),
-                    });
-                Err(GitAiError::Generic(format!(
-                    "Bad Request: {}",
-                    error_response.error
-                )))
-            }
-            401 => Err(GitAiError::Generic("Unauthorized".to_string())),
-            500 => {
-                let error_response: ApiErrorResponse =
-                    serde_json::from_str(body).unwrap_or_else(|_| ApiErrorResponse {
-                        error: "Internal server error".to_string(),
-                        details: None,
-                    });
-                Err(GitAiError::Generic(format!(
-                    "Internal Server Error: {}",
-                    error_response.error
-                )))
-            }
-            _ => Err(GitAiError::Generic(format!(
-                "Unexpected status code {}: {}",
-                status_code, body
-            ))),
         }
     }
 }
@@ -215,6 +310,7 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::cell::{Cell, RefCell};
 
     #[test]
@@ -314,5 +410,145 @@ mod tests {
         };
 
         assert!(response.validate_error_indices(2).is_err());
+    }
+
+    #[test]
+    fn deterministic_client_errors_skip_immediate_retry_and_are_permanent() {
+        for status in [400, 415, 422] {
+            let error = GitAiError::HttpStatusError {
+                status,
+                message: "invalid request".to_string(),
+            };
+            assert!(!metrics_upload_error_should_retry_immediately(&error));
+            assert!(metrics_upload_error_is_permanent(&error));
+        }
+    }
+
+    #[test]
+    fn configuration_conflict_and_oversized_errors_remain_queued() {
+        for status in [401, 403, 404, 405, 409, 413] {
+            let error = GitAiError::HttpStatusError {
+                status,
+                message: "configuration must change".to_string(),
+            };
+            assert!(!metrics_upload_error_should_retry_immediately(&error));
+            assert!(!metrics_upload_error_is_permanent(&error));
+        }
+    }
+
+    #[test]
+    fn transient_http_and_transport_errors_allow_immediate_retry() {
+        for status in [408, 425, 429, 500, 502, 503] {
+            let error = GitAiError::HttpStatusError {
+                status,
+                message: "temporary failure".to_string(),
+            };
+            assert!(metrics_upload_error_should_retry_immediately(&error));
+            assert!(!metrics_upload_error_is_permanent(&error));
+        }
+        assert!(metrics_upload_error_should_retry_immediately(
+            &GitAiError::Generic("network failure".to_string())
+        ));
+    }
+
+    #[test]
+    fn legacy_metrics_200_deserializes_but_fails_closed_without_acknowledgement() {
+        let wire_response: MetricsUploadWireResponse =
+            serde_json::from_str(r#"{"errors":[]}"#).expect("legacy response must deserialize");
+
+        let error = validate_metrics_upload_response(wire_response, 1, "expected-sha")
+            .expect_err("a legacy 200 must not acknowledge local facts");
+
+        assert!(
+            error.to_string().contains("accepted=true"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn metrics_acknowledgement_is_validated_before_error_indices() {
+        let wire_response: MetricsUploadWireResponse = serde_json::from_str(
+            r#"{"errors":[{"index":99,"error":"bad"}]}"#,
+        )
+        .expect("legacy response must deserialize");
+
+        let error = validate_metrics_upload_response(wire_response, 1, "expected-sha")
+            .expect_err("missing acknowledgement must fail");
+
+        assert!(
+            error.to_string().contains("accepted=true"),
+            "acknowledgement must be checked before error indices: {error}"
+        );
+    }
+
+    #[test]
+    fn metrics_acknowledgement_requires_exact_kind_count_and_payload_digest() {
+        let valid = |accepted, kind: &str, item_count, payload_sha256: &str| {
+            serde_json::from_value::<MetricsUploadWireResponse>(serde_json::json!({
+                "accepted": accepted,
+                "kind": kind,
+                "itemCount": item_count,
+                "payloadSha256": payload_sha256,
+                "errors": []
+            }))
+            .expect("response must deserialize")
+        };
+
+        assert!(
+            validate_metrics_upload_response(
+                valid(true, "git_ai_metrics", 2, "expected-sha"),
+                2,
+                "expected-sha"
+            )
+            .is_ok()
+        );
+
+        for (response, expected_message) in [
+            (
+                valid(false, "git_ai_metrics", 2, "expected-sha"),
+                "accepted=true",
+            ),
+            (
+                valid(true, "other", 2, "expected-sha"),
+                "kind=git_ai_metrics",
+            ),
+            (
+                valid(true, "git_ai_metrics", 1, "expected-sha"),
+                "itemCount",
+            ),
+            (
+                valid(true, "git_ai_metrics", 2, "different-sha"),
+                "payloadSha256",
+            ),
+        ] {
+            let error = validate_metrics_upload_response(response, 2, "expected-sha")
+                .expect_err("mismatched acknowledgement must fail");
+            assert!(
+                error.to_string().contains(expected_message),
+                "unexpected error for {expected_message}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_upload_hash_binds_to_the_exact_serialized_request_body() {
+        let batch = MetricsBatch::new(vec![]);
+        let prepared = prepare_metrics_upload(&batch).expect("prepare metrics batch");
+        let expected_body = serde_json::to_string(&batch).expect("serialize metrics batch");
+        let expected_sha256 = format!("{:x}", Sha256::digest(expected_body.as_bytes()));
+
+        assert_eq!(prepared.body, expected_body);
+        assert_eq!(prepared.payload_sha256, expected_sha256);
+    }
+
+    #[test]
+    fn parsing_a_forged_legacy_200_response_fails_closed() {
+        let error = parse_metrics_upload_response(r#"{"errors":[]}"#, 0, "expected-sha")
+            .expect_err("legacy 200 must not delete local facts");
+
+        assert!(
+            error.to_string().contains("accepted=true"),
+            "unexpected error: {error}"
+        );
     }
 }

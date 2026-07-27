@@ -133,8 +133,12 @@ fn build_checkpoint_attrs(
         .unwrap_or_default();
 
     let mut attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
-        .session_id(session_id)
-        .base_commit_sha(base_commit);
+        .session_id(session_id);
+    attrs = if base_commit == "initial" {
+        attrs.base_commit_sha_null()
+    } else {
+        attrs.base_commit_sha(base_commit)
+    };
 
     // Add AI-specific attributes
     if let Some(agent_id) = agent_id {
@@ -419,7 +423,7 @@ fn execute_resolved_checkpoint(
             }
 
             let file_attrs = attrs.clone().author(&checkpoint.author);
-            crate::metrics::record(values, file_attrs);
+            crate::metrics::record(values, file_attrs)?;
         }
     }
 
@@ -1165,6 +1169,19 @@ fn compute_line_stats(
 #[cfg(test)]
 mod kilo_runtime_metadata_tests {
     use super::*;
+    use crate::metrics::PosEncoded;
+
+    #[test]
+    fn root_checkpoint_metric_uses_null_base_commit() {
+        let repo = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        let attrs =
+            build_checkpoint_attrs(repo.gitai_repo(), "initial", None, &HashMap::new()).to_sparse();
+
+        assert_eq!(
+            attrs.get(&crate::metrics::attrs::attr_pos::BASE_COMMIT_SHA.to_string()),
+            Some(&serde_json::Value::Null)
+        );
+    }
 
     #[test]
     fn checkpoint_metrics_merge_only_allowlisted_kilo_runtime_metadata() {

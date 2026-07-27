@@ -872,7 +872,7 @@ fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), Gi
             {
                 let attrs = crate::daemon::checkpoint::build_agent_usage_attrs(None, agent_id);
                 let values = crate::metrics::AgentUsageValues::new();
-                crate::metrics::record(values, attrs);
+                crate::metrics::record(values, attrs)?;
             }
             return Err(e);
         }
@@ -885,7 +885,7 @@ fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), Gi
     {
         let attrs = crate::daemon::checkpoint::build_agent_usage_attrs(Some(&repo), agent_id);
         let values = crate::metrics::AgentUsageValues::new();
-        crate::metrics::record(values, attrs);
+        crate::metrics::record(values, attrs)?;
     }
 
     let resolved = resolve_checkpoint_request(&repo, &mut request)?;
@@ -1467,6 +1467,29 @@ fn rewrite_metric_branch_for_transition(
         })
 }
 
+/// Return only non-fast-forward local branch moves. `git branch -f` moves a
+/// pointer without creating a replacement commit, so its lifecycle metric must
+/// be emitted separately from rewrite note migration.
+fn branch_force_lifecycle_transitions(
+    repository: &Repository,
+    command: &crate::daemon::domain::NormalizedCommand,
+) -> Vec<(String, String, Option<String>)> {
+    command
+        .ref_changes
+        .iter()
+        .filter(|change| change.reference.starts_with("refs/heads/"))
+        .filter(|change| valid_non_zero_ref_change(change))
+        .filter(|change| !repo_is_ancestor(repository, &change.old, &change.new))
+        .map(|change| {
+            (
+                change.old.clone(),
+                change.new.clone(),
+                rewrite_metric_branch_for_ref(&change.reference),
+            )
+        })
+        .collect()
+}
+
 fn rewrite_metric_commits_with_branch(
     metric_commits: Vec<crate::authorship::rewrite::RewriteMetricCommit>,
     branch: Option<String>,
@@ -1879,7 +1902,7 @@ fn revert_destination_changes(
         .collect()
 }
 
-fn apply_revert_complete_rewrite(
+async fn apply_revert_complete_rewrite(
     repo: &crate::git::repository::Repository,
     cmd: &crate::daemon::domain::NormalizedCommand,
     source_oids: &[String],
@@ -1897,11 +1920,11 @@ fn apply_revert_complete_rewrite(
         .collect();
     let metric_commits =
         crate::authorship::rewrite_revert::handle_revert_commits_with_metrics(repo, &specs)?;
-    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, metric_commits);
+    crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(repo, metric_commits).await?;
     Ok(())
 }
 
-fn apply_cherry_pick_complete_rewrite(
+async fn apply_cherry_pick_complete_rewrite(
     repo: &crate::git::repository::Repository,
     original_head: &str,
     sources: &[String],
@@ -1992,12 +2015,13 @@ fn apply_cherry_pick_complete_rewrite(
             })
             .collect()
     };
-    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, rewrite_metric_commits);
+    crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(repo, rewrite_metric_commits)
+        .await?;
 
     Ok(())
 }
 
-fn apply_cherry_pick_no_commit_rewrite(
+async fn apply_cherry_pick_no_commit_rewrite(
     repo: &crate::git::repository::Repository,
     sources: &[String],
     parent_head: &str,
@@ -2028,7 +2052,8 @@ fn apply_cherry_pick_no_commit_rewrite(
         {
             metric_commit = metric_commit.with_authorship_note(note);
         }
-        crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, vec![metric_commit]);
+        crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(repo, vec![metric_commit])
+            .await?;
     }
     Ok(())
 }
@@ -4711,7 +4736,7 @@ impl ActorDaemonCoordinator {
     }
 
     /// Detects non-fast-forward ref moves and fires handle_rewrite_event.
-    fn detect_and_handle_non_ff_rewrites(
+    async fn detect_and_handle_non_ff_rewrites(
         &self,
         cmd: &crate::daemon::domain::NormalizedCommand,
     ) -> Result<(), GitAiError> {
@@ -4817,19 +4842,21 @@ impl ActorDaemonCoordinator {
                     rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
                 let branch =
                     rewrite_metric_branch_for_transition(cmd, &original_head, &new_tip, None);
-                crate::daemon::rewrite_metrics::spawn_ref_lifecycle_transition_metrics(
+                crate::daemon::rewrite_metrics::persist_ref_lifecycle_transition_metrics(
                     &repo,
                     "rebase",
                     original_head.clone(),
                     new_tip.clone(),
                     branch.clone(),
                     "ref_transition",
-                );
+                )
+                .await?;
                 if !metric_commits.is_empty() {
-                    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                    crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(
                         &repo,
                         rewrite_metric_commits_with_branch(metric_commits, branch),
-                    );
+                    )
+                    .await?;
                 }
             }
             return Ok(());
@@ -4886,7 +4913,7 @@ impl ActorDaemonCoordinator {
                 rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
             let branch =
                 rewrite_metric_branch_for_transition(cmd, old_tip, new_tip, Some(reference));
-            crate::daemon::rewrite_metrics::spawn_ref_lifecycle_transition_metrics(
+            crate::daemon::rewrite_metrics::persist_ref_lifecycle_transition_metrics(
                 &repo,
                 if is_rebase_cmd {
                     "rebase"
@@ -4899,12 +4926,14 @@ impl ActorDaemonCoordinator {
                 (*new_tip).to_string(),
                 branch.clone(),
                 "ref_transition",
-            );
+            )
+            .await?;
             if !metric_commits.is_empty() {
-                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(
                     &repo,
                     rewrite_metric_commits_with_branch(metric_commits, branch),
-                );
+                )
+                .await?;
             }
         }
 
@@ -5112,7 +5141,7 @@ impl ActorDaemonCoordinator {
             );
         }
         // Non-FF rewrite detection: fires for commands that rewrite history via ref moves.
-        // Skip for: checkout/switch/branch (no rewriting), cherry-pick (handled separately),
+        // Skip for: checkout/switch/branch (branch -f has its own pointer-only lifecycle below), cherry-pick (handled separately),
         // and plain commit/amend (CommitCreated/CommitAmended events handle those).
         // Do NOT skip for rebase — the CommitCreated events during rebase are intermediate
         // replayed commits; note transfer happens via non-FF detection on the final ref move.
@@ -5143,7 +5172,7 @@ impl ActorDaemonCoordinator {
             )
         };
         if !skip_non_ff && cmd.exit_code == 0 {
-            self.detect_and_handle_non_ff_rewrites(cmd)?;
+            self.detect_and_handle_non_ff_rewrites(cmd).await?;
         }
 
         if cmd.exit_code != 0 {
@@ -5248,7 +5277,8 @@ impl ActorDaemonCoordinator {
                             &original_head,
                             &applied_source_oids,
                             &new_commits,
-                        )?;
+                        )
+                        .await?;
                     }
                     if !source_oids.is_empty() || is_continue || is_skip {
                         let applied_sources = new_commits
@@ -5383,7 +5413,8 @@ impl ActorDaemonCoordinator {
                                     original_head,
                                     &sources,
                                     &destinations,
-                                )?;
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -5511,10 +5542,11 @@ impl ActorDaemonCoordinator {
                                             onto: pending.onto,
                                         },
                                     )?;
-                                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                                crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(
                                     &repo,
                                     outcome.metric_commits,
-                                );
+                                )
+                                .await?;
                                 handled_as_squash_merge = true;
                             } else {
                                 self.set_pending_squash_merge_for_worktree(
@@ -5545,7 +5577,7 @@ impl ActorDaemonCoordinator {
                                         &repo, cmd,
                                     )?;
                                 }
-                                apply_revert_complete_rewrite(&repo, cmd, &source_oids)?;
+                                apply_revert_complete_rewrite(&repo, cmd, &source_oids).await?;
                                 handled_revert_commits = true;
                             }
                         } else if !new_head.is_empty() {
@@ -5593,7 +5625,8 @@ impl ActorDaemonCoordinator {
                                         &pending.source_commits,
                                         &pending.head,
                                         new_head,
-                                    )?;
+                                    )
+                                    .await?;
                                 } else {
                                     self.set_pending_cherry_pick_no_commit_for_worktree(
                                         worktree.as_ref(),
@@ -5642,7 +5675,7 @@ impl ActorDaemonCoordinator {
                                 )
                             })?;
                             if crate::authorship::rewrite::rewrite_metrics_enabled() {
-                                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                                crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(
                                     &repo,
                                     vec![
                                         crate::authorship::rewrite::RewriteMetricCommit::new(
@@ -5653,7 +5686,8 @@ impl ActorDaemonCoordinator {
                                         .with_parent_sha(amend_result.parent_sha)
                                         .with_authorship_note(amend_result.authorship_note),
                                     ],
-                                );
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -5665,14 +5699,15 @@ impl ActorDaemonCoordinator {
                         let repo = find_repository_in_path(&worktree)?;
                         let branch =
                             rewrite_metric_branch_for_transition(cmd, old_head, new_head, None);
-                        crate::daemon::rewrite_metrics::spawn_ref_lifecycle_transition_metrics(
+                        crate::daemon::rewrite_metrics::persist_ref_lifecycle_transition_metrics(
                             &repo,
                             "reset",
                             old_head.to_string(),
                             new_head.to_string(),
                             branch,
                             "ref_transition",
-                        );
+                        )
+                        .await?;
                         match kind {
                             crate::daemon::domain::ResetKind::Hard => {
                                 repo.storage.delete_working_log_for_base_commit(old_head)?;
@@ -5692,10 +5727,11 @@ impl ActorDaemonCoordinator {
                                             onto: None,
                                         },
                                     )?;
-                                    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                                    crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(
                                         &repo,
                                         outcome.metric_commits,
-                                    );
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -5789,6 +5825,29 @@ impl ActorDaemonCoordinator {
                         )?;
                     }
                 }
+            }
+        }
+
+        // `git branch -f <branch> <target>` is a non-fast-forward pointer move
+        // on a local branch. It neither creates a commit nor transfers a note,
+        // so treating it as an authorship rewrite would fabricate replacement
+        // mappings. Emit only the Event 8 transition; the backend will abandon
+        // the old-exclusive candidates and restore the new-exclusive ones.
+        if primary == "branch"
+            && cmd.exit_code == 0
+            && let Some(worktree) = cmd.worktree.as_ref()
+        {
+            let repo = find_repository_in_path(&worktree.to_string_lossy())?;
+            for (old_tip, new_tip, branch) in branch_force_lifecycle_transitions(&repo, cmd) {
+                crate::daemon::rewrite_metrics::persist_ref_lifecycle_transition_metrics(
+                    &repo,
+                    "branch_force",
+                    old_tip,
+                    new_tip,
+                    branch,
+                    "ref_transition",
+                )
+                .await?;
             }
         }
 
@@ -6246,12 +6305,15 @@ impl ActorDaemonCoordinator {
                     .map(|v| ControlResponse::ok(None, Some(v)))
                     .map_err(GitAiError::from)
                 }),
-            ControlRequest::SubmitTelemetry { envelopes } => {
-                if let Some(worker) = &self.telemetry_worker {
-                    worker.submit_telemetry(envelopes).await;
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
+            ControlRequest::SubmitTelemetry { envelopes } => match self.telemetry_worker.as_ref() {
+                Some(worker) => worker
+                    .submit_telemetry(envelopes)
+                    .await
+                    .map(|_| ControlResponse::ok(None, None)),
+                None => Err(GitAiError::Generic(
+                    "telemetry worker is not available".to_string(),
+                )),
+            },
             ControlRequest::SubmitCas { records } => {
                 if let Some(worker) = &self.telemetry_worker {
                     worker.submit_cas(records).await;
@@ -8278,6 +8340,53 @@ mod tests {
             old: old.to_string(),
             new: new.to_string(),
         }
+    }
+
+    #[test]
+    fn branch_force_lifecycle_detects_only_a_non_fast_forward_local_branch_move() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "base\n", false)
+            .expect("write base");
+        let base = tmp.commit_all("base").expect("commit base");
+        tmp.write_file("file.txt", "old\n", false)
+            .expect("write old");
+        let old_tip = tmp.commit_all("old").expect("commit old");
+        tmp.create_branch("topic").expect("create topic branch");
+        tmp.git_command(&["switch", "-c", "replacement", &base])
+            .expect("switch replacement branch");
+        tmp.write_file("file.txt", "replacement\n", false)
+            .expect("write replacement");
+        let new_tip = tmp.commit_all("replacement").expect("commit replacement");
+
+        let command = test_rebase_command(
+            &["-f", "topic", &new_tip],
+            vec![ref_change("refs/heads/topic", &old_tip, &new_tip)],
+        );
+        let transitions = branch_force_lifecycle_transitions(tmp.gitai_repo(), &command);
+
+        assert_eq!(
+            transitions,
+            vec![(old_tip, new_tip, Some("topic".to_string()))]
+        );
+    }
+
+    #[test]
+    fn branch_force_lifecycle_ignores_a_fast_forward_branch_move() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "base\n", false)
+            .expect("write base");
+        let old_tip = tmp.commit_all("base").expect("commit base");
+        tmp.create_branch("topic").expect("create topic branch");
+        tmp.write_file("file.txt", "new\n", false)
+            .expect("write new");
+        let new_tip = tmp.commit_all("new").expect("commit new");
+
+        let command = test_rebase_command(
+            &["-f", "topic", &new_tip],
+            vec![ref_change("refs/heads/topic", &old_tip, &new_tip)],
+        );
+
+        assert!(branch_force_lifecycle_transitions(tmp.gitai_repo(), &command).is_empty());
     }
 
     #[test]

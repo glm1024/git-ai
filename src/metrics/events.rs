@@ -32,6 +32,12 @@ pub mod committed_pos {
     pub const AUTHOR_TS: usize = 15; // u64 (git author timestamp, %at)
     pub const COMMIT_TS: usize = 16; // u64 (git committer timestamp, %ct)
     pub const PATCH_ID: usize = 17; // String (git patch-id --stable)
+    // Deferred commits may span multiple independently uploaded Event 1 rows.
+    // The server must wait for every chunk before projecting the bundle.
+    pub const BUNDLE_ID: usize = 18; // String (stable bundle identity)
+    pub const BUNDLE_INDEX: usize = 19; // u32 (zero-based)
+    pub const BUNDLE_COUNT: usize = 20; // u32
+    pub const BUNDLE_HUNKS_SHA256: usize = 21; // String (digest of the full ordered hunk set)
 }
 
 /// Values for Event ID 1: committed
@@ -63,6 +69,10 @@ pub mod committed_pos {
 /// | 15 | author_ts | u64 |
 /// | 16 | commit_ts | u64 |
 /// | 17 | patch_id | String |
+/// | 18 | bundle_id | String |
+/// | 19 | bundle_index | u32 |
+/// | 20 | bundle_count | u32 |
+/// | 21 | bundle_hunks_sha256 | String |
 #[derive(Debug, Clone, Default)]
 pub struct CommittedValues {
     // Scalar fields
@@ -84,6 +94,10 @@ pub struct CommittedValues {
     pub author_ts: PosField<u64>,
     pub commit_ts: PosField<u64>,
     pub patch_id: PosField<String>,
+    pub bundle_id: PosField<String>,
+    pub bundle_index: PosField<u32>,
+    pub bundle_count: PosField<u32>,
+    pub bundle_hunks_sha256: PosField<String>,
 }
 
 impl CommittedValues {
@@ -242,6 +256,46 @@ impl CommittedValues {
         self.patch_id = Some(None);
         self
     }
+
+    pub fn bundle_id(mut self, value: impl Into<String>) -> Self {
+        self.bundle_id = Some(Some(value.into()));
+        self
+    }
+
+    pub fn bundle_id_null(mut self) -> Self {
+        self.bundle_id = Some(None);
+        self
+    }
+
+    pub fn bundle_index(mut self, value: u32) -> Self {
+        self.bundle_index = Some(Some(value));
+        self
+    }
+
+    pub fn bundle_index_null(mut self) -> Self {
+        self.bundle_index = Some(None);
+        self
+    }
+
+    pub fn bundle_count(mut self, value: u32) -> Self {
+        self.bundle_count = Some(Some(value));
+        self
+    }
+
+    pub fn bundle_count_null(mut self) -> Self {
+        self.bundle_count = Some(None);
+        self
+    }
+
+    pub fn bundle_hunks_sha256(mut self, value: impl Into<String>) -> Self {
+        self.bundle_hunks_sha256 = Some(Some(value.into()));
+        self
+    }
+
+    pub fn bundle_hunks_sha256_null(mut self) -> Self {
+        self.bundle_hunks_sha256 = Some(None);
+        self
+    }
 }
 
 impl PosEncoded for CommittedValues {
@@ -319,6 +373,26 @@ impl PosEncoded for CommittedValues {
             committed_pos::PATCH_ID,
             string_to_json(&self.patch_id),
         );
+        sparse_set(
+            &mut map,
+            committed_pos::BUNDLE_ID,
+            string_to_json(&self.bundle_id),
+        );
+        sparse_set(
+            &mut map,
+            committed_pos::BUNDLE_INDEX,
+            u32_to_json(&self.bundle_index),
+        );
+        sparse_set(
+            &mut map,
+            committed_pos::BUNDLE_COUNT,
+            u32_to_json(&self.bundle_count),
+        );
+        sparse_set(
+            &mut map,
+            committed_pos::BUNDLE_HUNKS_SHA256,
+            string_to_json(&self.bundle_hunks_sha256),
+        );
 
         map
     }
@@ -344,6 +418,10 @@ impl PosEncoded for CommittedValues {
             author_ts: sparse_get_u64(arr, committed_pos::AUTHOR_TS),
             commit_ts: sparse_get_u64(arr, committed_pos::COMMIT_TS),
             patch_id: sparse_get_string(arr, committed_pos::PATCH_ID),
+            bundle_id: sparse_get_string(arr, committed_pos::BUNDLE_ID),
+            bundle_index: sparse_get_u32(arr, committed_pos::BUNDLE_INDEX),
+            bundle_count: sparse_get_u32(arr, committed_pos::BUNDLE_COUNT),
+            bundle_hunks_sha256: sparse_get_string(arr, committed_pos::BUNDLE_HUNKS_SHA256),
         }
     }
 }
@@ -1283,6 +1361,38 @@ mod tests {
     }
 
     #[test]
+    fn test_committed_values_bundle_fields_roundtrip() {
+        use super::PosEncoded;
+
+        let original = CommittedValues::new()
+            .bundle_id("bundle-abc")
+            .bundle_index(2)
+            .bundle_count(4)
+            .bundle_hunks_sha256("full-hunks-digest");
+
+        let sparse = PosEncoded::to_sparse(&original);
+        assert_eq!(
+            sparse.get("18"),
+            Some(&Value::String("bundle-abc".to_string()))
+        );
+        assert_eq!(sparse.get("19"), Some(&Value::Number(2.into())));
+        assert_eq!(sparse.get("20"), Some(&Value::Number(4.into())));
+        assert_eq!(
+            sparse.get("21"),
+            Some(&Value::String("full-hunks-digest".to_string()))
+        );
+
+        let restored = <CommittedValues as PosEncoded>::from_sparse(&sparse);
+        assert_eq!(restored.bundle_id, Some(Some("bundle-abc".to_string())));
+        assert_eq!(restored.bundle_index, Some(Some(2)));
+        assert_eq!(restored.bundle_count, Some(Some(4)));
+        assert_eq!(
+            restored.bundle_hunks_sha256,
+            Some(Some("full-hunks-digest".to_string()))
+        );
+    }
+
+    #[test]
     fn test_committed_values_from_sparse() {
         use super::PosEncoded;
 
@@ -1918,6 +2028,203 @@ mod tests {
     }
 }
 
+/// Value positions for the compact `session_token_usage` event.
+pub mod session_token_usage_pos {
+    pub const SOURCE_KEY: usize = 0;
+    pub const INPUT_TOKENS: usize = 1;
+    pub const OUTPUT_TOKENS: usize = 2;
+    pub const CACHE_READ_TOKENS: usize = 3;
+    pub const CACHE_WRITE_TOKENS: usize = 4;
+    pub const REQUEST_COUNT: usize = 5;
+    pub const MODEL_PROVIDER: usize = 6;
+    pub const DAILY_SNAPSHOT: usize = 7;
+    pub const DATE_KEY: usize = 8;
+    pub const TIMEZONE: usize = 9;
+    pub const MACHINE_ID: usize = 10;
+    pub const SUPERSEDES_SOURCE_KEYS: usize = 11;
+    pub const SNAPSHOT_INSTANCE_ID: usize = 12;
+    pub const SUPERSEDES_SNAPSHOT_INSTANCE_IDS: usize = 13;
+}
+
+/// Values for Event ID 9: `session_token_usage`.
+///
+/// This is deliberately a cumulative daily business fact. It contains no prompt,
+/// response, reasoning, tool input/output, file contents, or raw transcript.
+#[derive(Debug, Clone, Default)]
+pub struct SessionTokenUsageValues {
+    pub source_key: PosField<String>,
+    pub input_tokens: PosField<u64>,
+    pub output_tokens: PosField<u64>,
+    pub cache_read_tokens: PosField<u64>,
+    pub cache_write_tokens: PosField<u64>,
+    pub request_count: PosField<u32>,
+    pub model_provider: PosField<String>,
+    pub daily_snapshot: PosField<u32>,
+    pub date_key: PosField<String>,
+    pub timezone: PosField<String>,
+    pub machine_id: PosField<String>,
+    pub supersedes_source_keys: PosField<Vec<String>>,
+    pub snapshot_instance_id: PosField<String>,
+    pub supersedes_snapshot_instance_ids: PosField<Vec<String>>,
+}
+
+impl SessionTokenUsageValues {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_key: impl Into<String>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        request_count: u32,
+        model_provider: Option<String>,
+        date_key: impl Into<String>,
+        timezone: impl Into<String>,
+        machine_id: impl Into<String>,
+        supersedes_source_keys: Vec<String>,
+        snapshot_instance_id: impl Into<String>,
+        supersedes_snapshot_instance_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            source_key: Some(Some(source_key.into())),
+            input_tokens: Some(Some(input_tokens)),
+            output_tokens: Some(Some(output_tokens)),
+            cache_read_tokens: Some(Some(cache_read_tokens)),
+            cache_write_tokens: Some(Some(cache_write_tokens)),
+            request_count: Some(Some(request_count)),
+            model_provider: model_provider.map(Some),
+            daily_snapshot: Some(Some(1)),
+            date_key: Some(Some(date_key.into())),
+            timezone: Some(Some(timezone.into())),
+            machine_id: Some(Some(machine_id.into())),
+            supersedes_source_keys: (!supersedes_source_keys.is_empty())
+                .then_some(Some(supersedes_source_keys)),
+            snapshot_instance_id: Some(Some(snapshot_instance_id.into())),
+            supersedes_snapshot_instance_ids: (!supersedes_snapshot_instance_ids.is_empty())
+                .then_some(Some(supersedes_snapshot_instance_ids)),
+        }
+    }
+}
+
+impl PosEncoded for SessionTokenUsageValues {
+    fn to_sparse(&self) -> SparseArray {
+        let mut map = SparseArray::new();
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::SOURCE_KEY,
+            string_to_json(&self.source_key),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::INPUT_TOKENS,
+            u64_to_json(&self.input_tokens),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::OUTPUT_TOKENS,
+            u64_to_json(&self.output_tokens),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::CACHE_READ_TOKENS,
+            u64_to_json(&self.cache_read_tokens),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::CACHE_WRITE_TOKENS,
+            u64_to_json(&self.cache_write_tokens),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::REQUEST_COUNT,
+            u32_to_json(&self.request_count),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::MODEL_PROVIDER,
+            string_to_json(&self.model_provider),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::DAILY_SNAPSHOT,
+            u32_to_json(&self.daily_snapshot),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::DATE_KEY,
+            string_to_json(&self.date_key),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::TIMEZONE,
+            string_to_json(&self.timezone),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::MACHINE_ID,
+            string_to_json(&self.machine_id),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::SUPERSEDES_SOURCE_KEYS,
+            vec_string_to_json(&self.supersedes_source_keys),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::SNAPSHOT_INSTANCE_ID,
+            string_to_json(&self.snapshot_instance_id),
+        );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::SUPERSEDES_SNAPSHOT_INSTANCE_IDS,
+            vec_string_to_json(&self.supersedes_snapshot_instance_ids),
+        );
+        map
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        Self {
+            source_key: sparse_get_string(arr, session_token_usage_pos::SOURCE_KEY),
+            input_tokens: sparse_get_u64(arr, session_token_usage_pos::INPUT_TOKENS),
+            output_tokens: sparse_get_u64(arr, session_token_usage_pos::OUTPUT_TOKENS),
+            cache_read_tokens: sparse_get_u64(arr, session_token_usage_pos::CACHE_READ_TOKENS),
+            cache_write_tokens: sparse_get_u64(arr, session_token_usage_pos::CACHE_WRITE_TOKENS),
+            request_count: sparse_get_u32(arr, session_token_usage_pos::REQUEST_COUNT),
+            model_provider: sparse_get_string(arr, session_token_usage_pos::MODEL_PROVIDER),
+            daily_snapshot: sparse_get_u32(arr, session_token_usage_pos::DAILY_SNAPSHOT),
+            date_key: sparse_get_string(arr, session_token_usage_pos::DATE_KEY),
+            timezone: sparse_get_string(arr, session_token_usage_pos::TIMEZONE),
+            machine_id: sparse_get_string(arr, session_token_usage_pos::MACHINE_ID),
+            supersedes_source_keys: sparse_get_vec_string(
+                arr,
+                session_token_usage_pos::SUPERSEDES_SOURCE_KEYS,
+            ),
+            snapshot_instance_id: sparse_get_string(
+                arr,
+                session_token_usage_pos::SNAPSHOT_INSTANCE_ID,
+            ),
+            supersedes_snapshot_instance_ids: sparse_get_vec_string(
+                arr,
+                session_token_usage_pos::SUPERSEDES_SNAPSHOT_INSTANCE_IDS,
+            ),
+        }
+    }
+}
+
+impl EventValues for SessionTokenUsageValues {
+    fn event_id() -> MetricEventId {
+        MetricEventId::SessionTokenUsage
+    }
+
+    fn to_sparse(&self) -> SparseArray {
+        PosEncoded::to_sparse(self)
+    }
+
+    fn from_sparse(arr: &SparseArray) -> Self {
+        PosEncoded::from_sparse(arr)
+    }
+}
+
 /// Value positions for "session_event" event.
 pub mod session_event_pos {
     pub const RAW_JSON: usize = 0;
@@ -2400,5 +2707,61 @@ mod session_event_tests {
     fn test_otel_trace_values_event_id() {
         assert_eq!(OtelTraceValues::event_id(), MetricEventId::OtelTrace);
         assert_eq!(OtelTraceValues::event_id() as u16, 6);
+    }
+
+    #[test]
+    fn test_session_token_usage_values_are_content_free_and_roundtrip() {
+        let values = SessionTokenUsageValues::new(
+            "ts1:abcdef",
+            10,
+            20,
+            3,
+            4,
+            1,
+            Some("anthropic".to_string()),
+            "2026-07-22",
+            "+08:00",
+            "install-1",
+            vec!["td2:anonymous".to_string()],
+            "snapshot-known-1",
+            vec!["snapshot-anonymous-1".to_string()],
+        );
+        let sparse = PosEncoded::to_sparse(&values);
+        let encoded = serde_json::to_string(&sparse).unwrap();
+        assert!(!encoded.contains("prompt"));
+        assert!(!encoded.contains("content"));
+        assert!(
+            encoded.len() < 256,
+            "compact values grew to {} bytes",
+            encoded.len()
+        );
+
+        let restored = <SessionTokenUsageValues as PosEncoded>::from_sparse(&sparse);
+        assert_eq!(restored.source_key, Some(Some("ts1:abcdef".to_string())));
+        assert_eq!(restored.input_tokens, Some(Some(10)));
+        assert_eq!(restored.output_tokens, Some(Some(20)));
+        assert_eq!(restored.cache_read_tokens, Some(Some(3)));
+        assert_eq!(restored.cache_write_tokens, Some(Some(4)));
+        assert_eq!(restored.request_count, Some(Some(1)));
+        assert_eq!(restored.daily_snapshot, Some(Some(1)));
+        assert_eq!(restored.date_key, Some(Some("2026-07-22".to_string())));
+        assert_eq!(restored.timezone, Some(Some("+08:00".to_string())));
+        assert_eq!(restored.machine_id, Some(Some("install-1".to_string())));
+        assert_eq!(
+            restored.supersedes_source_keys,
+            Some(Some(vec!["td2:anonymous".to_string()]))
+        );
+        assert_eq!(
+            restored.snapshot_instance_id,
+            Some(Some("snapshot-known-1".to_string()))
+        );
+        assert_eq!(
+            restored.supersedes_snapshot_instance_ids,
+            Some(Some(vec!["snapshot-anonymous-1".to_string()]))
+        );
+        assert_eq!(
+            SessionTokenUsageValues::event_id(),
+            MetricEventId::SessionTokenUsage
+        );
     }
 }

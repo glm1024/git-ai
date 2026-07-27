@@ -7,9 +7,12 @@
 
 pub mod attrs;
 pub mod db;
+pub(crate) mod deferred_commit_jobs;
+pub(crate) mod deferred_lifecycle_jobs;
 pub mod events;
 pub mod local_stats;
 pub mod pos_encoded;
+pub(crate) mod session_compaction;
 pub mod types;
 
 // Re-export all public types for external crates
@@ -17,6 +20,7 @@ pub use attrs::EventAttributes;
 pub use events::{
     AgentUsageValues, CheckpointValues, CommittedValues, InstallHooksValues,
     LifecycleTransitionValues, OtelTraceValues, RewriteCommittedValues, SessionEventValues,
+    SessionTokenUsageValues,
 };
 pub use pos_encoded::PosEncoded;
 pub use types::{EventValues, METRICS_API_VERSION, MetricEvent, MetricsBatch};
@@ -44,18 +48,20 @@ pub use types::{EventValues, METRICS_API_VERSION, MetricEvent, MetricsBatch};
 ///     .author("user@example.com")
 ///     .tool("claude-code");
 ///
-/// record(values, attrs);
+/// record(values, attrs)?;
 /// ```
-pub fn record<V: EventValues>(values: V, attrs: EventAttributes) {
+pub fn record<V: EventValues>(
+    values: V,
+    attrs: EventAttributes,
+) -> Result<(), crate::error::GitAiError> {
     if attrs.tool == Some(Some("mock_ai".to_string())) {
-        return;
+        return Ok(());
     }
     if should_ignore_debug_self_check_event(&attrs) {
-        return;
+        return Ok(());
     }
     let event = MetricEvent::new(&values, attrs.to_sparse());
-    // Write directly to observability log
-    crate::observability::log_metrics(vec![event]);
+    crate::observability::log_metrics(vec![event])
 }
 
 fn should_ignore_debug_self_check_event(attrs: &EventAttributes) -> bool {
@@ -105,7 +111,7 @@ mod tests {
         // record() early-returns for mock_ai; nothing to assert on the write
         // side since log_metrics is a no-op in tests, but the guard is exercised.
         let values = events::AgentUsageValues::new();
-        record(values, attrs);
+        record(values, attrs).expect("mock metrics are ignored");
     }
 
     #[test]
@@ -131,6 +137,6 @@ mod tests {
 
         // This would pass through record() — the call-site filter in
         // record_commit_metrics is responsible for stripping mock_ai entries.
-        record(values, attrs);
+        record(values, attrs).expect("test metrics are accepted");
     }
 }

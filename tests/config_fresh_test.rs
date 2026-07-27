@@ -114,6 +114,50 @@ fn test_config_fresh_picks_up_file_changes() {
     assert_eq!(config2.api_base_url(), "https://new.example.com");
 }
 
+#[test]
+#[serial]
+fn test_config_fresh_canonicalizes_manually_written_metrics_endpoint() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let _home_guard = HomeEnvGuard::set(temp_dir.path());
+
+    let config_dir = temp_dir.path().join(".git-ai");
+    std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
+    let file_config = git_ai::config::FileConfig {
+        metrics_api_base_url: Some(
+            "https://stats.example.com/prod-api/api/v1/ingest/ai-code-stats".to_string(),
+        ),
+        ..Default::default()
+    };
+    save_file_config(&file_config).expect("Failed to save config");
+
+    let config = Config::fresh();
+    assert_eq!(
+        config.metrics_api_base_url(),
+        Some("https://stats.example.com/prod-api")
+    );
+}
+
+#[test]
+#[serial]
+fn test_config_fresh_fails_closed_for_invalid_manual_metrics_url() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let _home_guard = HomeEnvGuard::set(temp_dir.path());
+
+    let config_dir = temp_dir.path().join(".git-ai");
+    std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
+    let file_config = git_ai::config::FileConfig {
+        metrics_api_base_url: Some("file:///tmp/not-an-upload-server".to_string()),
+        ..Default::default()
+    };
+    save_file_config(&file_config).expect("Failed to save config");
+
+    let config = Config::fresh();
+    assert!(
+        config.metrics_api_base_url().is_none(),
+        "invalid manual configuration must not opt in anonymous metrics uploads"
+    );
+}
+
 /// Test that Config::get() returns cached config and doesn't pick up changes
 #[test]
 #[serial]

@@ -702,7 +702,7 @@ async fn async_run_install(
 
     // Emit metrics for each agent/git_client result (only if not dry-run)
     if !options.dry_run {
-        emit_install_hooks_metrics(&detailed_results);
+        emit_install_hooks_metrics(&detailed_results)?;
     }
 
     // Warn if git version is below the minimum required for full functionality
@@ -777,7 +777,7 @@ fn warn_if_git_version_too_old() {
 }
 
 /// Emit metrics events for install-hooks results
-fn emit_install_hooks_metrics(results: &[(String, InstallResult)]) {
+fn emit_install_hooks_metrics(results: &[(String, InstallResult)]) -> Result<(), GitAiError> {
     use crate::metrics::{EventAttributes, InstallHooksValues};
 
     let attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"));
@@ -793,8 +793,9 @@ fn emit_install_hooks_metrics(results: &[(String, InstallResult)]) {
             values = values.message_null();
         }
 
-        crate::metrics::record(values, attrs.clone());
+        crate::metrics::record(values, attrs.clone())?;
     }
+    Ok(())
 }
 
 async fn async_run_uninstall(

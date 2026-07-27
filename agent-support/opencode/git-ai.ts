@@ -463,8 +463,6 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
           return
         }
 
-        pendingCalls.set(callID, { repoDir, sessionID, toolInput })
-
         const hookInput = JSON.stringify({
           hook_event_name: "PreToolUse",
           session_id: sessionID,
@@ -474,6 +472,7 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
           tool_input: toolInput,
         })
         await runCheckpoint(hookInput)
+        pendingCalls.set(callID, { repoDir, sessionID, toolInput })
       },
     ),
 

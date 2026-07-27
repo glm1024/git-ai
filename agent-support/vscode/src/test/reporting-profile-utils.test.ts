@@ -4,6 +4,7 @@ import {
   formatOrganizationRequestError,
   mergeReportingSettings,
   normalizeReportingSettingsForOrganization,
+  organizationResultMatchesMetricsUrl,
   ORGANIZATION_UNAVAILABLE_MESSAGE,
   resolveOrganizationOptionsUrl,
   validateReportingSettings,
@@ -45,6 +46,25 @@ suite("Reporting Profile Utilities", () => {
       resolveOrganizationOptionsUrl("http://stats.example.com/prod-api/worker/metrics/upload"),
       "http://stats.example.com/prod-api/api/v1/ai-code-stats/organization-options",
     );
+  });
+
+  test("only accepts organization data returned for the current metrics server", () => {
+    const currentUrl = "http://current.example.com/prod-api";
+    assert.strictEqual(
+      organizationResultMatchesMetricsUrl(
+        currentUrl,
+        "http://current.example.com/prod-api/api/v1/ai-code-stats/organization-options",
+      ),
+      true,
+    );
+    assert.strictEqual(
+      organizationResultMatchesMetricsUrl(
+        currentUrl,
+        "http://old.example.com/prod-api/api/v1/ai-code-stats/organization-options",
+      ),
+      false,
+    );
+    assert.strictEqual(organizationResultMatchesMetricsUrl("not-a-url", undefined), false);
   });
 
   test("uses a Chinese validation message for a malformed server address", () => {

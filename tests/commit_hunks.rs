@@ -4,7 +4,8 @@ mod repos;
 
 use git_ai::commands::diff::{
     DiffCommandOptions, DiffJsonHunk, build_diff_artifacts_from_hunks,
-    build_diff_artifacts_with_note, get_diff_with_line_numbers,
+    build_diff_artifacts_with_note, get_commit_metric_diff_with_line_numbers,
+    get_diff_with_line_numbers,
 };
 use git_ai::git::repository::Repository as GitAiRepository;
 use repos::test_file::ExpectedLineExt;
@@ -30,6 +31,116 @@ fn compute_content_hash(lines: &[&str]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(joined.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[test]
+fn test_commit_metric_hunks_do_not_treat_low_similarity_replacement_as_rename() {
+    let repo = TestRepo::new();
+    let old_file_path = repo.path().join("test.py");
+    let old_content = concat!(
+        "def add(a, b):\n",
+        "    \"\"\"返回两个数的和\"\"\"\n",
+        "    return a + b\n",
+        "\n",
+        "\n",
+        "def subtract(a, b):\n",
+        "    \"\"\"返回两个数的差\"\"\"\n",
+        "    return a - b\n",
+        "\n",
+        "\n",
+        "def multiply(a, b):\n",
+        "    \"\"\"返回两个数的积\"\"\"\n",
+        "    return a * b\n",
+        "\n",
+        "\n",
+        "def divide(a, b):\n",
+        "    \"\"\"返回两个数的商\"\"\"\n",
+        "    if b == 0:\n",
+        "        raise ValueError(\"除数不能为0\")\n",
+        "    return a / b\n",
+        "\n",
+        "\n",
+        "def mod(a, b):\n",
+        "    \"\"\"返回两个数的余数（取模）\"\"\"\n",
+        "    if b == 0:\n",
+        "        raise ValueError(\"除数不能为0\")\n",
+        "    return a % b\n",
+        "\n",
+        "\n",
+        "def power(a, b):\n",
+        "    \"\"\"返回 a 的 b 次幂\"\"\"\n",
+        "    return a ** b\n",
+    );
+    fs::write(&old_file_path, old_content).unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "test.py"])
+        .unwrap();
+    repo.stage_all_and_commit("add old file").unwrap();
+
+    fs::remove_file(&old_file_path).unwrap();
+    let new_file_path = repo.path().join("test2.py");
+    let new_content = "def add(a, b):\n    \"\"\"返回两个数的和。\"\"\"\n    return a + b\n";
+    fs::write(&new_file_path, new_content).unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "test2.py"]).unwrap();
+    let commit = repo
+        .stage_all_and_commit("replace old file with AI file")
+        .unwrap();
+
+    let git_repo = get_repo(&repo);
+    let parent_sha = get_parent_sha(&repo);
+
+    let permissive_hunks =
+        get_diff_with_line_numbers(&git_repo, &parent_sha, &commit.commit_sha).unwrap();
+    assert_eq!(
+        permissive_hunks
+            .iter()
+            .map(|hunk| hunk.added_lines.len())
+            .sum::<usize>(),
+        1,
+        "the 1% interactive rename policy reproduces the original undercount"
+    );
+
+    let metric_hunks =
+        get_commit_metric_diff_with_line_numbers(&git_repo, &parent_sha, &commit.commit_sha)
+            .unwrap();
+    assert_eq!(
+        metric_hunks
+            .iter()
+            .map(|hunk| hunk.added_lines.len())
+            .sum::<usize>(),
+        3
+    );
+    assert_eq!(
+        metric_hunks
+            .iter()
+            .map(|hunk| hunk.deleted_lines.len())
+            .sum::<usize>(),
+        32
+    );
+
+    let artifacts = build_diff_artifacts_from_hunks(
+        &git_repo,
+        metric_hunks,
+        &commit.commit_sha,
+        Some(&commit.authorship_log),
+    )
+    .unwrap();
+    let ai_addition_hunks: Vec<&DiffJsonHunk> = artifacts
+        .json_hunks
+        .iter()
+        .filter(|hunk| hunk.hunk_kind == "addition" && hunk.prompt_id.is_some())
+        .collect();
+    assert_eq!(ai_addition_hunks.len(), 1);
+    assert_eq!(ai_addition_hunks[0].file_path, "test2.py");
+    assert_eq!(ai_addition_hunks[0].start_line, 1);
+    assert_eq!(ai_addition_hunks[0].end_line, 3);
+    assert_eq!(
+        ai_addition_hunks[0].content_hash,
+        compute_content_hash(&[
+            "def add(a, b):",
+            "    \"\"\"返回两个数的和。\"\"\"",
+            "    return a + b",
+        ])
+    );
 }
 
 #[test]

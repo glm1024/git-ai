@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use glob::Pattern;
 use serde::{Deserialize, Serialize, Serializer};
+use url::Url;
 
 use crate::feature_flags::FeatureFlags;
 use crate::git::repository::Repository;
@@ -21,6 +22,12 @@ pub const DEFAULT_API_BASE_URL: &str = "https://usegitai.com";
 pub const DEFAULT_MAX_CHECKPOINT_FILE_SIZE_BYTES: usize = 3 * 1024 * 1024;
 pub const DEFAULT_MAX_CHECKPOINT_TOTAL_SIZE_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_CHECKPOINT_TOTAL_LINES: usize = 500_000;
+const KNOWN_METRICS_ENDPOINT_PATHS: [&str; 4] = [
+    "/worker/metrics/upload",
+    "/api/v1/ai-code-stats/organization-options",
+    "/api/v1/ingest/ai-code-stats",
+    "/api/v1/ingest/ai-token-usage",
+];
 
 /// Which backend to use for storing authorship notes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1016,6 +1023,55 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Validate and canonicalize a dedicated metrics server URL.
+///
+/// Managed configuration may contain either the server base URL or one of the
+/// full metrics/organization endpoints accepted by the reporting UI. Runtime
+/// callers must always receive the base URL because `ApiContext` appends the
+/// upload endpoint itself.
+pub(crate) fn normalize_metrics_api_base_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("metrics_api_base_url cannot be empty".to_string());
+    }
+    let mut url = Url::parse(trimmed)
+        .map_err(|e| format!("metrics_api_base_url is not a valid URL: {}", e))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("metrics_api_base_url must use http:// or https://".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("metrics_api_base_url must not include user credentials".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("metrics_api_base_url must not include a query or fragment".to_string());
+    }
+
+    let mut path = url.path().trim_end_matches('/').to_string();
+    for endpoint_path in KNOWN_METRICS_ENDPOINT_PATHS {
+        if let Some(prefix) = path.strip_suffix(endpoint_path) {
+            path = if prefix.is_empty() {
+                "/".to_string()
+            } else {
+                prefix.to_string()
+            };
+            break;
+        }
+    }
+    url.set_path(&path);
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn normalize_configured_metrics_api_base_url(value: String) -> Option<String> {
+    let value = normalize_optional_string(Some(value))?;
+    match normalize_metrics_api_base_url(&value) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            eprintln!("Warning: Ignoring invalid metrics_api_base_url: {error}");
+            None
+        }
+    }
+}
+
 fn author_config_cache_key() -> AuthorConfigCacheKey {
     let config_path = config_file_path();
     let config_fingerprint = config_path
@@ -1149,7 +1205,7 @@ fn build_config() -> Config {
     let metrics_api_base_url = file_cfg
         .as_ref()
         .and_then(|c| c.metrics_api_base_url.clone())
-        .and_then(|value| normalize_optional_string(Some(value)));
+        .and_then(normalize_configured_metrics_api_base_url);
 
     // Get prompt_storage setting (defaults to "default")
     // Valid values: "default", "notes", "local"
@@ -1803,7 +1859,8 @@ fn apply_test_config_patch(config: &mut Config) {
             config.reporting_profile = reporting_profile.normalized();
         }
         if let Some(metrics_api_base_url) = patch.metrics_api_base_url {
-            config.metrics_api_base_url = normalize_optional_string(Some(metrics_api_base_url));
+            config.metrics_api_base_url =
+                normalize_configured_metrics_api_base_url(metrics_api_base_url);
         }
         if let Some(author) = patch.author {
             config.author = author.normalized();
@@ -1856,6 +1913,17 @@ fn apply_test_config_patch(config: &mut Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_api_base_url_canonicalizes_every_supported_full_endpoint() {
+        for endpoint_path in KNOWN_METRICS_ENDPOINT_PATHS {
+            let full_endpoint = format!("https://stats.example.com/prod-api{endpoint_path}");
+            assert_eq!(
+                normalize_metrics_api_base_url(&full_endpoint).as_deref(),
+                Ok("https://stats.example.com/prod-api")
+            );
+        }
+    }
 
     #[test]
     fn reporting_profile_is_metrics_only_and_overrides_reserved_attribute_keys() {

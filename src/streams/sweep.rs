@@ -91,9 +91,9 @@ impl StreamFormat {
             | Self::CursorJsonl
             | Self::GeminiJsonl
             | Self::WindsurfJsonl
-            | Self::CodexJsonl
             | Self::PiJsonl
             | Self::CopilotEventStreamJsonl => WatermarkType::ByteOffset,
+            Self::CodexJsonl => WatermarkType::CodexByteOffset,
             Self::DroidJsonl => WatermarkType::Hybrid,
             Self::CopilotSessionJson | Self::ContinueJson | Self::AmpThreadJson => {
                 WatermarkType::RecordIndex

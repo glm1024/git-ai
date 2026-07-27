@@ -263,14 +263,15 @@ fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repos
         return;
     }
 
-    // Check if this is a merge commit — skip expensive stats just like the sync path.
+    // Merge conflict-resolution metrics are computed by the durable background
+    // job because first-parent stats would double-count branch history.
     let is_merge = repo
         .find_commit(commit_sha.clone())
         .map(|c| c.parent_count().unwrap_or(0) > 1)
         .unwrap_or(false);
     if is_merge {
         eprintln!(
-            "[git-ai] Skipped git-ai stats for merge commit {}.",
+            "[git-ai] Queued complete git-ai metrics for merge commit {}.",
             commit_sha
         );
         return;
@@ -285,7 +286,7 @@ fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repos
     ) && estimate.should_skip()
     {
         eprintln!(
-            "[git-ai] Skipped git-ai stats for large commit. Run `git ai stats {}` to compute stats on demand.",
+            "[git-ai] Queued complete git-ai metrics for large commit {}.",
             commit_sha
         );
         return;

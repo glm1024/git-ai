@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import {
   normalizeReportingSettingsForOrganization,
+  organizationResultMatchesMetricsUrl,
+  resolveOrganizationOptionsUrl,
   validateReportingSettings,
   type ReportingSettings,
 } from "./reporting-profile-utils";
@@ -15,7 +17,9 @@ export const REPORTING_PROFILE_VIEW_ID = "git-ai.reportingProfile";
 export class ReportingProfileViewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
   private organization: OrganizationLoadResult | undefined;
+  private organizationLoadingEndpoint: string | undefined;
   private requestId = 0;
+  private saving = false;
 
   public constructor(private readonly service: ReportingProfileService) {}
 
@@ -41,10 +45,10 @@ export class ReportingProfileViewProvider implements vscode.WebviewViewProvider 
         await this.postInitialState();
         return;
       case "serverChanged":
-        await this.postOrganization(message.metricsApiBaseUrl);
+        await this.postOrganization(message.metricsApiBaseUrl, message.generation);
         return;
       case "save":
-        await this.save(message.settings);
+        await this.save(message.settings, message.revision);
         return;
       default:
         return;
@@ -58,35 +62,90 @@ export class ReportingProfileViewProvider implements vscode.WebviewViewProvider 
       return;
     }
     this.organization = initial.organization;
+    this.organizationLoadingEndpoint = undefined;
     await this.postMessage({ type: "initial", initial });
   }
 
-  private async postOrganization(metricsApiBaseUrl: string): Promise<void> {
+  private async postOrganization(metricsApiBaseUrl: string, generation: number): Promise<void> {
     const requestId = ++this.requestId;
+    try {
+      this.organizationLoadingEndpoint = resolveOrganizationOptionsUrl(metricsApiBaseUrl);
+    } catch {
+      this.organizationLoadingEndpoint = undefined;
+    }
+    await this.postMessage({
+      type: "organizationLoading",
+      metricsApiBaseUrl,
+      generation,
+    });
     const organization = await this.service.loadOrganizationOptions(metricsApiBaseUrl);
     if (requestId !== this.requestId || !this.view) {
       return;
     }
+    this.organizationLoadingEndpoint = undefined;
     this.organization = organization;
-    await this.postMessage({ type: "organization", organization });
+    await this.postMessage({
+      type: "organization",
+      organization,
+      metricsApiBaseUrl,
+      generation,
+    });
   }
 
-  private async save(settings: ReportingSettings): Promise<void> {
-    const error = validateReportingSettings(settings, this.organization?.options);
-    if (error) {
-      await this.postMessage({ type: "saveResult", ok: false, error });
+  private async save(settings: ReportingSettings, revision: number): Promise<void> {
+    if (this.saving) {
+      await this.postMessage({
+        type: "saveResult",
+        ok: false,
+        error: "正在保存，请稍候",
+        revision,
+      });
       return;
     }
-    const settingsForSave = normalizeReportingSettingsForOrganization(settings, this.organization?.options);
+    this.saving = true;
     try {
+      const basicError = validateReportingSettings(settings);
+      if (basicError) {
+        await this.postMessage({ type: "saveResult", ok: false, error: basicError, revision });
+        return;
+      }
+
+      const expectedEndpoint = resolveOrganizationOptionsUrl(settings.metricsApiBaseUrl);
+      const organizationIsLoading = this.organizationLoadingEndpoint === expectedEndpoint;
+      const organizationIsCurrent = organizationResultMatchesMetricsUrl(
+        settings.metricsApiBaseUrl,
+        this.organization?.endpoint,
+      );
+      if (organizationIsLoading || !organizationIsCurrent) {
+        await this.postMessage({
+          type: "saveResult",
+          ok: false,
+          error: "正在加载当前上报服务器的组织架构，请稍后再保存",
+          revision,
+        });
+        return;
+      }
+
+      const error = validateReportingSettings(settings, this.organization?.options);
+      if (error) {
+        await this.postMessage({ type: "saveResult", ok: false, error, revision });
+        return;
+      }
+      const settingsForSave = normalizeReportingSettingsForOrganization(
+        settings,
+        this.organization?.options,
+      );
       const saved = await this.service.save(settingsForSave);
-      await this.postMessage({ type: "saveResult", ok: true, settings: saved });
+      await this.postMessage({ type: "saveResult", ok: true, settings: saved, revision });
     } catch (saveError) {
       await this.postMessage({
         type: "saveResult",
         ok: false,
         error: saveError instanceof Error ? saveError.message : "保存失败，请稍后重试",
+        revision,
       });
+    } finally {
+      this.saving = false;
     }
   }
 
@@ -95,11 +154,12 @@ export class ReportingProfileViewProvider implements vscode.WebviewViewProvider 
   }
 }
 
-function isMessage(message: unknown): message is {
-  type: "ready" | "serverChanged" | "save";
-  metricsApiBaseUrl: string;
-  settings: ReportingSettings;
-} {
+type ReportingProfileMessage =
+  | { type: "ready" }
+  | { type: "serverChanged"; metricsApiBaseUrl: string; generation: number }
+  | { type: "save"; settings: ReportingSettings; revision: number };
+
+function isMessage(message: unknown): message is ReportingProfileMessage {
   if (!message || typeof message !== "object" || !("type" in message)) {
     return false;
   }
@@ -108,7 +168,8 @@ function isMessage(message: unknown): message is {
     return true;
   }
   if (type === "serverChanged") {
-    return typeof (message as { metricsApiBaseUrl?: unknown }).metricsApiBaseUrl === "string";
+    return typeof (message as { metricsApiBaseUrl?: unknown }).metricsApiBaseUrl === "string"
+      && Number.isSafeInteger((message as { generation?: unknown }).generation);
   }
   if (type !== "save") {
     return false;
@@ -120,7 +181,14 @@ function isMessage(message: unknown): message is {
   const profile = (settings as { profile?: unknown }).profile;
   return typeof (settings as { metricsApiBaseUrl?: unknown }).metricsApiBaseUrl === "string"
     && Boolean(profile)
-    && typeof profile === "object";
+    && typeof profile === "object"
+    && Number.isSafeInteger((message as { revision?: unknown }).revision);
+}
+
+export function shouldApplySaveResult(currentRevision: number, resultRevision: number): boolean {
+  return Number.isSafeInteger(currentRevision)
+    && Number.isSafeInteger(resultRevision)
+    && currentRevision === resultRevision;
 }
 
 function getHtml(webview: vscode.Webview): string {
@@ -202,7 +270,8 @@ function getHtml(webview: vscode.Webview): string {
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    const state = { settings: { metricsApiBaseUrl: '', profile: { departmentName: '', officeName: '', teamName: '', userName: '', userEmail: '' } }, organization: undefined, cliError: '', saveError: '', saving: false, dirty: false, openMenu: '' };
+    ${shouldApplySaveResult.toString()}
+    const state = { settings: { metricsApiBaseUrl: '', profile: { departmentName: '', officeName: '', teamName: '', userName: '', userEmail: '' } }, organization: undefined, cliError: '', saveError: '', saving: false, saveRevision: undefined, dirty: false, revision: 0, organizationLoading: false, organizationGeneration: 0, openMenu: '' };
     let serverTimer;
     const element = (id) => document.getElementById(id);
     const setSaveState = (text, kind) => { const node = element('save-state'); element('save-state-text').textContent = text; node.className = 'save-state ' + kind; node.title = text; };
@@ -219,6 +288,8 @@ function getHtml(webview: vscode.Webview): string {
     const renderSaveState = () => {
       if (state.cliError) setSaveState(state.cliError, 'error');
       else if (state.saveError) setSaveState(state.saveError, 'error');
+      else if (state.saving) setSaveState('正在保存…', 'dirty');
+      else if (state.organizationLoading) setSaveState('正在加载组织架构…', 'dirty');
       else if (state.organization?.error) setSaveState(state.organization.error, 'error');
       else if (state.dirty) setSaveState('有未保存更改', 'dirty');
       else if (state.organization?.source === 'cache') setSaveState('正在使用缓存', 'dirty');
@@ -226,22 +297,28 @@ function getHtml(webview: vscode.Webview): string {
     };
     const render = () => {
       const options = state.organization?.options;
+      if (state.saving || state.organizationLoading) state.openMenu = '';
       updateSelect('department', '请选择部门', options?.departments.map((department) => department.name) || [], state.settings.profile.departmentName);
       updateSelect('office', state.settings.profile.departmentName ? '请选择处' : '请先选择部门', offices().map((office) => office.name), state.settings.profile.officeName);
       const selectedOffice = offices().find((office) => office.name === state.settings.profile.officeName);
       const availableTeams = selectedOffice?.teams || []; const teamField = element('team-field'); teamField.hidden = selectedOffice ? availableTeams.length === 0 : !state.settings.profile.teamName;
       updateSelect('team', '请选择组', availableTeams, state.settings.profile.teamName);
-      element('office').disabled = !state.settings.profile.departmentName || !options;
-      element('team').disabled = !selectedOffice || availableTeams.length === 0;
+      element('department').disabled = state.saving || state.organizationLoading || !options;
+      element('office').disabled = state.saving || state.organizationLoading || !state.settings.profile.departmentName || !options;
+      element('team').disabled = state.saving || state.organizationLoading || !selectedOffice || availableTeams.length === 0;
       element('user-name').value = state.settings.profile.userName;
       element('user-email').value = state.settings.profile.userEmail;
       element('server-url').value = state.settings.metricsApiBaseUrl;
-      element('save').disabled = Boolean(state.cliError);
-      element('save-label').textContent = '保存';
+      element('user-name').disabled = state.saving;
+      element('user-email').disabled = state.saving;
+      element('server-url').disabled = state.saving;
+      element('save').disabled = Boolean(state.cliError) || state.saving || state.organizationLoading;
+      element('save-label').textContent = state.saving ? '保存中…' : '保存';
       renderSaveState();
     };
-    const markDirty = () => { state.dirty = true; state.saveError = ''; };
+    const markDirty = () => { state.dirty = true; state.saveError = ''; state.revision += 1; };
     const chooseOption = (id, value) => {
+      if (state.saving || state.organizationLoading) return;
       if (id === 'department') { state.settings.profile.departmentName = value; state.settings.profile.officeName = ''; state.settings.profile.teamName = ''; }
       if (id === 'office') { state.settings.profile.officeName = value; state.settings.profile.teamName = ''; }
       if (id === 'team') state.settings.profile.teamName = value;
@@ -253,17 +330,51 @@ function getHtml(webview: vscode.Webview): string {
       element(id).addEventListener('keydown', (event) => { if (event.key === 'Escape') { state.openMenu = ''; render(); } else if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') { event.preventDefault(); state.openMenu = id; render(); } });
     }
     document.addEventListener('pointerdown', (event) => { if (state.openMenu && !event.target.closest('.select-control')) { state.openMenu = ''; render(); } });
-    element('user-name').addEventListener('input', (event) => { state.settings.profile.userName = event.target.value; markDirty(); renderSaveState(); });
-    element('user-email').addEventListener('input', (event) => { state.settings.profile.userEmail = event.target.value; markDirty(); renderSaveState(); });
-    element('server-url').addEventListener('input', (event) => { state.settings.metricsApiBaseUrl = event.target.value; markDirty(); renderSaveState(); clearTimeout(serverTimer); serverTimer = setTimeout(() => vscode.postMessage({ type: 'serverChanged', metricsApiBaseUrl: state.settings.metricsApiBaseUrl }), 300); });
-    element('save').addEventListener('click', () => { if (state.saving || state.cliError) return; state.saving = true; state.saveError = ''; render(); vscode.postMessage({ type: 'save', settings: state.settings }); });
+    element('user-name').addEventListener('input', (event) => { if (state.saving) return; state.settings.profile.userName = event.target.value; markDirty(); renderSaveState(); });
+    element('user-email').addEventListener('input', (event) => { if (state.saving) return; state.settings.profile.userEmail = event.target.value; markDirty(); renderSaveState(); });
+    element('server-url').addEventListener('input', (event) => {
+      if (state.saving) return;
+      state.settings.metricsApiBaseUrl = event.target.value;
+      state.organization = undefined;
+      state.organizationLoading = true;
+      state.organizationGeneration += 1;
+      const generation = state.organizationGeneration;
+      const metricsApiBaseUrl = state.settings.metricsApiBaseUrl;
+      markDirty();
+      render();
+      clearTimeout(serverTimer);
+      serverTimer = setTimeout(() => vscode.postMessage({ type: 'serverChanged', metricsApiBaseUrl, generation }), 300);
+    });
+    element('save').addEventListener('click', () => {
+      if (state.saving || state.cliError || state.organizationLoading) return;
+      state.saving = true;
+      state.saveRevision = state.revision;
+      state.saveError = '';
+      const settings = { metricsApiBaseUrl: state.settings.metricsApiBaseUrl, profile: { ...state.settings.profile } };
+      render();
+      vscode.postMessage({ type: 'save', settings, revision: state.saveRevision });
+    });
     window.addEventListener('message', (event) => {
       const message = event.data;
       if (message?.type === 'initial') {
-        state.settings = message.initial.settings; state.organization = message.initial.organization; state.cliError = message.initial.cliError || ''; state.dirty = Boolean(message.initial.importedFields?.length); render();
+        state.settings = message.initial.settings; state.organization = message.initial.organization; state.organizationLoading = false; state.cliError = message.initial.cliError || ''; state.dirty = Boolean(message.initial.importedFields?.length); state.revision = 0; render();
       }
-      if (message?.type === 'organization') { state.organization = message.organization; render(); }
-      if (message?.type === 'saveResult') { state.saving = false; if (message.ok) { state.settings = message.settings; state.cliError = ''; state.saveError = ''; state.dirty = false; } else { state.saveError = message.error || '保存失败，请稍后重试'; } render(); }
+      if (message?.type === 'organizationLoading' && message.generation === state.organizationGeneration && message.metricsApiBaseUrl === state.settings.metricsApiBaseUrl) {
+        state.organizationLoading = true; render();
+      }
+      if (message?.type === 'organization' && message.generation === state.organizationGeneration && message.metricsApiBaseUrl === state.settings.metricsApiBaseUrl) {
+        state.organization = message.organization; state.organizationLoading = false; render();
+      }
+      if (message?.type === 'saveResult' && message.revision === state.saveRevision) {
+        state.saving = false;
+        state.saveRevision = undefined;
+        if (message.ok && shouldApplySaveResult(state.revision, message.revision)) {
+          state.settings = message.settings; state.cliError = ''; state.saveError = ''; state.dirty = false;
+        } else if (!message.ok) {
+          state.saveError = message.error || '保存失败，请稍后重试';
+        }
+        render();
+      }
     });
     vscode.postMessage({ type: 'ready' });
   </script>

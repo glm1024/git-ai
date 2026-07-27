@@ -827,17 +827,43 @@ impl RefCursor {
             {
                 let branch_timestamp = branch.timestamp_secs;
                 self.consume_entry(&branch)?;
-                let branch_can_affect_head = current_worktree_branch_ref(cmd, state)
-                    .is_none_or(|current_branch| current_branch == spec.reference);
-                if branch_can_affect_head
-                    && let Some(timestamp) = branch_timestamp
-                    && let Some(head) = self
-                        .direct_ref_transition_entries(cmd, "HEAD", &old, &new)?
-                        .into_iter()
-                        .find(|entry| entry.timestamp_secs == Some(timestamp))
-                {
-                    self.consume_entry(&head)?;
-                    changes.push(entry_to_ref_change(&head));
+                match current_worktree_branch_ref(cmd, state) {
+                    Some(current_branch) if current_branch == spec.reference => {
+                        // Updating a checked-out branch through its full ref name
+                        // moves symbolic HEAD too. Git may record that HEAD reflog
+                        // mirror as zero->new instead of old->new, so the branch
+                        // transition and known worktree branch are the authoritative
+                        // pair. Consume either reflog shape when present, but publish
+                        // the real old->new HEAD movement to downstream analyzers.
+                        if let Some(head) = self.find_head_entry(
+                            cmd.worktree.as_deref(),
+                            &[],
+                            ExpectedTransition {
+                                old_oids: [old.clone(), zero_oid()].into_iter().collect(),
+                                new_oid: Some(new.clone()),
+                                messages: HashSet::new(),
+                            },
+                        )? {
+                            self.consume_entry(&head)?;
+                        }
+                        changes.push(RefChange {
+                            reference: "HEAD".to_string(),
+                            old,
+                            new,
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let Some(timestamp) = branch_timestamp
+                            && let Some(head) = self
+                                .direct_ref_transition_entries(cmd, "HEAD", &old, &new)?
+                                .into_iter()
+                                .find(|entry| entry.timestamp_secs == Some(timestamp))
+                        {
+                            self.consume_entry(&head)?;
+                            changes.push(entry_to_ref_change(&head));
+                        }
+                    }
                 }
             }
         } else if let Some(entry) = self.find_common_ref_entry(
@@ -4390,6 +4416,59 @@ mod tests {
         assert!(
             later.ref_changes.is_empty(),
             "later unstructured update-ref must not replay HEAD or branch reflog entries already represented by argv: {:?}",
+            later.ref_changes
+        );
+    }
+
+    #[test]
+    fn direct_current_branch_update_ref_recovers_zero_old_head_reflog_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = worktree.join(".git");
+        let reference = "refs/heads/feature";
+        append_reflog(&git_dir, reference, &[(A, B, "")]);
+        append_reflog(&git_dir, "HEAD", &[(&zero_oid(), B, "")]);
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let mut state = family_state(&family);
+        state.worktrees.insert(
+            worktree.canonicalize().unwrap(),
+            WorktreeState {
+                head: Some(A.to_string()),
+                branch: Some(reference.to_string()),
+                detached: false,
+                last_updated_ns: 0,
+            },
+        );
+        let mut cursor = RefCursor::new(family.clone());
+
+        let mut direct = command_with_worktree(
+            &family,
+            Some(worktree.clone()),
+            &["update-ref", reference, B, A],
+        );
+        cursor.enrich_command(&mut direct, &state).unwrap();
+
+        assert_eq!(
+            direct.ref_changes,
+            vec![
+                RefChange {
+                    reference: reference.to_string(),
+                    old: A.to_string(),
+                    new: B.to_string(),
+                },
+                RefChange {
+                    reference: "HEAD".to_string(),
+                    old: A.to_string(),
+                    new: B.to_string(),
+                },
+            ]
+        );
+
+        let mut later = command_with_worktree(&family, Some(worktree), &["update-ref", "--stdin"]);
+        cursor.enrich_command(&mut later, &state).unwrap();
+        assert!(
+            later.ref_changes.is_empty(),
+            "the malformed HEAD mirror must be consumed with its branch update: {:?}",
             later.ref_changes
         );
     }

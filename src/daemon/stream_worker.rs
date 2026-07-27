@@ -7,10 +7,8 @@
 use crate::authorship::authorship_log_serialization::{generate_session_id, generate_trace_id};
 use crate::config;
 use crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle;
-use crate::daemon::transcript_redaction::redact_json_secrets;
-use crate::metrics::{
-    EventAttributes, MetricEvent, OtelTraceValues, PosEncoded, SessionEventValues,
-};
+use crate::metrics::session_compaction::compact_session_event;
+use crate::metrics::{EventAttributes, PosEncoded};
 use crate::streams::agent::{SHARED_STREAM_SESSION_ID, StreamDescriptor};
 use crate::streams::db::{StreamRecord, StreamsDatabase};
 use crate::streams::types::StreamError;
@@ -1164,62 +1162,50 @@ impl StreamWorker {
             let batch_count = batch.events.len();
 
             let is_otel_stream = task.stream_kind == "otel_traces";
-            let metric_events: Vec<MetricEvent> = batch
-                .events
-                .into_iter()
-                .enumerate()
-                .filter_map(|(idx, raw_event)| {
-                    let (eid, pid, tid) = agent.extract_event_ids(&raw_event);
-                    let is_first_event = is_initial_watermark && total_events == 0 && idx == 0;
-                    let event_ts = match &file_meta {
-                        Some(meta) => {
-                            agent.extract_event_timestamp(&raw_event, meta, is_first_event)
-                        }
-                        None => extract_event_timestamp(&raw_event).unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as u32
-                        }),
-                    };
-                    let trace_id = generate_trace_id();
-                    let mut event_attrs = base_attrs.clone().trace_id(trace_id);
+            let mut session_observations = Vec::new();
+            for (idx, raw_event) in batch.events.into_iter().enumerate() {
+                let (eid, pid, tid) = agent.extract_event_ids(&raw_event);
+                let is_first_event = is_initial_watermark && total_events == 0 && idx == 0;
+                let event_ts = match &file_meta {
+                    Some(meta) => agent.extract_event_timestamp(&raw_event, meta, is_first_event),
+                    None => extract_event_timestamp(&raw_event).unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as u32
+                    }),
+                };
+                let trace_id = generate_trace_id();
+                let mut event_attrs = base_attrs.clone().trace_id(trace_id);
 
-                    if let Some(event_sid) = agent.extract_event_session_id(&raw_event) {
-                        let derived_session_id = generate_session_id(&event_sid, &stream.tool);
-                        event_attrs = event_attrs
-                            .session_id(derived_session_id)
-                            .external_session_id(event_sid);
-                    } else if is_otel_stream {
-                        tracing::debug!(
-                            session_id = %task.session_id,
-                            "dropping OTEL span without extractable session identifier"
-                        );
-                        return None;
-                    }
+                if let Some(event_sid) = agent.extract_event_session_id(&raw_event) {
+                    let derived_session_id = generate_session_id(&event_sid, &stream.tool);
+                    event_attrs = event_attrs
+                        .session_id(derived_session_id)
+                        .external_session_id(event_sid);
+                } else if is_otel_stream {
+                    tracing::debug!(
+                        session_id = %task.session_id,
+                        "dropping OTEL span without extractable session identifier"
+                    );
+                    continue;
+                }
 
-                    let attrs_sparse = event_attrs.to_sparse();
-                    let raw_event = redact_json_secrets(raw_event);
-                    Some(if is_otel_stream {
-                        MetricEvent::from_values_with_timestamp(
-                            OtelTraceValues::with_ids(raw_event, eid, pid, tid),
-                            attrs_sparse,
-                            Some(event_ts),
-                        )
-                    } else {
-                        MetricEvent::from_values_with_timestamp(
-                            SessionEventValues::with_ids(raw_event, eid, pid, tid),
-                            attrs_sparse,
-                            Some(event_ts),
-                        )
-                    })
-                })
-                .collect();
+                let attrs_sparse = event_attrs.to_sparse();
+                session_observations.push(compact_session_event(
+                    &raw_event,
+                    event_ts,
+                    attrs_sparse,
+                    eid,
+                    pid,
+                    tid,
+                ));
+            }
 
             persist_metrics_before_advancing_watermark(
                 || {
                     telemetry
-                        .persist_metrics_blocking(&metric_events)
+                        .persist_session_observations_blocking(&session_observations)
                         .map(|_| ())
                 },
                 || {

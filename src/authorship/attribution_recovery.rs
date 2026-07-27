@@ -232,7 +232,7 @@ pub(crate) fn recover_attribution(
         commit_sha,
         authorship_log,
         committed_hunks,
-    );
+    )?;
     let unknown_after_edges = unknown_lines_by_file(authorship_log, committed_hunks);
     if unknown_after_edges.is_empty() {
         return Ok(());
@@ -395,7 +395,7 @@ fn recover_bash_mtime(
             recovered_line_count: unknown_lines.len() as u32,
             metadata,
             event_ts: Some((candidate.start_time_ns / 1_000_000_000) as u32),
-        });
+        })?;
     }
 
     Ok(())
@@ -508,7 +508,7 @@ fn recover_session_event_mtime(
             recovered_line_count: unknown_lines.len() as u32,
             metadata,
             event_ts: Some(candidate.event_ts),
-        });
+        })?;
     }
 
     Ok(())
@@ -616,7 +616,7 @@ fn recover_commit_metadata(
             recovered_line_count: unknown_lines.len() as u32,
             metadata,
             event_ts: selection.event_ts,
-        });
+        })?;
     }
 
     Ok(())
@@ -1122,7 +1122,7 @@ fn recover_adjacent_edges(
     commit_sha: &str,
     authorship_log: &mut AuthorshipLog,
     committed_hunks: &HashMap<String, Vec<LineRange>>,
-) {
+) -> Result<(), GitAiError> {
     let unknown = unknown_lines_by_file(authorship_log, committed_hunks);
     for (file_path, unknown_lines) in unknown {
         let line_to_author = line_author_map(authorship_log, &file_path);
@@ -1174,9 +1174,10 @@ fn recover_adjacent_edges(
                 recovered_line_count,
                 metadata,
                 event_ts: None,
-            });
+            })?;
         }
     }
+    Ok(())
 }
 
 fn repo_worktree_key(repo: &Repository) -> Result<String, GitAiError> {
@@ -1692,9 +1693,21 @@ struct RecoveryMetricInput<'a> {
     event_ts: Option<u32>,
 }
 
-fn record_recovery_metric(input: RecoveryMetricInput<'_>) {
+fn recovery_metric_attrs(input: &RecoveryMetricInput<'_>) -> EventAttributes {
+    let attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+        .commit_sha(input.commit_sha)
+        .session_id(input.session_id)
+        .trace_id(input.trace_id);
+    if input.parent_sha == "initial" {
+        attrs.base_commit_sha_null()
+    } else {
+        attrs.base_commit_sha(input.parent_sha)
+    }
+}
+
+fn record_recovery_metric(input: RecoveryMetricInput<'_>) -> Result<(), GitAiError> {
     if input.tool == "mock_ai" {
-        return;
+        return Ok(());
     }
 
     let checkpoint_ts = input.event_ts.map(u64::from).unwrap_or_else(|| {
@@ -1718,11 +1731,7 @@ fn record_recovery_metric(input: RecoveryMetricInput<'_>) {
         values = values.external_tool_use_id(tool_use_id);
     }
 
-    let mut attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
-        .base_commit_sha(input.parent_sha)
-        .commit_sha(input.commit_sha)
-        .session_id(input.session_id)
-        .trace_id(input.trace_id);
+    let mut attrs = recovery_metric_attrs(&input);
 
     if !input.tool.is_empty() {
         attrs = attrs.tool(input.tool);
@@ -1744,7 +1753,7 @@ fn record_recovery_metric(input: RecoveryMetricInput<'_>) {
     attrs = attrs.author(input.author_id);
 
     let event = MetricEvent::from_values_with_timestamp(values, attrs.to_sparse(), input.event_ts);
-    crate::observability::log_metrics(vec![event]);
+    crate::observability::log_metrics(vec![event])
 }
 
 #[cfg(test)]
@@ -1761,6 +1770,36 @@ mod tests {
             id: external_session_id.to_string(),
             model: "gpt-5".to_string(),
         }
+    }
+
+    #[test]
+    fn root_recovery_metric_uses_null_base_commit() {
+        let repo = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        let input = RecoveryMetricInput {
+            repo: repo.gitai_repo(),
+            parent_sha: "initial",
+            commit_sha: "root",
+            file_path: "file.txt",
+            author_id: "author",
+            session_id: "session",
+            trace_id: "trace",
+            tool: "codex",
+            model: "gpt-5",
+            external_session_id: "external",
+            external_tool_use_id: None,
+            edit_kind: "file_edit",
+            checkpoint_type: "recovered",
+            recovered_line_count: 1,
+            metadata: serde_json::json!({}),
+            event_ts: Some(1),
+        };
+
+        let attrs = recovery_metric_attrs(&input).to_sparse();
+
+        assert_eq!(
+            attrs.get(&crate::metrics::attrs::attr_pos::BASE_COMMIT_SHA.to_string()),
+            Some(&serde_json::Value::Null)
+        );
     }
 
     fn bash_call(

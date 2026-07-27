@@ -1367,7 +1367,7 @@ impl DiffTreeChunkParser {
                 .or_default()
                 .push(DiffHunkContents::default());
         } else if let Some(new_line) = self.active_hunk_new_line.as_mut() {
-            if line.starts_with('+') {
+            if let Some(added_line) = line.strip_prefix('+') {
                 if let Some(ref file) = self.current_file {
                     self.added_lines_by_file
                         .entry(file.clone())
@@ -1378,18 +1378,18 @@ impl DiffTreeChunkParser {
                         .get_mut(file)
                         .and_then(|hunks| hunks.last_mut())
                     {
-                        contents.added.push(line[1..].to_string());
+                        contents.added.push(added_line.to_string());
                     }
                 }
                 *new_line += 1;
-            } else if line.starts_with('-') {
+            } else if let Some(deleted_line) = line.strip_prefix('-') {
                 if let Some(ref file) = self.current_file
                     && let Some(contents) = self
                         .hunk_contents_by_file
                         .get_mut(file)
                         .and_then(|hunks| hunks.last_mut())
                 {
-                    contents.deleted.push(line[1..].to_string());
+                    contents.deleted.push(deleted_line.to_string());
                 }
             } else if line.starts_with('\\') {
                 // Removed lines and "\ No newline at end of file" markers do

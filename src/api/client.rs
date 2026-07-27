@@ -332,9 +332,21 @@ impl ApiContext {
         endpoint: &str,
         body: &T,
     ) -> Result<http::Response, GitAiError> {
-        let url = self.build_url(endpoint)?;
         let body_json = serde_json::to_string(body).map_err(GitAiError::JsonError)?;
+        self.post_serialized_json(endpoint, &body_json)
+    }
 
+    /// Make a POST request from JSON that has already been serialized.
+    ///
+    /// This is reserved for protocols that bind an acknowledgement to the
+    /// exact request bytes. Regular callers should continue to use
+    /// [`Self::post_json`].
+    pub(crate) fn post_serialized_json(
+        &self,
+        endpoint: &str,
+        body_json: &str,
+    ) -> Result<http::Response, GitAiError> {
+        let url = self.build_url(endpoint)?;
         let (_agent, mut request) = Self::http_post(&url, self.timeout_secs);
         request = request.set("Content-Type", "application/json");
 
@@ -348,7 +360,7 @@ impl ApiContext {
             request = request.set("Authorization", &format!("Bearer {}", token));
         }
 
-        http::send_with_body(request, &body_json)
+        http::send_with_body(request, body_json)
             .map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))
     }
 

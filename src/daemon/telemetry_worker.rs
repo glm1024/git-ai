@@ -4,7 +4,9 @@
 //! and CAS payloads, then flushes them to their destinations every 3 seconds.
 
 use crate::api::logs::daemon_logs_upload_allowed;
-use crate::api::metrics::{MetricsUploadResponse, metrics_upload_allowed};
+use crate::api::metrics::{
+    MetricsUploadResponse, metrics_upload_allowed, metrics_upload_error_is_permanent,
+};
 use crate::api::types::{
     DAEMON_LOGS_UPLOAD_VERSION, DaemonLogEvent, DaemonLogFieldValue, DaemonLogKind, DaemonLogLevel,
     DaemonLogsUploadRequest,
@@ -15,6 +17,7 @@ use crate::config::{Config, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::error::GitAiError;
 use crate::metrics::db::{METADATA_BACKFILL_BATCH_SIZE, MetricRecord, MetricsDatabase};
+use crate::metrics::session_compaction::SessionObservation;
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use serde_json::{Value, json};
@@ -31,6 +34,7 @@ const MAX_DAEMON_LOG_BUFFER_EVENTS: usize = 5000;
 
 static METRICS_UPLOAD_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static METRICS_METADATA_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
+static TOKEN_IDENTITY_REHYDRATION_STARTED: AtomicBool = AtomicBool::new(false);
 static DAEMON_LOG_UPLOAD_IN_FLIGHT: std::sync::OnceLock<Arc<AtomicBool>> =
     std::sync::OnceLock::new();
 
@@ -209,7 +213,27 @@ impl DaemonTelemetryWorkerHandle {
     }
 
     /// Submit telemetry envelopes for batched processing.
-    pub async fn submit_telemetry(&self, envelopes: Vec<TelemetryEnvelope>) {
+    ///
+    /// Metric events are committed to SQLite before this method returns so the
+    /// control-plane response can serve as a durable acknowledgement.
+    pub async fn submit_telemetry(
+        &self,
+        envelopes: Vec<TelemetryEnvelope>,
+    ) -> Result<(), GitAiError> {
+        self.submit_telemetry_with_persist(envelopes, |events| {
+            store_metrics_in_db(&events).map(|_| ())
+        })
+        .await
+    }
+
+    async fn submit_telemetry_with_persist<P>(
+        &self,
+        envelopes: Vec<TelemetryEnvelope>,
+        persist_metrics: P,
+    ) -> Result<(), GitAiError>
+    where
+        P: FnOnce(Vec<MetricEvent>) -> Result<(), GitAiError> + Send + 'static,
+    {
         let (buffered_envelopes, metric_events) = split_metric_envelopes(envelopes);
         if !buffered_envelopes.is_empty() {
             self.buffer
@@ -219,12 +243,16 @@ impl DaemonTelemetryWorkerHandle {
         }
 
         if !metric_events.is_empty() {
-            std::mem::drop(tokio::task::spawn_blocking(move || {
-                if let Err(e) = store_metrics_in_db(&metric_events) {
-                    tracing::warn!(%e, "telemetry: failed to persist metrics locally");
-                }
-            }));
+            tokio::task::spawn_blocking(move || persist_metrics(metric_events))
+                .await
+                .map_err(|error| {
+                    GitAiError::Generic(format!(
+                        "metrics persistence worker failed before acknowledgement: {error}"
+                    ))
+                })??;
         }
+
+        Ok(())
     }
 
     /// Submit CAS records for batched upload.
@@ -292,6 +320,20 @@ impl DaemonTelemetryWorkerHandle {
     /// producer coupled to the metrics DB write and bounds peak memory.
     pub fn persist_metrics_blocking(&self, events: &[MetricEvent]) -> Result<Vec<i64>, GitAiError> {
         store_metrics_in_db(events)
+    }
+
+    /// Persist content-free transcript observations and enqueue only compact
+    /// token deltas. The metrics DB transaction owns deduplication so a crash
+    /// before the transcript watermark advances is safe to replay.
+    pub(crate) fn persist_session_observations_blocking(
+        &self,
+        observations: &[SessionObservation],
+    ) -> Result<Vec<i64>, GitAiError> {
+        let db = MetricsDatabase::global()?;
+        let mut db_lock = db
+            .lock()
+            .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
+        db_lock.insert_session_observations(observations)
     }
 
     /// Submit telemetry envelopes synchronously (best-effort, non-blocking).
@@ -366,7 +408,9 @@ fn submit_daemon_internal_telemetry_with_handle(
 ) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
-            handle.submit_telemetry(envelopes).await;
+            if let Err(e) = handle.submit_telemetry(envelopes).await {
+                tracing::warn!(%e, "telemetry: failed to persist daemon metrics locally");
+            }
         });
     } else {
         handle.submit_telemetry_sync(envelopes);
@@ -439,6 +483,7 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
     let daemon_id = crate::uuid::generate_v4();
 
     spawn_metrics_metadata_backfill();
+    spawn_token_identity_rehydration();
 
     tokio::spawn(async move {
         telemetry_flush_loop(buffer, daemon_id, flush_rx).await;
@@ -457,6 +502,40 @@ fn spawn_metrics_metadata_backfill() {
             tracing::warn!(%e, "telemetry: failed to backfill metrics event metadata");
         }
     }));
+}
+
+fn spawn_token_identity_rehydration() {
+    if TOKEN_IDENTITY_REHYDRATION_STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    std::mem::drop(tokio::task::spawn_blocking(|| {
+        if let Err(e) = rehydrate_unknown_token_identity() {
+            tracing::warn!(%e, "telemetry: failed to rehydrate token reporting identity");
+        }
+    }));
+}
+
+fn rehydrate_unknown_token_identity() -> Result<usize, GitAiError> {
+    let config = Config::fresh();
+    let reporting_attributes = config
+        .metrics_custom_attributes()
+        .iter()
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "department_name" | "office_name" | "team_name" | "user_name" | "user_email"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let db = MetricsDatabase::global()?;
+    let mut db_lock = db
+        .lock()
+        .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
+    db_lock
+        .rehydrate_unknown_daily_token_identity(&reporting_attributes)
+        .map(|ids| ids.len())
 }
 
 fn backfill_metrics_event_metadata() -> Result<(), GitAiError> {
@@ -493,6 +572,16 @@ async fn telemetry_flush_loop(
     let mut next_heartbeat_at = started_at + DAEMON_LOG_HEARTBEAT_INTERVAL;
     let mut flush_requests: Vec<FlushRequest> = Vec::new();
 
+    // Reclaim durable post-commit work immediately after a daemon restart.
+    // Periodic passes handle the remaining queue and `await` drains a larger
+    // bounded batch.
+    let _ = tokio::task::spawn_blocking(|| {
+        crate::metrics::deferred_commit_jobs::process_periodic_jobs();
+        crate::metrics::deferred_lifecycle_jobs::process_periodic_jobs();
+        flush_pending_metrics();
+    })
+    .await;
+
     loop {
         tokio::select! {
             _ = sleep_until(next_telemetry_flush_at(Instant::now())) => {}
@@ -528,6 +617,16 @@ async fn telemetry_flush_loop(
         let daemon_id_for_flush = daemon_id.clone();
         let flush_started_at = std::time::Instant::now();
         let flush_result = tokio::task::spawn_blocking(move || {
+            match flush_mode {
+                FlushMode::Periodic => {
+                    crate::metrics::deferred_commit_jobs::process_periodic_jobs();
+                    crate::metrics::deferred_lifecycle_jobs::process_periodic_jobs();
+                }
+                FlushMode::Await => {
+                    crate::metrics::deferred_commit_jobs::process_jobs_for_await();
+                    crate::metrics::deferred_lifecycle_jobs::process_jobs_for_await();
+                }
+            }
             let requeue_daemon_logs = if let Some(snapshot) = snapshot {
                 flush_telemetry_batch(snapshot, &daemon_id_for_flush)
             } else {
@@ -649,17 +748,39 @@ where
 }
 
 fn count_pending_metrics_for_await() -> usize {
+    let deferred = pending_count_or_unknown(
+        "deferred commit metrics",
+        crate::metrics::deferred_commit_jobs::count_outstanding(),
+    )
+    .saturating_add(pending_count_or_unknown(
+        "deferred lifecycle metrics",
+        crate::metrics::deferred_lifecycle_jobs::count_outstanding(),
+    ));
     if !METRICS_UPLOAD_AVAILABLE.load(Ordering::Relaxed) {
-        return 0;
+        return deferred;
     }
 
-    MetricsDatabase::global()
+    let retryable = MetricsDatabase::global()
         .and_then(|db| {
             db.lock()
                 .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))
         })
-        .and_then(|db| db.count_retryable())
-        .unwrap_or(0)
+        .and_then(|db| db.count_retryable());
+    let retryable = pending_count_or_unknown("metrics outbox", retryable);
+    deferred.saturating_add(retryable)
+}
+
+/// An unreadable durable queue is not an empty queue. Returning one keeps
+/// `git-ai await` conservative and prevents a transient SQLite/lock failure
+/// from being acknowledged as a fully flushed telemetry route.
+fn pending_count_or_unknown(label: &str, result: Result<usize, GitAiError>) -> usize {
+    match result {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!(%error, queue = label, "unable to count pending telemetry");
+            1
+        }
+    }
 }
 
 fn flush_metrics(events: &[MetricEvent]) {
@@ -692,6 +813,10 @@ fn flush_metrics(events: &[MetricEvent]) {
 }
 
 fn flush_pending_metrics() {
+    if let Err(e) = rehydrate_unknown_token_identity() {
+        tracing::warn!(%e, "telemetry: failed to rehydrate token reporting identity");
+    }
+
     let context = ApiContext::for_metrics();
     let api_base_url = context.base_url.clone();
     let client = ApiClient::new(context);
@@ -729,6 +854,10 @@ fn store_metrics_in_db(events: &[MetricEvent]) -> Result<Vec<i64>, GitAiError> {
     db_lock.insert_events(&event_jsons)
 }
 
+pub(crate) fn persist_metrics_to_db_blocking(events: &[MetricEvent]) -> Result<(), GitAiError> {
+    store_metrics_in_db(events).map(|_| ())
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PendingMetricsFlushResult {
     uploaded_events: usize,
@@ -743,7 +872,7 @@ fn flush_pending_metrics_from_db(
     flush_pending_metric_records_with(
         read_pending_metrics_batch,
         mark_metric_records_delivered,
-        mark_metric_records_failed,
+        mark_metric_records_deferred,
         mark_metric_records_undeliverable,
         |batch| client.upload_metrics(batch),
         deadline,
@@ -767,13 +896,13 @@ fn mark_metric_records_delivered(ids: &[i64]) -> Result<(), GitAiError> {
     db_lock.mark_records_delivered(ids, current_unix_ts())
 }
 
-fn mark_metric_records_failed(ids: &[i64], error: &GitAiError) -> Result<(), GitAiError> {
+fn mark_metric_records_deferred(ids: &[i64], error: &GitAiError) -> Result<(), GitAiError> {
     let db = MetricsDatabase::global()?;
     let mut db_lock = db
         .lock()
         .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
     let now = current_unix_ts();
-    db_lock.mark_records_failed(ids, &error.to_string(), now)
+    db_lock.mark_records_deferred(ids, &error.to_string(), now)
 }
 
 fn mark_metric_records_undeliverable(records: &[(i64, String)]) -> Result<(), GitAiError> {
@@ -816,7 +945,7 @@ where
 
         let mut events = Vec::new();
         let mut record_ids = Vec::new();
-        let mut invalid_ids = Vec::new();
+        let mut invalid_records = Vec::new();
 
         for record in &batch {
             match serde_json::from_str::<MetricEvent>(&record.event_json) {
@@ -824,18 +953,20 @@ where
                     events.push(event);
                     record_ids.push(record.id);
                 }
-                Err(_) => {
-                    invalid_ids.push(record.id);
+                Err(error) => {
+                    invalid_records
+                        .push((record.id, format!("invalid local metric JSON: {error}")));
                 }
             }
         }
 
-        let batch_min_id = record_ids.iter().chain(invalid_ids.iter()).min().copied();
-        let batch_max_id = record_ids.iter().chain(invalid_ids.iter()).max().copied();
+        let invalid_ids = invalid_records.iter().map(|(id, _)| id);
+        let batch_min_id = record_ids.iter().chain(invalid_ids.clone()).min().copied();
+        let batch_max_id = record_ids.iter().chain(invalid_ids).max().copied();
 
-        if !invalid_ids.is_empty() {
-            result.invalid_records += invalid_ids.len();
-            mark_delivered(&invalid_ids)?;
+        if !invalid_records.is_empty() {
+            result.invalid_records += invalid_records.len();
+            mark_undeliverable(&invalid_records)?;
         }
 
         if events.is_empty() {
@@ -847,7 +978,7 @@ where
             min_id = ?batch_min_id,
             max_id = ?batch_max_id,
             events = record_ids.len(),
-            invalid_records = invalid_ids.len(),
+            invalid_records = invalid_records.len(),
             "metrics upload batch sending"
         );
         let response = match upload_batch(&metrics_batch) {
@@ -860,7 +991,15 @@ where
                     error = %e,
                     "metrics upload batch failed"
                 );
-                mark_failed(&record_ids, &e)?;
+                if metrics_upload_error_is_permanent(&e) {
+                    let undeliverable_records = record_ids
+                        .iter()
+                        .map(|id| (*id, e.to_string()))
+                        .collect::<Vec<_>>();
+                    mark_undeliverable(&undeliverable_records)?;
+                } else {
+                    mark_failed(&record_ids, &e)?;
+                }
                 return Err(e);
             }
         };
@@ -1579,6 +1718,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unreadable_durable_queue_is_never_reported_as_empty() {
+        assert_eq!(pending_count_or_unknown("test", Ok(0)), 0);
+        assert_eq!(
+            pending_count_or_unknown("test", Err(GitAiError::Generic("locked".to_string()))),
+            1
+        );
+    }
+
     fn now_ts() -> u32 {
         unix_now().min(u32::MAX as u64) as u32
     }
@@ -1590,6 +1738,37 @@ mod tests {
             level: "info".to_string(),
             context: None,
         }
+    }
+
+    fn test_metric_envelope() -> TelemetryEnvelope {
+        TelemetryEnvelope::Metrics {
+            events: vec![MetricEvent {
+                timestamp: now_ts(),
+                event_id: 1,
+                values: Default::default(),
+                attrs: Default::default(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_telemetry_does_not_ack_a_failed_metric_transaction() {
+        let handle = DaemonTelemetryWorkerHandle::new_noop();
+
+        let error = handle
+            .submit_telemetry_with_persist(vec![test_metric_envelope()], |_| {
+                Err(GitAiError::Generic(
+                    "simulated metrics transaction failure".to_string(),
+                ))
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated metrics transaction failure")
+        );
     }
 
     #[tokio::test]
@@ -1687,7 +1866,7 @@ mod tests {
                 invalid_records: 0,
             }
         );
-        assert_eq!(*uploaded.borrow(), vec![vec![ts2], vec![ts1]]);
+        assert_eq!(*uploaded.borrow(), vec![vec![ts1], vec![ts2]]);
         assert_eq!(db.borrow().count().unwrap(), 0);
         assert_eq!(
             db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
@@ -1696,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_pending_metric_records_marks_invalid_rows_delivered() {
+    fn flush_pending_metric_records_marks_invalid_local_rows_undeliverable() {
         let (metrics_db, _metrics_db_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
         let db = Rc::new(RefCell::new(metrics_db));
         let ts = now_ts();
@@ -1752,10 +1931,18 @@ mod tests {
             }
         );
         assert_eq!(*uploaded.borrow(), vec![ts]);
-        assert_eq!(db.borrow().count().unwrap(), 0);
+        assert_eq!(db.borrow().count().unwrap(), 1);
         assert_eq!(
             db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
             1
+        );
+        let status = db.borrow().status().unwrap();
+        assert_eq!(status.stopped_after_errors, 1);
+        assert!(
+            status
+                .latest_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("invalid local metric JSON:"))
         );
     }
 
@@ -1822,7 +2009,7 @@ mod tests {
                 invalid_records: 0,
             }
         );
-        assert_eq!(*uploaded.borrow(), vec![ts3, ts2, ts1]);
+        assert_eq!(*uploaded.borrow(), vec![ts1, ts2, ts3]);
         assert_eq!(db.borrow().count().unwrap(), 1);
         assert_eq!(db.borrow().count_retryable().unwrap(), 0);
         assert!(
@@ -1966,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_pending_metric_records_keeps_rows_pending_after_upload_failure() {
+    fn request_level_outage_keeps_rows_in_long_retry_queue() {
         let (metrics_db, _metrics_db_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
         let db = Rc::new(RefCell::new(metrics_db));
         let ts = now_ts();
@@ -1984,9 +2171,8 @@ mod tests {
             {
                 let db = Rc::clone(&db);
                 move |ids, err| {
-                    let now = unix_now();
                     db.borrow_mut()
-                        .mark_records_failed(ids, &err.to_string(), now)
+                        .mark_records_deferred(ids, &err.to_string(), unix_now())
                 }
             },
             {
@@ -1996,7 +2182,12 @@ mod tests {
                         .mark_records_undeliverable(records, unix_now())
                 }
             },
-            |_batch| Err(GitAiError::Generic("upload failed".to_string())),
+            |_batch| {
+                Err(GitAiError::HttpStatusError {
+                    status: 503,
+                    message: "backend unavailable".to_string(),
+                })
+            },
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             10,
         );
@@ -2004,6 +2195,115 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(db.borrow().count().unwrap(), 1);
         assert_eq!(db.borrow().count_retryable().unwrap(), 0);
+        let status = db.borrow().status().unwrap();
+        assert_eq!(status.waiting_retry, 1);
+        assert_eq!(status.stopped_after_errors, 0);
+    }
+
+    #[test]
+    fn deterministic_http_rejection_stops_compact_token_snapshot_retries() {
+        let (metrics_db, _metrics_db_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
+        let db = Rc::new(RefCell::new(metrics_db));
+        db.borrow_mut()
+            .insert_events(&[format!(r#"{{"t":{},"e":9,"v":{{}},"a":{{}}}}"#, now_ts())])
+            .unwrap();
+
+        let result = flush_pending_metric_records_with(
+            {
+                let db = Rc::clone(&db);
+                move |limit| db.borrow_mut().dequeue_pending_batch(limit)
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids| db.borrow_mut().mark_records_delivered(ids, unix_now())
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids, err| {
+                    db.borrow_mut()
+                        .mark_records_deferred(ids, &err.to_string(), unix_now())
+                }
+            },
+            {
+                let db = Rc::clone(&db);
+                move |records| {
+                    db.borrow_mut()
+                        .mark_records_undeliverable(records, unix_now())
+                }
+            },
+            |_batch| {
+                Err(GitAiError::HttpStatusError {
+                    status: 422,
+                    message: "invalid metrics payload".to_string(),
+                })
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            10,
+        );
+
+        assert!(result.is_err());
+        let status = db.borrow().status().unwrap();
+        assert_eq!(status.not_delivered, 1);
+        assert_eq!(status.stopped_after_errors, 1);
+        assert_eq!(status.waiting_retry, 0);
+        assert!(
+            db.borrow_mut()
+                .dequeue_pending_batch(10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn payload_too_large_keeps_commit_record_for_later_recovery() {
+        let (metrics_db, _metrics_db_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
+        let db = Rc::new(RefCell::new(metrics_db));
+        let commit_ts = now_ts();
+        db.borrow_mut()
+            .insert_events(&[event_json(commit_ts)])
+            .unwrap();
+
+        let result = flush_pending_metric_records_with(
+            {
+                let db = Rc::clone(&db);
+                move |limit| db.borrow_mut().dequeue_pending_batch(limit)
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids| db.borrow_mut().mark_records_delivered(ids, unix_now())
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids, err| {
+                    db.borrow_mut()
+                        .mark_records_deferred(ids, &err.to_string(), unix_now())
+                }
+            },
+            {
+                let db = Rc::clone(&db);
+                move |records| {
+                    db.borrow_mut()
+                        .mark_records_undeliverable(records, unix_now())
+                }
+            },
+            |_batch| {
+                Err(GitAiError::HttpStatusError {
+                    status: 413,
+                    message: "payload too large".to_string(),
+                })
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            10,
+        );
+
+        assert!(result.is_err());
+        let status = db.borrow().status().unwrap();
+        assert_eq!(status.not_delivered, 1);
+        assert_eq!(status.waiting_retry, 1);
+        assert_eq!(status.stopped_after_errors, 0);
+        let history = db.borrow().get_metric_history(0, None, &[1]).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].ts, commit_ts);
     }
 
     #[test]

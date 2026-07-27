@@ -72,4 +72,15 @@ chmod +x "$HOME/.git-ai/bin/git-ai"
 echo "Running install hooks..."
 ~/.git-ai/bin/git-ai install
 
+# `git-ai install` restarts the daemon internally so it picks up the newly
+# installed binary. Make that otherwise-silent step explicit and fail the dev
+# install if the fresh daemon is not reachable.
+echo "Verifying background service..."
+if ! ~/.git-ai/bin/git-ai bg status >/dev/null; then
+    echo "Error: git-ai background service did not become ready after install." >&2
+    echo "Try: ~/.git-ai/bin/git-ai bg restart" >&2
+    exit 1
+fi
+echo "Background service restarted and ready."
+
 echo "Done!"

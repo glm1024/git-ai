@@ -2,7 +2,9 @@ use url::Url;
 
 /// Normalize repo URL to canonical HTTPS format
 /// Accepts: HTTPS, HTTP, SSH (scp-like user@host:path or ssh://), git:// URLs
-/// Returns: Canonical HTTPS URL without credentials, .git suffix, or trailing slash
+/// Returns: Canonical HTTPS URL without credentials, default ports, `.git`
+/// suffix, or trailing slash. Non-default ports are part of repository
+/// identity and are preserved (for example Gerrit's SSH port 29418).
 pub fn normalize_repo_url(url_str: &str) -> Result<String, String> {
     let url_str = url_str.trim();
 
@@ -14,8 +16,14 @@ pub fn normalize_repo_url(url_str: &str) -> Result<String, String> {
         return normalize_ssh_url(host, path);
     }
 
-    // Parse as URL
-    let url = Url::parse(url_str).map_err(|e| format!("Invalid URL: {}", e))?;
+    // Older clients and server-facing records may already use the canonical
+    // scheme-less `host[:port]/path` form. Treat it as HTTPS input.
+    let parse_input = if url_str.contains("://") {
+        url_str.to_string()
+    } else {
+        format!("https://{url_str}")
+    };
+    let url = Url::parse(&parse_input).map_err(|e| format!("Invalid URL: {}", e))?;
 
     // Validate scheme
     let scheme = url.scheme();
@@ -25,12 +33,16 @@ pub fn normalize_repo_url(url_str: &str) -> Result<String, String> {
 
     // Extract host
     let host = url.host_str().ok_or("URL must have a host")?;
+    let host = format_url_host(host);
+    let authority = match url.port() {
+        Some(port) if !is_default_port(scheme, port) => format!("{host}:{port}"),
+        _ => host,
+    };
 
-    // Normalize path: remove .git suffix and trailing slash
-    let path = url.path().trim_end_matches('/').trim_end_matches(".git");
+    let path = normalize_repo_path(url.path());
 
     // Build canonical HTTPS URL
-    let canonical = format!("https://{}{}", host, path);
+    let canonical = format!("https://{authority}/{path}");
 
     // Validate the normalized URL
     validate_normalized_url(&canonical)?;
@@ -65,10 +77,8 @@ fn normalize_ssh_url(host: &str, path: &str) -> Result<String, String> {
     }
 
     // Normalize path
-    let path = path
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
+    let host = format_url_host(host);
+    let path = normalize_repo_path(path);
 
     let canonical = format!("https://{}/{}", host, path);
 
@@ -76,6 +86,42 @@ fn normalize_ssh_url(host: &str, path: &str) -> Result<String, String> {
     validate_normalized_url(&canonical)?;
 
     Ok(canonical)
+}
+
+fn is_default_port(scheme: &str, port: u16) -> bool {
+    matches!(
+        (scheme, port),
+        ("https", 443) | ("http", 80) | ("ssh", 22) | ("git", 9418)
+    )
+}
+
+fn format_url_host(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    }
+}
+
+fn strip_git_suffix(mut path: &str) -> &str {
+    while path
+        .len()
+        .checked_sub(4)
+        .and_then(|start| path.get(start..))
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".git"))
+    {
+        path = &path[..path.len() - 4];
+    }
+    path
+}
+
+fn normalize_repo_path(path: &str) -> String {
+    let path = path.trim_matches('/');
+    let path = strip_git_suffix(path);
+    // Gerrit commonly exposes the authenticated HTTP clone route below /a/.
+    // It is a transport marker, not part of repository identity.
+    path.strip_prefix("a/").unwrap_or(path).to_string()
 }
 
 /// Resolve a normalized repo URL from an already-opened Repository.
@@ -121,6 +167,10 @@ mod tests {
         assert_eq!(
             normalize_repo_url("https://gitlab.com/group/subgroup/repo.git/").unwrap(),
             "https://gitlab.com/group/subgroup/repo"
+        );
+        assert_eq!(
+            normalize_repo_url("github.com/user/repo.git").unwrap(),
+            "https://github.com/user/repo"
         );
     }
 
@@ -223,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_normalize_repo_url_with_port() {
-        // HTTPS with custom port
+        // Protocol-default ports are omitted.
         assert_eq!(
             normalize_repo_url("https://github.com:443/user/repo").unwrap(),
             "https://github.com/user/repo"
@@ -233,6 +283,28 @@ mod tests {
         assert_eq!(
             normalize_repo_url("ssh://git@github.com:22/user/repo.git").unwrap(),
             "https://github.com/user/repo"
+        );
+
+        // Non-default ports are repository identity, notably Gerrit SSH.
+        assert_eq!(
+            normalize_repo_url("ssh://git@review.example.com:29418/a/team/repo.git").unwrap(),
+            "https://review.example.com:29418/team/repo"
+        );
+        assert_eq!(
+            normalize_repo_url("https://review.example.com:8443/a/team/repo.git").unwrap(),
+            "https://review.example.com:8443/team/repo"
+        );
+        assert_ne!(
+            normalize_repo_url("https://review.example.com:8443/a/team/repo.git").unwrap(),
+            normalize_repo_url("https://review.example.com:9443/a/team/repo.git").unwrap()
+        );
+        assert_eq!(
+            normalize_repo_url("git@github.com:Org/Repo.git").unwrap(),
+            normalize_repo_url("https://github.com/Org/Repo").unwrap()
+        );
+        assert_eq!(
+            normalize_repo_url("ssh://git@review.example.com:29418/a/team/repo.git").unwrap(),
+            normalize_repo_url("https://review.example.com:29418/team/repo").unwrap()
         );
     }
 
@@ -272,6 +344,11 @@ mod tests {
         assert_eq!(
             normalize_repo_url("https://gitlab.com/group/subgroup/project.git").unwrap(),
             "https://gitlab.com/group/subgroup/project"
+        );
+
+        assert_eq!(
+            normalize_repo_url("HTTPS://GitHub.COM/Org/Repo.GIT").unwrap(),
+            "https://github.com/Org/Repo"
         );
     }
 

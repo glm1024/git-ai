@@ -3,6 +3,10 @@
 use std::io::BufRead;
 use std::time::Duration;
 
+/// Internal-only marker attached by a transcript reader to seed cumulative
+/// token watermarks without producing a usage delta.
+pub(crate) const TOKEN_BASELINE_ONLY_FIELD: &str = "_git_ai_token_baseline_only";
+
 /// Result of reading a single line from a JSONL reader.
 pub enum JsonlLineState {
     /// End of file reached.

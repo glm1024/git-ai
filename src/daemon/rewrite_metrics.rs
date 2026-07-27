@@ -8,46 +8,59 @@ use crate::authorship::rewrite::{DiffTreeResult, RewriteMetricCommit};
 use crate::config::Config;
 use crate::error::GitAiError;
 use crate::git::repository::Repository;
+use crate::metrics::types::SparseArray;
 use crate::metrics::{
     EventAttributes, LifecycleTransitionValues, MetricEvent, PosEncoded, RewriteCommittedValues,
 };
 
 const MAX_LIFECYCLE_COMMITS_PER_CHUNK: usize = 512;
+pub(crate) const MAX_LIFECYCLE_CHUNKS: usize = 64;
+pub(crate) const MAX_LIFECYCLE_UNIQUE_COMMITS: usize = 32_768;
+pub(crate) const MAX_LIFECYCLE_CHUNK_EVENT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_LIFECYCLE_BUNDLE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
-pub(crate) fn spawn_rewrite_commit_metrics(
+pub(crate) async fn persist_rewrite_commit_metrics(
     repo: &Repository,
     metric_commits: Vec<RewriteMetricCommit>,
-) {
+) -> Result<(), GitAiError> {
     if !crate::authorship::rewrite::rewrite_metrics_enabled() {
-        return;
+        return Ok(());
     }
     if metric_commits.is_empty() {
-        return;
+        return Ok(());
     }
 
     let repo = repo.clone();
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                build_rewrite_metric_events(&repo, &metric_commits)
-            })
-            .await;
-            match result {
-                Ok(events) => submit_events(events),
-                Err(err) => tracing::warn!(%err, "rewrite metrics worker panicked"),
-            }
-        });
-    } else {
-        std::thread::spawn(move || {
-            submit_events(build_rewrite_metric_events(&repo, &metric_commits));
-        });
-    }
+    build_and_persist_events(
+        move || build_rewrite_metric_events(&repo, &metric_commits),
+        |events| crate::daemon::telemetry_worker::persist_metrics_to_db_blocking(&events),
+    )
+    .await
 }
 
-fn submit_events(events: Vec<MetricEvent>) {
-    if !events.is_empty() {
-        crate::observability::log_metrics(events);
+async fn build_and_persist_events<Build, Persist>(
+    build: Build,
+    persist: Persist,
+) -> Result<(), GitAiError>
+where
+    Build: FnOnce() -> Result<Vec<MetricEvent>, GitAiError> + Send + 'static,
+    Persist: FnOnce(Vec<MetricEvent>) -> Result<(), GitAiError> + Send + 'static,
+{
+    let events = tokio::task::spawn_blocking(build).await.map_err(|error| {
+        GitAiError::Generic(format!(
+            "rewrite metrics builder failed before persistence: {error}"
+        ))
+    })??;
+    if events.is_empty() {
+        return Ok(());
     }
+    tokio::task::spawn_blocking(move || persist(events))
+        .await
+        .map_err(|error| {
+            GitAiError::Generic(format!(
+                "rewrite metrics persistence worker failed before acknowledgement: {error}"
+            ))
+        })?
 }
 
 pub(crate) fn dedupe_metric_commits(
@@ -98,7 +111,7 @@ fn merge_metric_commit_context(target: &mut RewriteMetricCommit, source: Rewrite
 fn build_rewrite_metric_events(
     repo: &Repository,
     metric_commits: &[RewriteMetricCommit],
-) -> Vec<MetricEvent> {
+) -> Result<Vec<MetricEvent>, GitAiError> {
     let mut metric_commits = dedupe_metric_commits(metric_commits.to_vec());
     hydrate_missing_parent_shas(repo, &mut metric_commits);
     hydrate_missing_parent_diffs(repo, &mut metric_commits);
@@ -109,7 +122,10 @@ fn build_rewrite_metric_events(
         // Persist the strong replacement fact before the derived replacement
         // commit. The metrics DB preserves insertion order and retries pending
         // rows in that order.
-        events.extend(build_mapped_lifecycle_events(metric_commit, &batch_context));
+        events.extend(build_mapped_lifecycle_events(
+            metric_commit,
+            &batch_context,
+        )?);
         match build_rewrite_committed_metric_event(repo, metric_commit, &batch_context) {
             Ok(Some(event)) => events.push(event),
             Ok(None) => {}
@@ -123,53 +139,73 @@ fn build_rewrite_metric_events(
             }
         }
     }
-    events
+    Ok(events)
 }
 
-/// Emit a ref transition using only facts already captured by trace2/ref
-/// analysis. This function performs no repository reads on the command
-/// ingestion path; config/repository metadata work happens on a detached
-/// worker before the event is placed in the persistent metrics queue.
-pub(crate) fn spawn_ref_lifecycle_transition_metrics(
+/// Durably capture a named-branch ref transition using facts already observed
+/// by trace2/ref analysis. The caller awaits the SQLite intent insert before
+/// acknowledging the command side effect; repository enumeration and outbox
+/// construction are retryable work and may finish immediately or later.
+pub(crate) async fn persist_ref_lifecycle_transition_metrics(
     repo: &Repository,
     operation_kind: impl Into<String>,
     old_tip: impl Into<String>,
     new_tip: impl Into<String>,
     branch: Option<String>,
     semantics: impl Into<String>,
-) {
+) -> Result<(), GitAiError> {
     if !crate::authorship::rewrite::rewrite_metrics_enabled() {
-        return;
+        return Ok(());
     }
-    let repo = repo.clone();
     let operation_kind = operation_kind.into();
     let old_tip = old_tip.into();
     let new_tip = new_tip.into();
     let semantics = semantics.into();
-    std::thread::spawn(move || {
-        match build_ref_lifecycle_transition_events(
-            &repo,
+    let branch = resolve_lifecycle_branch(repo, branch);
+    let Some(branch) = branch else {
+        // Event 8 is intentionally scoped to one named branch. A detached HEAD
+        // transition does not move a branch pointer, and the backend rejects an
+        // unscoped lifecycle bundle. Treat it as out of scope instead of
+        // creating a permanently retrying/dead-lettered metric.
+        tracing::debug!(
+            operation_kind,
+            old_tip,
+            new_tip,
+            "skipping lifecycle ref transition without a named branch"
+        );
+        return Ok(());
+    };
+    let context = RewriteMetricBatchContext::new(repo);
+    let attrs = lifecycle_attrs(&new_tip, Some(&branch), &context).to_sparse();
+    let spec =
+        crate::metrics::deferred_lifecycle_jobs::DeferredLifecycleMetricJobSpec::from_transition(
+            repo,
             &operation_kind,
             &old_tip,
             &new_tip,
-            branch,
+            Some(branch),
             &semantics,
-        ) {
-            Ok(events) => submit_events(events),
-            Err(error) => tracing::warn!(
-                %error,
-                operation_kind,
-                old_tip,
-                new_tip,
-                "skipping lifecycle transition metric because commit enumeration failed"
-            ),
-        }
-    });
+            &attrs,
+        )?;
+
+    // The immutable old/new ref intent enters SQLite before rev-list or event
+    // construction. Immediate processing is only a latency optimization; a
+    // computation/outbox failure leaves the job pending for periodic retry.
+    tokio::task::spawn_blocking(move || {
+        crate::metrics::deferred_lifecycle_jobs::enqueue_and_try_process(&spec)
+    })
+    .await
+    .map_err(|error| {
+        GitAiError::Generic(format!(
+            "deferred lifecycle enqueue worker failed before durable acknowledgement: {error}"
+        ))
+    })?
 }
 
 /// Build a ref transition only when both exclusive commit sets were observed.
 /// A tip-only event is not a safe fallback because downstream consumers may
 /// interpret its old/new tips as authoritative lifecycle replacements.
+#[allow(dead_code)]
 fn build_ref_lifecycle_transition_events(
     repo: &Repository,
     operation_kind: &str,
@@ -178,6 +214,39 @@ fn build_ref_lifecycle_transition_events(
     branch: Option<String>,
     semantics: &str,
 ) -> Result<Vec<MetricEvent>, GitAiError> {
+    let context = RewriteMetricBatchContext::new(repo);
+    let branch = resolve_lifecycle_branch(repo, branch);
+    let attrs = lifecycle_attrs(new_tip, branch.as_deref(), &context).to_sparse();
+    let event_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(u64::from(u32::MAX)) as u32;
+    build_ref_lifecycle_transition_events_from_snapshot(
+        repo,
+        operation_kind,
+        old_tip,
+        new_tip,
+        branch.as_deref(),
+        semantics,
+        attrs,
+        event_ts,
+    )
+}
+
+/// Rebuild a persisted ref-transition intent without consulting mutable
+/// configuration or metadata. Only repository reachability is recomputed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_ref_lifecycle_transition_events_from_snapshot(
+    repo: &Repository,
+    operation_kind: &str,
+    old_tip: &str,
+    new_tip: &str,
+    branch: Option<&str>,
+    semantics: &str,
+    attrs: SparseArray,
+    event_ts: u32,
+) -> Result<Vec<MetricEvent>, GitAiError> {
     // One detached plumbing call returns both sides of the ref move. This is
     // outside trace2 ingestion and avoids per-commit subprocesses while still
     // sending the complete reset/rebase/drop set.
@@ -185,22 +254,27 @@ fn build_ref_lifecycle_transition_events(
     if invalidated.is_empty() && replacements.is_empty() {
         return Ok(Vec::new());
     }
-    let context = RewriteMetricBatchContext::new(repo);
-    let branch = resolve_lifecycle_branch(repo, branch);
-    Ok(build_lifecycle_events(
+    build_lifecycle_events_from_snapshot(
         operation_kind,
         old_tip,
         new_tip,
-        branch.as_deref(),
+        branch,
         &invalidated,
         &replacements,
         semantics,
-        &context,
-    ))
+        attrs,
+        event_ts,
+    )
 }
 
 fn resolve_lifecycle_branch(repo: &Repository, branch: Option<String>) -> Option<String> {
-    branch.or_else(|| repo.head().ok().and_then(|head| head.shorthand().ok()))
+    branch
+        .or_else(|| repo.head().ok().and_then(|head| head.shorthand().ok()))
+        .and_then(|branch| {
+            let branch = branch.trim();
+            let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            (!branch.is_empty() && !branch.eq_ignore_ascii_case("HEAD")).then(|| branch.to_string())
+        })
 }
 
 fn exclusive_commits_for_transition(
@@ -236,7 +310,7 @@ fn exclusive_commits_for_transition(
 fn build_mapped_lifecycle_events(
     commit: &RewriteMetricCommit,
     context: &RewriteMetricBatchContext,
-) -> Vec<MetricEvent> {
+) -> Result<Vec<MetricEvent>, GitAiError> {
     let (invalidated, semantics) = match commit.operation {
         crate::authorship::rewrite::RewriteMetricOperation::Rebase
         | crate::authorship::rewrite::RewriteMetricOperation::Amend
@@ -249,9 +323,9 @@ fn build_mapped_lifecycle_events(
         crate::authorship::rewrite::RewriteMetricOperation::SquashMerge
         | crate::authorship::rewrite::RewriteMetricOperation::CherryPick
         | crate::authorship::rewrite::RewriteMetricOperation::CherryPickNoCommit
-        | crate::authorship::rewrite::RewriteMetricOperation::Revert => return Vec::new(),
+        | crate::authorship::rewrite::RewriteMetricOperation::Revert => return Ok(Vec::new()),
     };
-    build_lifecycle_events(
+    build_lifecycle_events_checked(
         commit.operation.as_str(),
         invalidated.first().map(String::as_str).unwrap_or(""),
         &commit.new_sha,
@@ -264,7 +338,7 @@ fn build_mapped_lifecycle_events(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_lifecycle_events(
+fn build_lifecycle_events_checked(
     operation_kind: &str,
     old_tip: &str,
     new_tip: &str,
@@ -273,19 +347,59 @@ fn build_lifecycle_events(
     replacements: &[String],
     semantics: &str,
     context: &RewriteMetricBatchContext,
-) -> Vec<MetricEvent> {
+) -> Result<Vec<MetricEvent>, GitAiError> {
+    let attrs = lifecycle_attrs(new_tip, branch, context).to_sparse();
+    let event_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(u64::from(u32::MAX)) as u32;
+    build_lifecycle_events_from_snapshot(
+        operation_kind,
+        old_tip,
+        new_tip,
+        branch,
+        invalidated,
+        replacements,
+        semantics,
+        attrs,
+        event_ts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_lifecycle_events_from_snapshot(
+    operation_kind: &str,
+    old_tip: &str,
+    new_tip: &str,
+    branch: Option<&str>,
+    invalidated: &[String],
+    replacements: &[String],
+    semantics: &str,
+    attrs: SparseArray,
+    event_ts: u32,
+) -> Result<Vec<MetricEvent>, GitAiError> {
+    let unique_commit_count = invalidated
+        .len()
+        .checked_add(replacements.len())
+        .ok_or_else(|| GitAiError::Generic("lifecycle commit count overflowed".to_string()))?;
+    if unique_commit_count > MAX_LIFECYCLE_UNIQUE_COMMITS {
+        return Err(GitAiError::Generic(format!(
+            "lifecycle bundle has {unique_commit_count} commits; limit is {MAX_LIFECYCLE_UNIQUE_COMMITS}"
+        )));
+    }
     let operation_id = lifecycle_operation_id(operation_kind, old_tip, new_tip, branch);
     if semantics == "replacement" && !invalidated.is_empty() && !replacements.is_empty() {
         return build_replacement_lifecycle_events(
             operation_kind,
             old_tip,
             new_tip,
-            branch,
             invalidated,
             replacements,
             semantics,
-            context,
             &operation_id,
+            &attrs,
+            event_ts,
         );
     }
     let mut tagged = Vec::with_capacity(invalidated.len() + replacements.len());
@@ -295,7 +409,12 @@ fn build_lifecycle_events(
         tagged.push((true, String::new()));
     }
     let chunk_count = tagged.len().div_ceil(MAX_LIFECYCLE_COMMITS_PER_CHUNK) as u32;
-    tagged
+    if chunk_count as usize > MAX_LIFECYCLE_CHUNKS {
+        return Err(GitAiError::Generic(format!(
+            "lifecycle bundle has {chunk_count} chunks; limit is {MAX_LIFECYCLE_CHUNKS}"
+        )));
+    }
+    let events = tagged
         .chunks(MAX_LIFECYCLE_COMMITS_PER_CHUNK)
         .enumerate()
         .map(|(index, chunk)| {
@@ -319,10 +438,11 @@ fn build_lifecycle_events(
                 .chunk_index(index as u32)
                 .chunk_count(chunk_count)
                 .semantics(semantics);
-            let attrs = lifecycle_attrs(new_tip, branch, context);
-            MetricEvent::from_values(values, attrs.to_sparse())
+            MetricEvent::from_values_with_timestamp(values, attrs.clone(), Some(event_ts))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    validate_lifecycle_event_bundle_size(&events)?;
+    Ok(events)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -330,20 +450,25 @@ fn build_replacement_lifecycle_events(
     operation_kind: &str,
     old_tip: &str,
     new_tip: &str,
-    branch: Option<&str>,
     invalidated: &[String],
     replacements: &[String],
     semantics: &str,
-    context: &RewriteMetricBatchContext,
     operation_id: &str,
-) -> Vec<MetricEvent> {
+    attrs: &SparseArray,
+    event_ts: u32,
+) -> Result<Vec<MetricEvent>, GitAiError> {
     let old_chunk_count = invalidated.len().div_ceil(MAX_LIFECYCLE_COMMITS_PER_CHUNK);
     let new_chunk_count = replacements.len().div_ceil(MAX_LIFECYCLE_COMMITS_PER_CHUNK);
     let chunk_count = old_chunk_count.max(new_chunk_count);
+    if chunk_count > MAX_LIFECYCLE_CHUNKS {
+        return Err(GitAiError::Generic(format!(
+            "lifecycle replacement bundle has {chunk_count} chunks; limit is {MAX_LIFECYCLE_CHUNKS}"
+        )));
+    }
     let old_anchor = invalidated[0].clone();
     let new_anchor = replacements[0].clone();
 
-    (0..chunk_count)
+    let events = (0..chunk_count)
         .map(|index| {
             let old_start = index * MAX_LIFECYCLE_COMMITS_PER_CHUNK;
             let new_start = index * MAX_LIFECYCLE_COMMITS_PER_CHUNK;
@@ -377,12 +502,32 @@ fn build_replacement_lifecycle_events(
                 .chunk_index(index as u32)
                 .chunk_count(chunk_count as u32)
                 .semantics(semantics);
-            MetricEvent::from_values(
-                values,
-                lifecycle_attrs(new_tip, branch, context).to_sparse(),
-            )
+            MetricEvent::from_values_with_timestamp(values, attrs.clone(), Some(event_ts))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    validate_lifecycle_event_bundle_size(&events)?;
+    Ok(events)
+}
+
+fn validate_lifecycle_event_bundle_size(events: &[MetricEvent]) -> Result<(), GitAiError> {
+    let mut total = 0usize;
+    for event in events {
+        let event_bytes = serde_json::to_vec(event)?.len();
+        if event_bytes > MAX_LIFECYCLE_CHUNK_EVENT_BYTES {
+            return Err(GitAiError::Generic(format!(
+                "lifecycle event chunk is {event_bytes} bytes; limit is {MAX_LIFECYCLE_CHUNK_EVENT_BYTES}"
+            )));
+        }
+        total = total.checked_add(event_bytes).ok_or_else(|| {
+            GitAiError::Generic("lifecycle event bundle byte size overflowed".to_string())
+        })?;
+        if total > MAX_LIFECYCLE_BUNDLE_EVENT_BYTES {
+            return Err(GitAiError::Generic(format!(
+                "lifecycle event bundle is {total} bytes; limit is {MAX_LIFECYCLE_BUNDLE_EVENT_BYTES}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn lifecycle_operation_id(
@@ -685,8 +830,12 @@ fn rewrite_metric_attrs(
     let base_commit_sha = metric_commit.parent_sha.as_deref().unwrap_or("initial");
     let mut attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
         .commit_sha(metric_commit.new_sha.clone())
-        .base_commit_sha(base_commit_sha)
         .author(&batch_context.author);
+    attrs = if base_commit_sha == "initial" {
+        attrs.base_commit_sha_null()
+    } else {
+        attrs.base_commit_sha(base_commit_sha)
+    };
 
     attrs = apply_rewrite_metric_branch(attrs, metric_commit);
 
@@ -736,6 +885,8 @@ mod tests {
     use crate::metrics::EventValues;
     use crate::metrics::events::rewrite_committed_pos;
     use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn metric_commit(
         new_sha: &str,
@@ -775,6 +926,63 @@ mod tests {
                 vec![LineRange::Single(line)],
             ));
         log.serialize_to_string().expect("serialize note")
+    }
+
+    #[tokio::test]
+    async fn durable_metric_task_waits_for_builder_and_persistence() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let (persisted_tx, persisted_rx) = mpsc::channel();
+        let mut task = tokio::spawn(build_and_persist_events(
+            move || {
+                release_rx.recv().expect("release builder");
+                Ok(vec![MetricEvent {
+                    timestamp: 1,
+                    event_id: 8,
+                    values: Default::default(),
+                    attrs: Default::default(),
+                }])
+            },
+            move |events| {
+                assert_eq!(events.len(), 1);
+                persisted_tx.send(()).expect("record persistence");
+                Ok(())
+            },
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut task)
+                .await
+                .is_err(),
+            "the tracked task must not acknowledge while its builder is blocked"
+        );
+        assert!(persisted_rx.try_recv().is_err());
+
+        release_tx.send(()).expect("release builder");
+        task.await
+            .expect("tracked task join")
+            .expect("durable task result");
+        persisted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("persistence completed before acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn durable_metric_task_propagates_persistence_failure() {
+        let error = build_and_persist_events(
+            || {
+                Ok(vec![MetricEvent {
+                    timestamp: 1,
+                    event_id: 8,
+                    values: Default::default(),
+                    attrs: Default::default(),
+                }])
+            },
+            |_| Err(GitAiError::Generic("simulated sqlite failure".to_string())),
+        )
+        .await
+        .expect_err("persistence failure must prevent acknowledgement");
+
+        assert!(error.to_string().contains("simulated sqlite failure"));
     }
 
     #[test]
@@ -946,7 +1154,8 @@ mod tests {
         )
         .with_authorship_note(note);
 
-        let events = build_rewrite_metric_events(tmp.gitai_repo(), &[commit]);
+        let events =
+            build_rewrite_metric_events(tmp.gitai_repo(), &[commit]).expect("rewrite events");
 
         assert_eq!(events.len(), 2);
         assert_eq!(
@@ -995,14 +1204,15 @@ mod tests {
         let commit = metric_commit(&root_sha, &["old"], RewriteMetricOperation::Amend)
             .with_authorship_note(note);
 
-        let events = build_rewrite_metric_events(tmp.gitai_repo(), &[commit]);
+        let events =
+            build_rewrite_metric_events(tmp.gitai_repo(), &[commit]).expect("rewrite events");
 
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[1]
                 .attrs
                 .get(&crate::metrics::attrs::attr_pos::BASE_COMMIT_SHA.to_string()),
-            Some(&serde_json::json!("initial"))
+            Some(&serde_json::Value::Null)
         );
         assert_eq!(
             events[1]
@@ -1030,7 +1240,7 @@ mod tests {
         let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
         let context = RewriteMetricBatchContext::new(tmp.gitai_repo());
         let invalidated = (0..513).map(|i| format!("old-{i}")).collect::<Vec<_>>();
-        let events = build_lifecycle_events(
+        let events = build_lifecycle_events_checked(
             "rebase",
             "old-tip",
             "new-tip",
@@ -1039,7 +1249,8 @@ mod tests {
             &[],
             "ref_transition",
             &context,
-        );
+        )
+        .expect("bounded lifecycle events");
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| event.event_id == 8));
         assert_eq!(
@@ -1052,7 +1263,11 @@ mod tests {
         );
 
         let cherry = metric_commit("copy", &["source"], RewriteMetricOperation::CherryPick);
-        assert!(build_mapped_lifecycle_events(&cherry, &context).is_empty());
+        assert!(
+            build_mapped_lifecycle_events(&cherry, &context)
+                .expect("copy-like lifecycle")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1061,7 +1276,7 @@ mod tests {
         let context = RewriteMetricBatchContext::new(tmp.gitai_repo());
         let invalidated = (0..513).map(|i| format!("old-{i}")).collect::<Vec<_>>();
         let replacements = vec!["new-anchor".to_string()];
-        let events = build_lifecycle_events(
+        let events = build_lifecycle_events_checked(
             "rebase",
             "old-tip",
             "new-tip",
@@ -1070,7 +1285,8 @@ mod tests {
             &replacements,
             "replacement",
             &context,
-        );
+        )
+        .expect("bounded replacement lifecycle events");
 
         assert_eq!(events.len(), 2);
         for event in &events {
@@ -1093,6 +1309,64 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_bundle_uses_one_timestamp_and_rejects_aggregate_overflow() {
+        let invalidated = (0..513).map(|i| format!("old-{i}")).collect::<Vec<_>>();
+        let events = build_lifecycle_events_from_snapshot(
+            "reset",
+            "old-tip",
+            "new-tip",
+            Some("main"),
+            &invalidated,
+            &[],
+            "ref_transition",
+            SparseArray::new(),
+            1_700_000_123,
+        )
+        .expect("bounded lifecycle bundle");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.timestamp == 1_700_000_123));
+
+        let oversized = (0..=MAX_LIFECYCLE_UNIQUE_COMMITS)
+            .map(|i| format!("old-{i}"))
+            .collect::<Vec<_>>();
+        let error = build_lifecycle_events_from_snapshot(
+            "reset",
+            "old-tip",
+            "new-tip",
+            Some("main"),
+            &oversized,
+            &[],
+            "ref_transition",
+            SparseArray::new(),
+            1_700_000_123,
+        )
+        .expect_err("oversized lifecycle bundle must be rejected");
+        assert!(error.to_string().contains("limit is 32768"));
+    }
+
+    #[test]
+    fn lifecycle_bundle_rejects_cumulative_serialized_payload_overflow() {
+        let mut attrs = SparseArray::new();
+        attrs.insert(
+            "30".to_string(),
+            serde_json::Value::String("x".repeat(MAX_LIFECYCLE_BUNDLE_EVENT_BYTES)),
+        );
+        let error = build_lifecycle_events_from_snapshot(
+            "reset",
+            "old-tip",
+            "new-tip",
+            Some("main"),
+            &["old".to_string()],
+            &[],
+            "ref_transition",
+            attrs,
+            1_700_000_123,
+        )
+        .expect_err("oversized serialized lifecycle payload must be rejected");
+        assert!(error.to_string().contains("bytes"));
+    }
+
+    #[test]
     fn amend_rebase_and_reset_emit_strong_replacement_or_ref_semantics() {
         let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
         let context = RewriteMetricBatchContext::new(tmp.gitai_repo());
@@ -1102,7 +1376,8 @@ mod tests {
             RewriteMetricOperation::Rebase,
         ] {
             let commit = metric_commit("new", &["old"], operation);
-            let events = build_mapped_lifecycle_events(&commit, &context);
+            let events =
+                build_mapped_lifecycle_events(&commit, &context).expect("mapped lifecycle");
             assert_eq!(events.len(), 1);
             assert_eq!(
                 events[0].values
@@ -1118,7 +1393,7 @@ mod tests {
             );
         }
 
-        let reset = build_lifecycle_events(
+        let reset = build_lifecycle_events_checked(
             "reset",
             "old-tip",
             "new-tip",
@@ -1127,7 +1402,8 @@ mod tests {
             &[],
             "ref_transition",
             &context,
-        );
+        )
+        .expect("bounded reset lifecycle events");
         assert_eq!(reset.len(), 1);
         assert_eq!(
             reset[0].values[&crate::metrics::events::lifecycle_transition_pos::OLD_TIP.to_string()],
@@ -1137,6 +1413,21 @@ mod tests {
             reset[0].values[&crate::metrics::events::lifecycle_transition_pos::NEW_TIP.to_string()],
             serde_json::json!("new-tip")
         );
+    }
+
+    #[test]
+    fn mapped_lifecycle_limit_failure_is_not_silently_dropped() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        let context = RewriteMetricBatchContext::new(tmp.gitai_repo());
+        let originals = (0..=MAX_LIFECYCLE_UNIQUE_COMMITS)
+            .map(|index| format!("old-{index}"))
+            .collect::<Vec<_>>();
+        let commit =
+            RewriteMetricCommit::new("new".to_string(), originals, RewriteMetricOperation::Rebase);
+
+        let error = build_mapped_lifecycle_events(&commit, &context)
+            .expect_err("oversized strong lifecycle evidence must fail the tracked task");
+        assert!(error.to_string().contains("limit is 32768"));
     }
 
     #[test]
@@ -1222,5 +1513,24 @@ mod tests {
             resolve_lifecycle_branch(tmp.gitai_repo(), Some("captured".to_string())),
             Some("captured".to_string())
         );
+        assert_eq!(
+            resolve_lifecycle_branch(tmp.gitai_repo(), Some("refs/heads/captured".to_string())),
+            Some("captured".to_string())
+        );
+        assert_eq!(
+            resolve_lifecycle_branch(tmp.gitai_repo(), Some("HEAD".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn detached_head_is_not_fabricated_as_a_lifecycle_branch() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "a\n", false).expect("write");
+        let tip = tmp.commit_all("first").expect("commit");
+        tmp.git_command(&["checkout", "--detach", &tip])
+            .expect("detach HEAD");
+
+        assert_eq!(resolve_lifecycle_branch(tmp.gitai_repo(), None), None);
     }
 }

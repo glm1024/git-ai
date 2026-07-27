@@ -318,6 +318,21 @@ mod tests {
     }
 
     #[test]
+    fn test_opencode_plugin_only_tracks_call_after_pre_checkpoint_succeeds() {
+        let pre_checkpoint = OPENCODE_PLUGIN_CONTENT
+            .find("await runCheckpoint(hookInput)")
+            .expect("pre checkpoint call");
+        let track_pending_call = OPENCODE_PLUGIN_CONTENT
+            .find("pendingCalls.set(callID")
+            .expect("pending call insertion");
+
+        assert!(
+            pre_checkpoint < track_pending_call,
+            "a failed pre checkpoint must not leave a pending call that can emit a post-only checkpoint"
+        );
+    }
+
+    #[test]
     fn test_opencode_plugin_placeholder_substitution() {
         let binary_path = create_test_binary_path();
         let content = OpenCodeInstaller::generate_plugin_content(&binary_path);

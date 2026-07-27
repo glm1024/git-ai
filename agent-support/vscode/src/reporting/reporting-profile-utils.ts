@@ -159,6 +159,20 @@ export function resolveOrganizationOptionsUrl(rawValue: string): string {
   return url.toString();
 }
 
+export function organizationResultMatchesMetricsUrl(
+  rawMetricsApiBaseUrl: string,
+  organizationEndpoint: string | undefined,
+): boolean {
+  if (!organizationEndpoint) {
+    return false;
+  }
+  try {
+    return resolveOrganizationOptionsUrl(rawMetricsApiBaseUrl) === organizationEndpoint;
+  } catch {
+    return false;
+  }
+}
+
 export function normalizeOrganizationOptions(value: unknown): OrganizationOptions {
   if (!value || typeof value !== "object") {
     throw new Error("组织架构响应格式无效");

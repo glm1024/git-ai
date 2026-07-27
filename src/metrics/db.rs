@@ -1,21 +1,31 @@
 //! Metrics storage for local history and offline buffering.
 //!
-//! Every metric event is stored here. `delivered_ts IS NULL` means the row is
-//! still pending upload; delivered rows are retained as the local history.
-//! Server handles idempotency.
+//! Uploadable metrics are buffered here. Raw transcript events are compacted
+//! before persistence, and delivered token snapshots are deleted immediately;
+//! other delivered metrics remain available as local history. The server
+//! handles idempotency.
 
 use crate::error::GitAiError;
 use crate::metrics::attrs::attr_pos;
-use crate::metrics::events::{checkpoint_pos, otel_trace_pos, session_event_pos};
+use crate::metrics::events::{
+    SessionTokenUsageValues, checkpoint_pos, otel_trace_pos, session_event_pos,
+};
 use crate::metrics::pos_encoded::sparse_get_string;
-use crate::metrics::types::{MetricEvent, MetricEventId};
+use crate::metrics::session_compaction::{SessionObservation, compact_session_event};
+use crate::metrics::types::{MetricEvent, MetricEventId, SparseArray};
+use crate::utils::LockFile;
+use chrono::{Local, TimeZone};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Current schema version (must match MIGRATIONS.len())
-const SCHEMA_VERSION: usize = 5;
+const SCHEMA_VERSION: usize = 11;
 
 // This value is part of the metrics retry index schema. Changing it requires a
 // migration that rebuilds `metrics_retryable` with the same literal used by
@@ -25,13 +35,36 @@ const MAX_METRIC_UPLOAD_ATTEMPTS: u32 = 6;
 const METRIC_PROCESSING_LOCK_TIMEOUT_SECS: u64 = 10 * 60;
 pub(crate) const METADATA_BACKFILL_BATCH_SIZE: usize = 1000;
 const NS_PER_SECOND: u128 = 1_000_000_000;
+/// Leave one MiB for the request envelope below the server's 8 MiB limit.
+pub(crate) const MAX_METRICS_UPLOAD_BODY_BYTES: usize = 7 * 1024 * 1024;
+const LEGACY_CONTENT_COMPACTION_BATCH_SIZE: usize = 128;
+const SCHEMA_MIGRATION_LOCK_WAIT: Duration = Duration::from_secs(30);
+const SCHEMA_MIGRATION_LOCK_POLL: Duration = Duration::from_millis(50);
+/// Wrapper processes can fall back to the same SQLite file while the daemon is
+/// finishing a write. Wait through short cross-process writer contention rather
+/// than turning a durable telemetry handoff into a spurious failure.
+const METRICS_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-const RETRYABLE_METRIC_IDS_SQL: &str = "SELECT id FROM metrics \
+const LEGACY_CONTENT_INSERT_GUARD_SQL: &str = r#"
+    CREATE TRIGGER IF NOT EXISTS metrics_reject_legacy_content_insert
+    BEFORE INSERT ON metrics
+    FOR EACH ROW
+    WHEN COALESCE(
+        NEW.event_kind,
+        CASE WHEN json_valid(NEW.event_json)
+             THEN json_extract(NEW.event_json, '$.e') END
+    ) IN (5, 6)
+    BEGIN
+        SELECT RAISE(ABORT, 'raw session content events are disabled');
+    END;
+"#;
+
+const RETRYABLE_METRIC_IDS_SQL: &str = "SELECT id, length(CAST(event_json AS BLOB)) FROM metrics \
      WHERE delivered_ts IS NULL \
        AND processing_started_at IS NULL \
        AND next_retry_at <= ?1 \
        AND attempts < 6 \
-     ORDER BY next_retry_at ASC, id DESC \
+     ORDER BY id ASC \
      LIMIT ?2";
 
 /// Database migrations - each migration upgrades the schema by one version
@@ -89,10 +122,113 @@ const MIGRATIONS: &[&str] = &[
 
     DROP INDEX IF EXISTS metrics_pending_retry;
     "#,
+    // Migration 5 -> 6: Store content-free session activity, short-lived
+    // attribution recovery markers, and deduplicated token source watermarks.
+    r#"
+    CREATE TABLE IF NOT EXISTS session_activity (
+        session_id TEXT PRIMARY KEY NOT NULL,
+        first_ts INTEGER NOT NULL,
+        last_ts INTEGER NOT NULL,
+        tool TEXT NOT NULL,
+        model TEXT,
+        repo_url TEXT,
+        external_session_id TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS session_activity_last_ts
+        ON session_activity (last_ts, repo_url, tool);
+
+    CREATE TABLE IF NOT EXISTS session_recovery_events (
+        event_key TEXT PRIMARY KEY NOT NULL,
+        event_ts INTEGER NOT NULL,
+        session_id TEXT NOT NULL,
+        trace_id TEXT,
+        tool TEXT NOT NULL,
+        model TEXT,
+        external_session_id TEXT NOT NULL,
+        external_event_id TEXT,
+        external_parent_event_id TEXT,
+        external_tool_use_id TEXT,
+        repo_url TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS session_recovery_event_ts
+        ON session_recovery_events (event_ts, session_id);
+    CREATE INDEX IF NOT EXISTS session_recovery_tool_latest
+        ON session_recovery_events (tool, event_ts DESC);
+
+    CREATE TABLE IF NOT EXISTS session_token_sources (
+        source_key TEXT PRIMARY KEY NOT NULL,
+        session_id TEXT NOT NULL,
+        first_ts INTEGER NOT NULL,
+        last_ts INTEGER NOT NULL,
+        tool TEXT NOT NULL,
+        model TEXT,
+        provider TEXT,
+        repo_url TEXT,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cumulative_source INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS session_token_sources_history
+        ON session_token_sources (last_ts, repo_url, tool);
+
+    CREATE TABLE IF NOT EXISTS session_token_daily (
+        bucket_key TEXT PRIMARY KEY NOT NULL,
+        date_key TEXT NOT NULL,
+        timezone TEXT NOT NULL,
+        machine_id TEXT NOT NULL,
+        first_ts INTEGER NOT NULL,
+        last_ts INTEGER NOT NULL,
+        attrs_json TEXT NOT NULL,
+        provider TEXT,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        outbox_metric_id INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS session_token_daily_history
+        ON session_token_daily (last_ts);
+    "#,
+    // Migration 6 -> 7: prevent this and older binaries from writing new raw
+    // transcript rows while compact_legacy_content_events() drains existing
+    // content.
+    LEGACY_CONTENT_INSERT_GUARD_SQL,
+    // Migration 7 -> 8: retain the inherited Codex fork baseline separately
+    // from the cumulative source watermark so local usage can report only the
+    // child session's own contribution. The columns are added idempotently by
+    // add_token_baseline_columns() before this migration transaction.
+    "",
+    // Migration 8 -> 9: identify each cumulative Event9 bucket generation and
+    // retain exact supersession aliases until the corrected snapshot is ACKed.
+    // Columns are added idempotently by
+    // add_token_snapshot_identity_columns() before this transaction.
+    r#"
+    UPDATE session_token_daily
+       SET snapshot_instance_id = lower(hex(randomblob(16)))
+     WHERE snapshot_instance_id = '';
+    CREATE INDEX IF NOT EXISTS metrics_retryable_fair
+        ON metrics (id ASC)
+        WHERE delivered_ts IS NULL
+          AND processing_started_at IS NULL
+          AND attempts < 6;
+    "#,
+    // Migration 9 -> 10: durable, crash-safe work queue for complete
+    // post-commit Event 1 computation outside the latency-sensitive hook path.
+    crate::metrics::deferred_commit_jobs::DEFERRED_COMMIT_JOBS_SCHEMA_SQL,
+    // Migration 10 -> 11: persist immutable Event 8 ref transitions before
+    // rev-list/build work so a side-effect failure remains retryable.
+    crate::metrics::deferred_lifecycle_jobs::DEFERRED_LIFECYCLE_JOBS_SCHEMA_SQL,
 ];
 
 /// Global database singleton
-static METRICS_DB: OnceLock<Mutex<MetricsDatabase>> = OnceLock::new();
+static METRICS_DB: OnceLock<Result<Mutex<MetricsDatabase>, String>> = OnceLock::new();
 
 /// Record returned from database queries
 #[derive(Debug, Clone)]
@@ -110,6 +246,59 @@ pub struct MetricHistoryRecord {
     pub ts: u32,
     pub repo_url: Option<String>,
     pub event: MetricEvent,
+}
+
+/// One content-free session row used by `git-ai usage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactSessionRecord {
+    pub session_id: String,
+    pub first_ts: u32,
+    pub last_ts: u32,
+    pub tool: String,
+    pub model: Option<String>,
+    pub repo_url: Option<String>,
+}
+
+/// Deduplicated absolute token counters for one assistant message or one
+/// cumulative session source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactTokenRecord {
+    pub source_key: String,
+    pub session_id: String,
+    pub usage_ts: u32,
+    pub model: Option<String>,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cumulative_source: bool,
+    pub repo_url: Option<String>,
+}
+
+struct PendingDailyTokenDelta {
+    bucket_key: String,
+    anonymous_bucket_key: String,
+    date_key: String,
+    timezone: String,
+    machine_id: String,
+    sequence: usize,
+    timestamp: u32,
+    attrs: SparseArray,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    request_count: u32,
+    provider: Option<String>,
+}
+
+struct DailyTokenIdentityRow {
+    bucket_key: String,
+    date_key: String,
+    timezone: String,
+    machine_id: String,
+    attrs: SparseArray,
+    provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,24 +356,27 @@ pub struct MetricsDatabase {
 }
 
 impl MetricsDatabase {
-    /// How long metric rows are retained for local history/offline retry (365 days).
+    /// How long delivered metric rows are retained as local history (365 days).
+    /// Undelivered rows are formal facts and remain until a server receipt exists.
     const METRICS_RETENTION_SECS: u64 = 365 * 24 * 3600;
+    /// Recovery markers are needed only near the file mutation they explain.
+    const RECOVERY_RETENTION_SECS: u64 = 7 * 24 * 3600;
     /// Minimum interval between prune passes (24 hours).
     const METRICS_PRUNE_INTERVAL_SECS: u64 = 24 * 3600;
 
+    pub(crate) fn deferred_jobs_connection(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Get or initialize the global database
     pub fn global() -> Result<&'static Mutex<MetricsDatabase>, GitAiError> {
-        let db_mutex = METRICS_DB.get_or_init(|| match Self::new() {
-            Ok(db) => Mutex::new(db),
-            Err(e) => {
-                eprintln!("[Error] Failed to initialize metrics database: {}", e);
-                Mutex::new(
-                    Self::new_fallback().expect("Failed to create fallback metrics database"),
-                )
-            }
-        });
-
-        Ok(db_mutex)
+        match METRICS_DB.get_or_init(|| Self::new().map(Mutex::new).map_err(|e| e.to_string())) {
+            Ok(db) => Ok(db),
+            Err(error) => Err(GitAiError::Generic(format!(
+                "Failed to initialize primary metrics database; refusing fallback storage: {}",
+                error
+            ))),
+        }
     }
 
     /// Create a new database connection
@@ -198,37 +390,19 @@ impl MetricsDatabase {
 
         // Open with WAL mode and performance optimizations
         let conn = crate::sqlite::open_with_memory_limits(&db_path)?;
+        conn.busy_timeout(METRICS_SQLITE_BUSY_TIMEOUT)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA temp_store=MEMORY;
+            PRAGMA auto_vacuum=INCREMENTAL;
             "#,
         )?;
 
         let mut db = Self { conn };
         db.initialize_schema()?;
 
-        Ok(db)
-    }
-
-    fn new_fallback() -> Result<Self, GitAiError> {
-        let temp_path = std::env::temp_dir().join("git-ai-metrics-db-failed");
-        Self::new_fallback_at_path(&temp_path)
-    }
-
-    fn new_fallback_at_path(path: &std::path::Path) -> Result<Self, GitAiError> {
-        let conn = crate::sqlite::open_with_memory_limits(path)?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=NORMAL;
-            PRAGMA temp_store=MEMORY;
-            "#,
-        )?;
-
-        let mut db = Self { conn };
-        db.initialize_schema()?;
         Ok(db)
     }
 
@@ -237,10 +411,12 @@ impl MetricsDatabase {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("metrics.db");
         let conn = crate::sqlite::open_with_memory_limits(&db_path)?;
+        conn.busy_timeout(METRICS_SQLITE_BUSY_TIMEOUT)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
+            PRAGMA auto_vacuum=INCREMENTAL;
             "#,
         )?;
 
@@ -256,11 +432,13 @@ impl MetricsDatabase {
             std::fs::create_dir_all(parent)?;
         }
         let conn = crate::sqlite::open_with_memory_limits(path)?;
+        conn.busy_timeout(METRICS_SQLITE_BUSY_TIMEOUT)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA temp_store=MEMORY;
+            PRAGMA auto_vacuum=INCREMENTAL;
             "#,
         )?;
 
@@ -285,7 +463,25 @@ impl MetricsDatabase {
 
     /// Initialize schema and handle migrations
     fn initialize_schema(&mut self) -> Result<(), GitAiError> {
-        // FAST PATH: Check if database is already at current version
+        let lock_path = self.schema_migration_lock_path()?;
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let deadline = Instant::now() + SCHEMA_MIGRATION_LOCK_WAIT;
+        let _migration_lock = loop {
+            if let Some(lock) = LockFile::try_acquire(&lock_path) {
+                break lock;
+            }
+            if Instant::now() >= deadline {
+                return Err(GitAiError::Generic(format!(
+                    "Timed out waiting for metrics schema migration lock at {}",
+                    lock_path.display()
+                )));
+            }
+            std::thread::sleep(SCHEMA_MIGRATION_LOCK_POLL);
+        };
+
+        // Re-read only after taking the process-wide migration lock.
         let version_check: Result<usize, _> = self.conn.query_row(
             "SELECT value FROM schema_metadata WHERE key = 'version'",
             [],
@@ -299,6 +495,19 @@ impl MetricsDatabase {
 
         if let Ok(current_version) = version_check {
             if current_version == SCHEMA_VERSION {
+                self.add_deferred_commit_parent_note_column()?;
+                self.ensure_legacy_content_insert_guard()?;
+                if self.legacy_content_rows_exist()? {
+                    self.compact_legacy_content_events()?;
+                }
+                crate::metrics::deferred_commit_jobs::compact_done_payloads_on_connection(
+                    &mut self.conn,
+                    100,
+                )?;
+                crate::metrics::deferred_lifecycle_jobs::compact_done_payloads_on_connection(
+                    &mut self.conn,
+                    100,
+                )?;
                 return Ok(());
             }
             if current_version > SCHEMA_VERSION {
@@ -352,7 +561,62 @@ impl MetricsDatabase {
             )?;
         }
 
+        self.ensure_legacy_content_insert_guard()?;
+        if self.legacy_content_rows_exist()? {
+            self.compact_legacy_content_events()?;
+        }
+        crate::metrics::deferred_commit_jobs::compact_done_payloads_on_connection(
+            &mut self.conn,
+            100,
+        )?;
+        crate::metrics::deferred_lifecycle_jobs::compact_done_payloads_on_connection(
+            &mut self.conn,
+            100,
+        )?;
+
         Ok(())
+    }
+
+    fn schema_migration_lock_path(&self) -> Result<PathBuf, GitAiError> {
+        let database_path: String = self
+            .conn
+            .query_row("PRAGMA database_list", [], |row| row.get(2))?;
+        if database_path.is_empty() {
+            return Err(GitAiError::Generic(
+                "Metrics database has no filesystem path for migration locking".to_string(),
+            ));
+        }
+        let mut lock_path = std::ffi::OsString::from(database_path);
+        lock_path.push(".migration.lock");
+        Ok(PathBuf::from(lock_path))
+    }
+
+    fn ensure_legacy_content_insert_guard(&self) -> Result<(), GitAiError> {
+        self.conn.execute_batch(LEGACY_CONTENT_INSERT_GUARD_SQL)?;
+        Ok(())
+    }
+
+    fn legacy_content_rows_exist(&self) -> Result<bool, GitAiError> {
+        let exists: i64 = self.conn.query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM metrics
+                WHERE COALESCE(
+                    event_kind,
+                    CASE WHEN json_valid(event_json)
+                         THEN json_extract(event_json, '$.e') END
+                ) IN (?1, ?2)
+                LIMIT 1
+            )
+            "#,
+            params![
+                MetricEventId::SessionEvent as i64,
+                MetricEventId::OtelTrace as i64
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
     }
 
     /// Apply a single migration
@@ -371,12 +635,98 @@ impl MetricsDatabase {
         if from_version == 3 {
             self.add_event_metadata_columns()?;
         }
+        if from_version == 7 {
+            self.add_token_baseline_columns()?;
+        }
+        if from_version == 8 {
+            self.add_token_snapshot_identity_columns()?;
+        }
+        if from_version == 10 {
+            self.add_deferred_commit_parent_note_column()?;
+        }
 
         let migration_sql = MIGRATIONS[from_version];
         let tx = self.conn.transaction()?;
         tx.execute_batch(migration_sql)?;
         tx.commit()?;
 
+        if from_version == 6 {
+            self.compact_legacy_content_events()?;
+        }
+
+        Ok(())
+    }
+
+    /// Convert legacy content-bearing transcript and OTEL rows into the same
+    /// bounded metadata/token projections used by new streams, then remove the
+    /// original JSON. Projection commits before deletion and is idempotent, so
+    /// an interrupted upgrade safely resumes on the next startup.
+    fn compact_legacy_content_events(&mut self) -> Result<(), GitAiError> {
+        let mut compacted = 0usize;
+        loop {
+            let ids = {
+                let mut stmt = self.conn.prepare(
+                    r#"
+                    SELECT id
+                    FROM metrics
+                    WHERE COALESCE(
+                        event_kind,
+                        CASE WHEN json_valid(event_json)
+                             THEN json_extract(event_json, '$.e') END
+                    ) IN (?1, ?2)
+                    ORDER BY id ASC
+                    LIMIT ?3
+                    "#,
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        MetricEventId::SessionEvent as i64,
+                        MetricEventId::OtelTrace as i64,
+                        LEGACY_CONTENT_COMPACTION_BATCH_SIZE as i64,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    ids.push(row?);
+                }
+                ids
+            };
+            if ids.is_empty() {
+                break;
+            }
+
+            let mut observations = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let event_json: String = self.conn.query_row(
+                    "SELECT event_json FROM metrics WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                if let Some(observation) = compact_legacy_content_event(&event_json) {
+                    observations.push(observation);
+                }
+            }
+            self.insert_session_observations(&observations)?;
+
+            let tx = self.conn.transaction()?;
+            {
+                let mut delete = tx.prepare_cached("DELETE FROM metrics WHERE id = ?1")?;
+                for id in &ids {
+                    delete.execute(params![id])?;
+                }
+            }
+            tx.commit()?;
+            compacted += ids.len();
+        }
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_metadata (key, value) VALUES ('legacy_content_rows_compacted', ?1)",
+            params![compacted.to_string()],
+        )?;
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA incremental_vacuum(1024); PRAGMA wal_checkpoint(TRUNCATE);");
         Ok(())
     }
 
@@ -462,6 +812,59 @@ impl MetricsDatabase {
             self.add_column_if_missing("metrics", name, sql)?;
         }
         Ok(())
+    }
+
+    fn add_token_baseline_columns(&mut self) -> Result<(), GitAiError> {
+        for (name, sql) in [
+            (
+                "baseline_input_tokens",
+                "ALTER TABLE session_token_sources ADD COLUMN baseline_input_tokens INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "baseline_output_tokens",
+                "ALTER TABLE session_token_sources ADD COLUMN baseline_output_tokens INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "baseline_cache_read_tokens",
+                "ALTER TABLE session_token_sources ADD COLUMN baseline_cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "baseline_cache_write_tokens",
+                "ALTER TABLE session_token_sources ADD COLUMN baseline_cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            self.add_column_if_missing("session_token_sources", name, sql)?;
+        }
+        Ok(())
+    }
+
+    fn add_token_snapshot_identity_columns(&mut self) -> Result<(), GitAiError> {
+        for (name, sql) in [
+            (
+                "snapshot_instance_id",
+                "ALTER TABLE session_token_daily ADD COLUMN snapshot_instance_id TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "supersedes_source_keys_json",
+                "ALTER TABLE session_token_daily ADD COLUMN supersedes_source_keys_json TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "supersedes_snapshot_instance_ids_json",
+                "ALTER TABLE session_token_daily ADD COLUMN supersedes_snapshot_instance_ids_json TEXT NOT NULL DEFAULT '[]'",
+            ),
+        ] {
+            self.add_column_if_missing("session_token_daily", name, sql)?;
+        }
+        Ok(())
+    }
+
+    fn add_deferred_commit_parent_note_column(&mut self) -> Result<(), GitAiError> {
+        self.add_column_if_missing(
+            "deferred_commit_metric_jobs",
+            "parent_authorship_note",
+            "ALTER TABLE deferred_commit_metric_jobs \
+             ADD COLUMN parent_authorship_note TEXT NOT NULL DEFAULT ''",
+        )
     }
 
     fn add_column_if_missing(
@@ -576,6 +979,423 @@ impl MetricsDatabase {
         Ok(ids)
     }
 
+    /// Persist one transcript batch as bounded, content-free local state.
+    ///
+    /// Raw transcript JSON never enters SQLite. Every event contributes only a
+    /// short-lived recovery marker and a per-session first/last watermark. Token
+    /// snapshots are deduplicated by their stable source key. Positive deltas
+    /// update one cumulative day/dimension row, and the upload outbox keeps at
+    /// most one mutable pending snapshot per row while the backend is offline.
+    pub(crate) fn insert_session_observations(
+        &mut self,
+        observations: &[SessionObservation],
+    ) -> Result<Vec<i64>, GitAiError> {
+        if observations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tx = self.conn.transaction()?;
+        let mut metric_ids = Vec::new();
+        let mut pending_token_deltas: BTreeMap<String, PendingDailyTokenDelta> = BTreeMap::new();
+        let machine_id = token_snapshot_machine_id();
+
+        for (observation_sequence, observation) in observations.iter().enumerate() {
+            let Some(session_id) =
+                sparse_get_string(&observation.attrs, attr_pos::SESSION_ID).flatten()
+            else {
+                continue;
+            };
+            if session_id.is_empty() {
+                continue;
+            }
+            let tool = sparse_get_string(&observation.attrs, attr_pos::TOOL)
+                .flatten()
+                .unwrap_or_else(|| "unknown".to_string());
+            let model = sparse_get_string(&observation.attrs, attr_pos::MODEL).flatten();
+            let repo_url = sparse_get_string(&observation.attrs, attr_pos::REPO_URL).flatten();
+            let trace_id = sparse_get_string(&observation.attrs, attr_pos::TRACE_ID).flatten();
+            let external_session_id =
+                sparse_get_string(&observation.attrs, attr_pos::EXTERNAL_SESSION_ID)
+                    .flatten()
+                    .unwrap_or_default();
+            let event_ts = i64::from(observation.timestamp);
+
+            tx.execute(
+                r#"
+                INSERT INTO session_activity (
+                    session_id, first_ts, last_ts, tool, model, repo_url, external_session_id
+                ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    first_ts = MIN(session_activity.first_ts, excluded.first_ts),
+                    last_ts = MAX(session_activity.last_ts, excluded.last_ts),
+                    tool = CASE WHEN excluded.last_ts >= session_activity.last_ts
+                        THEN excluded.tool ELSE session_activity.tool END,
+                    model = CASE WHEN excluded.last_ts >= session_activity.last_ts
+                        THEN COALESCE(excluded.model, session_activity.model) ELSE session_activity.model END,
+                    repo_url = COALESCE(session_activity.repo_url, excluded.repo_url),
+                    external_session_id = COALESCE(
+                        NULLIF(session_activity.external_session_id, ''), excluded.external_session_id)
+                "#,
+                params![
+                    session_id,
+                    event_ts,
+                    tool,
+                    model.as_deref(),
+                    repo_url.as_deref(),
+                    external_session_id,
+                ],
+            )?;
+
+            if !external_session_id.is_empty() {
+                let recovery_key = recovery_event_key(
+                    &session_id,
+                    observation.timestamp,
+                    observation.external_tool_use_id.as_deref(),
+                    &tool,
+                    model.as_deref(),
+                    repo_url.as_deref(),
+                );
+                tx.execute(
+                    r#"
+                    INSERT OR IGNORE INTO session_recovery_events (
+                        event_key, event_ts, session_id, trace_id, tool, model,
+                        external_session_id, external_event_id, external_parent_event_id,
+                        external_tool_use_id, repo_url
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    "#,
+                    params![
+                        recovery_key,
+                        event_ts,
+                        session_id,
+                        trace_id.as_deref(),
+                        tool,
+                        model.as_deref(),
+                        external_session_id,
+                        observation.external_event_id.as_deref(),
+                        observation.external_parent_event_id.as_deref(),
+                        observation.external_tool_use_id.as_deref(),
+                        repo_url.as_deref(),
+                    ],
+                )?;
+            }
+
+            let Some(token) = observation.token.as_ref() else {
+                continue;
+            };
+            let previous = tx
+                .query_row(
+                    r#"
+                    SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                    FROM session_token_sources WHERE source_key = ?1
+                    "#,
+                    params![token.source_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?.max(0) as u64,
+                            row.get::<_, i64>(1)?.max(0) as u64,
+                            row.get::<_, i64>(2)?.max(0) as u64,
+                            row.get::<_, i64>(3)?.max(0) as u64,
+                        ))
+                    },
+                )
+                .optional()?;
+            let (old_input, old_output, old_cache_read, old_cache_write) =
+                previous.unwrap_or_default();
+            let input_delta = token.input.saturating_sub(old_input);
+            let output_delta = token.output.saturating_sub(old_output);
+            let cache_read_delta = token.cache_read.saturating_sub(old_cache_read);
+            let cache_write_delta = token.cache_write.saturating_sub(old_cache_write);
+            let has_positive_delta = input_delta > 0
+                || output_delta > 0
+                || cache_read_delta > 0
+                || cache_write_delta > 0;
+            let request_count = if token.baseline_only {
+                0
+            } else if token.cumulative {
+                u32::from(has_positive_delta)
+            } else {
+                u32::from(previous.is_none())
+            };
+            let token_model = token.model.as_ref().or(model.as_ref());
+
+            tx.execute(
+                r#"
+                INSERT INTO session_token_sources (
+                    source_key, session_id, first_ts, last_ts, tool, model, provider, repo_url,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    cumulative_source, baseline_input_tokens, baseline_output_tokens,
+                    baseline_cache_read_tokens, baseline_cache_write_tokens
+                ) VALUES (
+                    ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16
+                )
+                ON CONFLICT(source_key) DO UPDATE SET
+                    first_ts = MIN(session_token_sources.first_ts, excluded.first_ts),
+                    last_ts = MAX(session_token_sources.last_ts, excluded.last_ts),
+                    model = COALESCE(NULLIF(session_token_sources.model, ''), excluded.model),
+                    provider = COALESCE(NULLIF(session_token_sources.provider, ''), excluded.provider),
+                    repo_url = COALESCE(session_token_sources.repo_url, excluded.repo_url),
+                    input_tokens = MAX(session_token_sources.input_tokens, excluded.input_tokens),
+                    output_tokens = MAX(session_token_sources.output_tokens, excluded.output_tokens),
+                    cache_read_tokens = MAX(session_token_sources.cache_read_tokens, excluded.cache_read_tokens),
+                    cache_write_tokens = MAX(session_token_sources.cache_write_tokens, excluded.cache_write_tokens),
+                    cumulative_source = MAX(session_token_sources.cumulative_source, excluded.cumulative_source),
+                    baseline_input_tokens = MAX(session_token_sources.baseline_input_tokens, excluded.baseline_input_tokens),
+                    baseline_output_tokens = MAX(session_token_sources.baseline_output_tokens, excluded.baseline_output_tokens),
+                    baseline_cache_read_tokens = MAX(session_token_sources.baseline_cache_read_tokens, excluded.baseline_cache_read_tokens),
+                    baseline_cache_write_tokens = MAX(session_token_sources.baseline_cache_write_tokens, excluded.baseline_cache_write_tokens)
+                "#,
+                params![
+                    token.source_key,
+                    session_id,
+                    event_ts,
+                    tool,
+                    token_model.map(String::as_str),
+                    token.provider.as_deref(),
+                    repo_url.as_deref(),
+                    u64_to_sqlite(token.input),
+                    u64_to_sqlite(token.output),
+                    u64_to_sqlite(token.cache_read),
+                    u64_to_sqlite(token.cache_write),
+                    i64::from(token.cumulative),
+                    u64_to_sqlite(if token.baseline_only { token.input } else { 0 }),
+                    u64_to_sqlite(if token.baseline_only { token.output } else { 0 }),
+                    u64_to_sqlite(if token.baseline_only {
+                        token.cache_read
+                    } else {
+                        0
+                    }),
+                    u64_to_sqlite(if token.baseline_only {
+                        token.cache_write
+                    } else {
+                        0
+                    }),
+                ],
+            )?;
+
+            if token.baseline_only
+                || (input_delta == 0
+                    && output_delta == 0
+                    && cache_read_delta == 0
+                    && cache_write_delta == 0
+                    && request_count == 0)
+            {
+                continue;
+            }
+
+            let (bucket_key, anonymous_bucket_key, date_key, timezone, snapshot_attrs) =
+                daily_token_bucket(
+                    observation.timestamp,
+                    &observation.attrs,
+                    token.provider.as_deref(),
+                    &machine_id,
+                    &token.source_key,
+                )?;
+            let delta = pending_token_deltas
+                .entry(bucket_key.clone())
+                .or_insert_with(|| PendingDailyTokenDelta {
+                    bucket_key,
+                    anonymous_bucket_key,
+                    date_key,
+                    timezone: timezone.clone(),
+                    machine_id: machine_id.clone(),
+                    sequence: observation_sequence,
+                    timestamp: observation.timestamp,
+                    attrs: snapshot_attrs.clone(),
+                    input: 0,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    request_count: 0,
+                    provider: token.provider.clone(),
+                });
+            delta.input = delta.input.saturating_add(input_delta);
+            delta.output = delta.output.saturating_add(output_delta);
+            delta.cache_read = delta.cache_read.saturating_add(cache_read_delta);
+            delta.cache_write = delta.cache_write.saturating_add(cache_write_delta);
+            delta.request_count = delta.request_count.saturating_add(request_count);
+            delta.sequence = observation_sequence;
+            if delta.provider.is_none() {
+                delta.provider = token.provider.clone();
+            }
+            if observation.timestamp >= delta.timestamp {
+                delta.timestamp = observation.timestamp;
+                delta.attrs = snapshot_attrs;
+                delta.timezone = timezone;
+            }
+        }
+
+        let mut pending_token_deltas = pending_token_deltas.into_values().collect::<Vec<_>>();
+        // Materialize unknown deltas first, then let the most recently observed
+        // valid identity claim that transient bucket. This matters when one
+        // compaction batch spans an A -> unknown -> B profile transition.
+        pending_token_deltas.sort_by_key(|delta| {
+            (
+                delta.anonymous_bucket_key != delta.bucket_key,
+                Reverse(delta.sequence),
+            )
+        });
+
+        for delta in pending_token_deltas {
+            let attrs_json = serde_json::to_string(&delta.attrs)?;
+            if delta.anonymous_bucket_key != delta.bucket_key {
+                migrate_unknown_daily_token_bucket(
+                    &tx,
+                    &delta.anonymous_bucket_key,
+                    &delta.bucket_key,
+                    &attrs_json,
+                    &delta.timezone,
+                    delta.provider.as_deref(),
+                )?;
+            }
+            let snapshot_instance_id = crate::uuid::generate_v4();
+            tx.execute(
+                r#"
+                INSERT INTO session_token_daily (
+                    bucket_key, date_key, timezone, machine_id, first_ts, last_ts, attrs_json, provider,
+                    request_count, input_tokens, output_tokens, cache_read_tokens,
+                    cache_write_tokens, outbox_metric_id, snapshot_instance_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)
+                ON CONFLICT(bucket_key) DO UPDATE SET
+                    first_ts = MIN(session_token_daily.first_ts, excluded.first_ts),
+                    last_ts = MAX(session_token_daily.last_ts, excluded.last_ts),
+                    timezone = CASE WHEN excluded.last_ts >= session_token_daily.last_ts
+                        THEN excluded.timezone ELSE session_token_daily.timezone END,
+                    attrs_json = CASE WHEN excluded.last_ts >= session_token_daily.last_ts
+                        THEN excluded.attrs_json ELSE session_token_daily.attrs_json END,
+                    provider = COALESCE(session_token_daily.provider, excluded.provider),
+                    request_count = session_token_daily.request_count + excluded.request_count,
+                    input_tokens = session_token_daily.input_tokens + excluded.input_tokens,
+                    output_tokens = session_token_daily.output_tokens + excluded.output_tokens,
+                    cache_read_tokens = session_token_daily.cache_read_tokens + excluded.cache_read_tokens,
+                    cache_write_tokens = session_token_daily.cache_write_tokens + excluded.cache_write_tokens
+                "#,
+                params![
+                    delta.bucket_key,
+                    delta.date_key,
+                    delta.timezone,
+                    delta.machine_id,
+                    i64::from(delta.timestamp),
+                    attrs_json,
+                    delta.provider.as_deref(),
+                    i64::from(delta.request_count),
+                    u64_to_sqlite(delta.input),
+                    u64_to_sqlite(delta.output),
+                    u64_to_sqlite(delta.cache_read),
+                    u64_to_sqlite(delta.cache_write),
+                    snapshot_instance_id,
+                ],
+            )?;
+
+            metric_ids.push(refresh_daily_token_outbox(&tx, &delta.bucket_key)?);
+        }
+
+        tx.commit()?;
+        self.prune_compact_session_history_if_due()?;
+        Ok(metric_ids)
+    }
+
+    /// Re-key cumulative token snapshots that use a legacy project identity or
+    /// were recorded before a valid reporting email existed. Existing valid
+    /// user identities are never re-keyed: if a machine legitimately changes
+    /// from user A to user B, both remain separate business buckets.
+    ///
+    /// The migration and replacement outbox snapshot are committed together.
+    /// A pending anonymous row is replaced; an in-flight row stays immutable
+    /// and the new identified snapshot becomes its cumulative successor.
+    pub(crate) fn rehydrate_unknown_daily_token_identity(
+        &mut self,
+        reporting_attributes: &HashMap<String, String>,
+    ) -> Result<Vec<i64>, GitAiError> {
+        let configured_email = reporting_attributes
+            .get("user_email")
+            .and_then(|email| compact_valid_email(email));
+
+        let tx = self.conn.transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT bucket_key, date_key, timezone, machine_id, attrs_json, provider
+                FROM session_token_daily
+                ORDER BY first_ts ASC, bucket_key ASC
+                "#,
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let attrs_json = row.get::<_, String>(4)?;
+                let attrs = serde_json::from_str::<SparseArray>(&attrs_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        attrs_json.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(DailyTokenIdentityRow {
+                    bucket_key: row.get(0)?,
+                    date_key: row.get(1)?,
+                    timezone: row.get(2)?,
+                    machine_id: row.get(3)?,
+                    attrs,
+                    provider: row.get(5)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut refreshed_ids = BTreeSet::new();
+        for row in rows {
+            let mut target_attrs = row.attrs.clone();
+            if legacy_daily_token_bucket_revision(&row.bucket_key)
+                && !has_explicit_project_key(&target_attrs)
+            {
+                mark_legacy_project_identity_ambiguous(&mut target_attrs, &row.bucket_key)?;
+            } else {
+                canonicalize_snapshot_repo_url(&mut target_attrs);
+            }
+            let source_email = compact_identity_email(&target_attrs);
+            if source_email.is_none() && configured_email.is_some() {
+                apply_reporting_attributes(&mut target_attrs, reporting_attributes)?;
+            }
+            let target_email =
+                compact_identity_email(&target_attrs).unwrap_or_else(|| "unknown".to_string());
+            let target_attrs_json = serde_json::to_string(&target_attrs)?;
+            let target_bucket_key = daily_token_bucket_key(
+                latest_daily_token_bucket_revision(&row.bucket_key),
+                &row.date_key,
+                &target_email,
+                &row.machine_id,
+                &target_attrs,
+                row.provider.as_deref(),
+            );
+
+            if row.bucket_key == target_bucket_key {
+                if target_attrs != row.attrs {
+                    tx.execute(
+                        "UPDATE session_token_daily SET attrs_json = ?1, timezone = ?2 \
+                         WHERE bucket_key = ?3",
+                        params![target_attrs_json, row.timezone, row.bucket_key],
+                    )?;
+                    refreshed_ids.insert(refresh_daily_token_outbox(&tx, &row.bucket_key)?);
+                }
+                continue;
+            }
+
+            if migrate_daily_token_bucket(
+                &tx,
+                &row.bucket_key,
+                &target_bucket_key,
+                &target_attrs_json,
+                &row.timezone,
+                row.provider.as_deref(),
+                false,
+            )? {
+                refreshed_ids.insert(refresh_daily_token_outbox(&tx, &target_bucket_key)?);
+            }
+        }
+
+        tx.commit()?;
+        Ok(refreshed_ids.into_iter().collect())
+    }
+
     /// Atomically claim a due batch of pending metrics for upload.
     pub fn dequeue_pending_batch(&mut self, limit: usize) -> Result<Vec<MetricRecord>, GitAiError> {
         if limit == 0 {
@@ -589,11 +1409,18 @@ impl MetricsDatabase {
         let ids = {
             let mut stmt = tx.prepare(RETRYABLE_METRIC_IDS_SQL)?;
             let rows = stmt.query_map(params![now as i64, limit as i64], |row| {
-                row.get::<_, i64>(0)
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0) as usize))
             })?;
             let mut ids = Vec::new();
+            let mut selected_bytes = 1024usize;
             for row in rows {
-                ids.push(row?);
+                let (id, event_bytes) = row?;
+                let next_bytes = selected_bytes.saturating_add(event_bytes).saturating_add(1);
+                if !ids.is_empty() && next_bytes > MAX_METRICS_UPLOAD_BODY_BYTES {
+                    break;
+                }
+                ids.push(id);
+                selected_bytes = next_bytes;
             }
             ids
         };
@@ -653,6 +1480,15 @@ impl MetricsDatabase {
         let tx = self.conn.transaction()?;
 
         {
+            let mut acknowledge_compact_snapshot = tx.prepare_cached(
+                "UPDATE session_token_daily \
+                 SET outbox_metric_id = NULL, \
+                     supersedes_source_keys_json = '[]', \
+                     supersedes_snapshot_instance_ids_json = '[]' \
+                 WHERE outbox_metric_id = ?1",
+            )?;
+            let mut delete_compact =
+                tx.prepare_cached("DELETE FROM metrics WHERE id = ?1 AND event_kind = ?2")?;
             let mut stmt = tx.prepare_cached(
                 "UPDATE metrics \
                  SET delivered_ts = ?1, processing_started_at = NULL \
@@ -660,7 +1496,12 @@ impl MetricsDatabase {
             )?;
 
             for id in ids {
-                stmt.execute(params![delivered_ts as i64, id])?;
+                acknowledge_compact_snapshot.execute(params![id])?;
+                if delete_compact.execute(params![id, MetricEventId::SessionTokenUsage as i64])?
+                    == 0
+                {
+                    stmt.execute(params![delivered_ts as i64, id])?;
+                }
             }
         }
 
@@ -686,7 +1527,10 @@ impl MetricsDatabase {
                 r#"
                 UPDATE metrics
                 SET processing_started_at = NULL,
-                    attempts = attempts + 1,
+                    attempts = CASE
+                        WHEN event_kind = ?4 THEN MIN(attempts + 1, ?5)
+                        ELSE attempts + 1
+                    END,
                     last_sync_error = ?1,
                     last_sync_at = ?2,
                     next_retry_at = ?2 + CASE
@@ -702,7 +1546,60 @@ impl MetricsDatabase {
             )?;
 
             for id in ids {
-                stmt.execute(params![error, failed_at as i64, id])?;
+                stmt.execute(params![
+                    error,
+                    failed_at as i64,
+                    id,
+                    MetricEventId::SessionTokenUsage as i64,
+                    (MAX_METRIC_UPLOAD_ATTEMPTS - 1) as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Keep recoverable configuration/size failures in the automatic queue.
+    ///
+    /// The attempt value is capped below the retry-index cutoff while the
+    /// schedule still reaches the normal 24-hour maximum backoff.
+    pub fn mark_records_deferred(
+        &mut self,
+        ids: &[i64],
+        error: &str,
+        failed_at: u64,
+    ) -> Result<(), GitAiError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                r#"
+                UPDATE metrics
+                SET processing_started_at = NULL,
+                    attempts = MIN(attempts + 1, ?4),
+                    last_sync_error = ?1,
+                    last_sync_at = ?2,
+                    next_retry_at = ?2 + CASE
+                        WHEN attempts + 1 <= 1 THEN 300
+                        WHEN attempts + 1 = 2 THEN 1800
+                        WHEN attempts + 1 = 3 THEN 7200
+                        WHEN attempts + 1 = 4 THEN 21600
+                        WHEN attempts + 1 = 5 THEN 43200
+                        ELSE 86400
+                    END
+                WHERE id = ?3 AND delivered_ts IS NULL
+                "#,
+            )?;
+            for id in ids {
+                stmt.execute(params![
+                    error,
+                    failed_at as i64,
+                    id,
+                    (MAX_METRIC_UPLOAD_ATTEMPTS - 1) as i64,
+                ])?;
             }
         }
         tx.commit()?;
@@ -854,10 +1751,11 @@ impl MetricsDatabase {
         Ok(())
     }
 
-    /// Delete metric rows outside the local retention window.
+    /// Delete delivered metric rows outside the local history retention window.
     ///
-    /// Valid rows are pruned by event timestamp, regardless of delivery state. Malformed
-    /// rows cannot be aged by event timestamp, so delivered malformed rows fall back to
+    /// Rows without a delivery receipt are never aged out, including rows waiting
+    /// to retry and rows stopped after deterministic server errors. Valid delivered
+    /// rows are aged by event timestamp; malformed delivered rows fall back to
     /// `delivered_ts`.
     fn prune_old_metrics_if_due(&mut self) -> Result<(), GitAiError> {
         let now = std::time::SystemTime::now()
@@ -899,9 +1797,61 @@ impl MetricsDatabase {
         Ok(())
     }
 
+    fn prune_compact_session_history_if_due(&mut self) -> Result<(), GitAiError> {
+        let now = current_unix_ts();
+        let last_prune: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'compact_session_last_prune_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .and_then(|value: String| value.parse().ok());
+        if let Some(last) = last_prune
+            && now.saturating_sub(last.max(0) as u64) < Self::METRICS_PRUNE_INTERVAL_SECS
+        {
+            return Ok(());
+        }
+
+        let recovery_cutoff = now.saturating_sub(Self::RECOVERY_RETENTION_SECS) as i64;
+        let history_cutoff = now.saturating_sub(Self::METRICS_RETENTION_SECS) as i64;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM session_recovery_events WHERE event_ts < ?1",
+            params![recovery_cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM session_activity WHERE last_ts < ?1",
+            params![history_cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM session_token_sources WHERE last_ts < ?1",
+            params![history_cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM session_token_daily WHERE last_ts < ?1",
+            params![history_cutoff],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_metadata (key, value) VALUES ('compact_session_last_prune_ts', ?1)",
+            params![now.to_string()],
+        )?;
+        tx.commit()?;
+
+        // This physically returns a bounded number of freelist pages on fresh
+        // databases. Older databases that predate incremental auto-vacuum keep
+        // working; SQLite treats the call as a no-op until an explicit rebuild.
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA incremental_vacuum(256); PRAGMA wal_checkpoint(TRUNCATE);");
+        Ok(())
+    }
+
     fn old_metric_row_ids(&self, cutoff: u64) -> Result<Vec<i64>, GitAiError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, event_json, event_ts, delivered_ts FROM metrics ORDER BY id ASC",
+            "SELECT id, event_json, event_ts, delivered_ts \
+             FROM metrics WHERE delivered_ts IS NOT NULL ORDER BY id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -994,6 +1944,200 @@ impl MetricsDatabase {
         Ok(records)
     }
 
+    pub(crate) fn get_compact_session_history(
+        &self,
+        since_ts: u32,
+        repo_filter: Option<&str>,
+    ) -> Result<Vec<CompactSessionRecord>, GitAiError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, first_ts, last_ts, tool, model, repo_url \
+             FROM session_activity WHERE last_ts >= ?1 ORDER BY last_ts ASC",
+        )?;
+        let rows = stmt.query_map(params![since_ts as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (session_id, first_ts, last_ts, tool, model, repo_url) = row?;
+            if !compact_repo_matches(repo_url.as_deref(), repo_filter)
+                || !(0..=u32::MAX as i64).contains(&first_ts)
+                || !(0..=u32::MAX as i64).contains(&last_ts)
+            {
+                continue;
+            }
+            records.push(CompactSessionRecord {
+                session_id,
+                first_ts: (first_ts as u32).max(since_ts),
+                last_ts: last_ts as u32,
+                tool,
+                model,
+                repo_url,
+            });
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn get_compact_token_history(
+        &self,
+        since_ts: u32,
+        repo_filter: Option<&str>,
+    ) -> Result<Vec<CompactTokenRecord>, GitAiError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT source_key, session_id, first_ts, last_ts, model, repo_url,
+                   MAX(input_tokens - baseline_input_tokens, 0),
+                   MAX(output_tokens - baseline_output_tokens, 0),
+                   MAX(cache_read_tokens - baseline_cache_read_tokens, 0),
+                   MAX(cache_write_tokens - baseline_cache_write_tokens, 0),
+                   cumulative_source
+            FROM session_token_sources AS source
+            WHERE last_ts >= ?1
+              AND NOT (
+                  source.tool = 'codex'
+                  AND source.source_key LIKE 'ts1:%'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM session_token_sources AS corrected
+                      WHERE corrected.session_id = source.session_id
+                        AND corrected.tool = 'codex'
+                        AND corrected.source_key LIKE 'ts2:%'
+                  )
+              )
+            ORDER BY last_ts ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![since_ts as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (
+                source_key,
+                session_id,
+                first_ts,
+                last_ts,
+                model,
+                repo_url,
+                input,
+                output,
+                cache_read,
+                cache_write,
+                cumulative_source,
+            ) = row?;
+            let usage_ts = if cumulative_source != 0 {
+                last_ts
+            } else {
+                first_ts.max(since_ts as i64)
+            };
+            if !compact_repo_matches(repo_url.as_deref(), repo_filter)
+                || !(0..=u32::MAX as i64).contains(&usage_ts)
+            {
+                continue;
+            }
+            records.push(CompactTokenRecord {
+                source_key,
+                session_id,
+                usage_ts: usage_ts as u32,
+                model,
+                input: input.max(0) as u64,
+                output: output.max(0) as u64,
+                cache_read: cache_read.max(0) as u64,
+                cache_write: cache_write.max(0) as u64,
+                cumulative_source: cumulative_source != 0,
+                repo_url,
+            });
+        }
+        Ok(records)
+    }
+
+    fn compact_recovery_candidates_near_timestamps(
+        &self,
+        timestamps_ns: &[u128],
+        window_ns: u128,
+        min_event_ts: u32,
+        max_event_ts: u32,
+    ) -> Result<Vec<SessionEventRecoveryCandidate>, GitAiError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT rowid, event_ts, session_id, trace_id, tool, model,
+                   external_session_id, external_tool_use_id, repo_url
+            FROM session_recovery_events
+            WHERE event_ts >= ?1 AND event_ts <= ?2
+              AND session_id != '' AND tool != '' AND tool != 'mock_ai'
+              AND external_session_id != ''
+            ORDER BY rowid ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![min_event_ts as i64, max_event_ts as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (
+                row_id,
+                event_ts,
+                session_id,
+                trace_id,
+                tool,
+                model,
+                external_session_id,
+                external_tool_use_id,
+                repo_url,
+            ) = row?;
+            if !(0..=u32::MAX as i64).contains(&event_ts) {
+                continue;
+            }
+            let event_ts = event_ts as u32;
+            if min_distance_to_event_ts(timestamps_ns, event_ts)
+                .is_none_or(|distance| distance > window_ns)
+            {
+                continue;
+            }
+            candidates.push(SessionEventRecoveryCandidate {
+                row_id,
+                event_ts,
+                session_id,
+                trace_id,
+                tool,
+                model,
+                external_session_id,
+                external_tool_use_id,
+                repo_url,
+            });
+        }
+        Ok(candidates)
+    }
+
     pub(crate) fn session_event_candidates_near_timestamps(
         &self,
         timestamps_ns: &[u128],
@@ -1008,6 +2152,13 @@ impl MetricsDatabase {
         else {
             return Ok(Vec::new());
         };
+
+        let mut candidates = self.compact_recovery_candidates_near_timestamps(
+            timestamps_ns,
+            window_ns,
+            min_event_ts,
+            max_event_ts,
+        )?;
 
         let mut stmt = self.conn.prepare(
             r#"
@@ -1054,7 +2205,6 @@ impl MetricsDatabase {
             },
         )?;
 
-        let mut candidates = Vec::new();
         for row in rows {
             let (
                 row_id,
@@ -1104,6 +2254,43 @@ impl MetricsDatabase {
         let placeholders = std::iter::repeat_n("?", tools.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let compact_sql = format!(
+            r#"
+            SELECT rowid, event_ts, session_id, trace_id, tool, model,
+                   external_session_id, external_tool_use_id, repo_url
+            FROM session_recovery_events
+            WHERE tool IN ({placeholders})
+              AND session_id != '' AND tool != '' AND tool != 'mock_ai'
+              AND external_session_id != ''
+            ORDER BY event_ts DESC, rowid DESC
+            LIMIT 100
+            "#
+        );
+        let tool_values = tools
+            .iter()
+            .map(|tool| rusqlite::types::Value::Text((*tool).to_string()))
+            .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        {
+            let mut compact_stmt = self.conn.prepare(&compact_sql)?;
+            let compact_rows =
+                compact_stmt.query_map(params_from_iter(tool_values.iter()), |row| {
+                    Ok(SessionEventRecoveryCandidate {
+                        row_id: row.get(0)?,
+                        event_ts: row.get::<_, i64>(1)?.max(0).min(u32::MAX as i64) as u32,
+                        session_id: row.get(2)?,
+                        trace_id: row.get(3)?,
+                        tool: row.get(4)?,
+                        model: row.get(5)?,
+                        external_session_id: row.get(6)?,
+                        external_tool_use_id: row.get(7)?,
+                        repo_url: row.get(8)?,
+                    })
+                })?;
+            for row in compact_rows {
+                candidates.push(row?);
+            }
+        }
         let sql = format!(
             r#"
             SELECT
@@ -1155,7 +2342,6 @@ impl MetricsDatabase {
             ))
         })?;
 
-        let mut candidates = Vec::new();
         for row in rows {
             let (
                 row_id,
@@ -1185,6 +2371,13 @@ impl MetricsDatabase {
             });
         }
 
+        candidates.sort_by_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.event_ts),
+                std::cmp::Reverse(candidate.row_id),
+            )
+        });
+        candidates.truncate(100);
         Ok(candidates)
     }
 
@@ -1341,6 +2534,663 @@ impl MetricsDatabase {
     }
 }
 
+fn migrate_unknown_daily_token_bucket(
+    tx: &rusqlite::Transaction<'_>,
+    anonymous_bucket_key: &str,
+    target_bucket_key: &str,
+    target_attrs_json: &str,
+    target_timezone: &str,
+    target_provider: Option<&str>,
+) -> Result<bool, GitAiError> {
+    migrate_daily_token_bucket(
+        tx,
+        anonymous_bucket_key,
+        target_bucket_key,
+        target_attrs_json,
+        target_timezone,
+        target_provider,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn migrate_daily_token_bucket(
+    tx: &rusqlite::Transaction<'_>,
+    source_bucket_key: &str,
+    target_bucket_key: &str,
+    target_attrs_json: &str,
+    target_timezone: &str,
+    target_provider: Option<&str>,
+    require_anonymous_source: bool,
+) -> Result<bool, GitAiError> {
+    if source_bucket_key == target_bucket_key {
+        return Ok(false);
+    }
+
+    let source = tx
+        .query_row(
+            "SELECT attrs_json, outbox_metric_id, snapshot_instance_id, \
+                    supersedes_source_keys_json, supersedes_snapshot_instance_ids_json \
+             FROM session_token_daily WHERE bucket_key = ?1",
+            params![source_bucket_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        source_attrs_json,
+        source_outbox_metric_id,
+        source_snapshot_instance_id,
+        source_supersedes_keys_json,
+        source_supersedes_instances_json,
+    )) = source
+    else {
+        return Ok(false);
+    };
+    let source_attrs: SparseArray = serde_json::from_str(&source_attrs_json)?;
+    if require_anonymous_source && compact_identity_email(&source_attrs).is_some() {
+        return Ok(false);
+    }
+
+    let target_aliases = tx
+        .query_row(
+            "SELECT supersedes_source_keys_json, supersedes_snapshot_instance_ids_json \
+             FROM session_token_daily WHERE bucket_key = ?1",
+            params![target_bucket_key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let mut supersedes_source_keys =
+        parse_token_snapshot_aliases(target_aliases.as_ref().map(|aliases| aliases.0.as_str()))?;
+    supersedes_source_keys.extend(parse_token_snapshot_aliases(Some(
+        &source_supersedes_keys_json,
+    ))?);
+    supersedes_source_keys.insert(source_bucket_key.to_string());
+    let mut supersedes_snapshot_instance_ids =
+        parse_token_snapshot_aliases(target_aliases.as_ref().map(|aliases| aliases.1.as_str()))?;
+    supersedes_snapshot_instance_ids.extend(parse_token_snapshot_aliases(Some(
+        &source_supersedes_instances_json,
+    ))?);
+    if !source_snapshot_instance_id.is_empty() {
+        supersedes_snapshot_instance_ids.insert(source_snapshot_instance_id);
+    }
+    let supersedes_source_keys_json =
+        serde_json::to_string(&supersedes_source_keys.into_iter().collect::<Vec<_>>())?;
+    let supersedes_snapshot_instance_ids_json = serde_json::to_string(
+        &supersedes_snapshot_instance_ids
+            .into_iter()
+            .collect::<Vec<_>>(),
+    )?;
+
+    // A pending snapshot is replaceable, but an in-flight row may already have
+    // been serialized into an HTTP request. Leave the latter immutable and
+    // create a cumulative successor below.
+    if let Some(outbox_metric_id) = source_outbox_metric_id {
+        tx.execute(
+            "DELETE FROM metrics \
+             WHERE id = ?1 AND event_kind = ?2 AND delivered_ts IS NULL \
+               AND processing_started_at IS NULL",
+            params![outbox_metric_id, MetricEventId::SessionTokenUsage as i64],
+        )?;
+    }
+
+    tx.execute(
+        r#"
+        INSERT INTO session_token_daily (
+            bucket_key, date_key, timezone, machine_id, first_ts, last_ts,
+            attrs_json, provider, request_count, input_tokens, output_tokens,
+            cache_read_tokens, cache_write_tokens, outbox_metric_id,
+            snapshot_instance_id
+        )
+        SELECT ?1, date_key, ?2, machine_id, first_ts, last_ts,
+               ?3, COALESCE(?4, provider), request_count, input_tokens,
+               output_tokens, cache_read_tokens, cache_write_tokens, NULL, ?6
+        FROM session_token_daily
+        WHERE bucket_key = ?5
+        ON CONFLICT(bucket_key) DO UPDATE SET
+            first_ts = MIN(session_token_daily.first_ts, excluded.first_ts),
+            last_ts = MAX(session_token_daily.last_ts, excluded.last_ts),
+            timezone = ?2,
+            attrs_json = ?3,
+            provider = COALESCE(?4, session_token_daily.provider, excluded.provider),
+            request_count = session_token_daily.request_count + excluded.request_count,
+            input_tokens = session_token_daily.input_tokens + excluded.input_tokens,
+            output_tokens = session_token_daily.output_tokens + excluded.output_tokens,
+            cache_read_tokens = session_token_daily.cache_read_tokens + excluded.cache_read_tokens,
+            cache_write_tokens = session_token_daily.cache_write_tokens + excluded.cache_write_tokens
+        "#,
+        params![
+            target_bucket_key,
+            target_timezone,
+            target_attrs_json,
+            target_provider,
+            source_bucket_key,
+            crate::uuid::generate_v4(),
+        ],
+    )?;
+    tx.execute(
+        "UPDATE session_token_daily \
+         SET supersedes_source_keys_json = ?1, \
+             supersedes_snapshot_instance_ids_json = ?2 \
+         WHERE bucket_key = ?3",
+        params![
+            supersedes_source_keys_json,
+            supersedes_snapshot_instance_ids_json,
+            target_bucket_key,
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM session_token_daily WHERE bucket_key = ?1",
+        params![source_bucket_key],
+    )?;
+    Ok(true)
+}
+
+fn parse_token_snapshot_aliases(raw: Option<&str>) -> Result<BTreeSet<String>, GitAiError> {
+    let aliases = raw
+        .filter(|raw| !raw.trim().is_empty())
+        .map(serde_json::from_str::<Vec<String>>)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(aliases
+        .into_iter()
+        .filter_map(|alias| compact_non_empty(&alias).map(str::to_string))
+        .collect())
+}
+
+fn refresh_daily_token_outbox(
+    tx: &rusqlite::Transaction<'_>,
+    bucket_key: &str,
+) -> Result<i64, GitAiError> {
+    let snapshot = tx.query_row(
+        r#"
+        SELECT date_key, timezone, machine_id, last_ts, attrs_json, provider, request_count,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+               outbox_metric_id, snapshot_instance_id, supersedes_source_keys_json,
+               supersedes_snapshot_instance_ids_json
+        FROM session_token_daily WHERE bucket_key = ?1
+        "#,
+        params![bucket_key],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+            ))
+        },
+    )?;
+    let (
+        date_key,
+        timezone,
+        machine_id,
+        last_ts,
+        snapshot_attrs_json,
+        provider,
+        request_count,
+        input,
+        output,
+        cache_read,
+        cache_write,
+        outbox_metric_id,
+        snapshot_instance_id,
+        supersedes_source_keys_json,
+        supersedes_snapshot_instance_ids_json,
+    ) = snapshot;
+    let snapshot_attrs: SparseArray = serde_json::from_str(&snapshot_attrs_json)?;
+    let supersedes_source_keys = parse_token_snapshot_aliases(Some(&supersedes_source_keys_json))?
+        .into_iter()
+        .collect();
+    let supersedes_snapshot_instance_ids =
+        parse_token_snapshot_aliases(Some(&supersedes_snapshot_instance_ids_json))?
+            .into_iter()
+            .collect();
+    let values = SessionTokenUsageValues::new(
+        bucket_key,
+        input.max(0) as u64,
+        output.max(0) as u64,
+        cache_read.max(0) as u64,
+        cache_write.max(0) as u64,
+        request_count.max(0).min(u32::MAX as i64) as u32,
+        provider,
+        date_key,
+        timezone,
+        machine_id,
+        supersedes_source_keys,
+        snapshot_instance_id,
+        supersedes_snapshot_instance_ids,
+    );
+    let event = MetricEvent::from_values_with_timestamp(
+        values,
+        snapshot_attrs,
+        Some(last_ts.max(0).min(u32::MAX as i64) as u32),
+    );
+    let event_json = serde_json::to_string(&event)?;
+    let metadata = extract_metric_event_metadata(&event_json)
+        .ok_or_else(|| GitAiError::Generic("invalid compact metric metadata".to_string()))?;
+    let updated = if let Some(outbox_id) = outbox_metric_id {
+        tx.execute(
+            r#"
+            UPDATE metrics SET
+                event_json = ?1, event_ts = ?2, event_kind = ?3,
+                trace_id = ?4, session_id = ?5, parent_session_id = ?6,
+                tool = ?7, external_session_id = ?8,
+                external_parent_session_id = ?9, external_event_id = ?10,
+                external_parent_event_id = ?11, external_tool_use_id = ?12,
+                attempts = 0, last_sync_error = NULL, last_sync_at = NULL,
+                next_retry_at = 0
+            WHERE id = ?13 AND delivered_ts IS NULL
+              AND processing_started_at IS NULL AND event_kind = ?3
+            "#,
+            params![
+                event_json,
+                i64::from(metadata.event_ts),
+                i64::from(metadata.event_kind),
+                metadata.trace_id.as_deref(),
+                metadata.session_id.as_deref(),
+                metadata.parent_session_id.as_deref(),
+                metadata.tool.as_deref(),
+                metadata.external_session_id.as_deref(),
+                metadata.external_parent_session_id.as_deref(),
+                metadata.external_event_id.as_deref(),
+                metadata.external_parent_event_id.as_deref(),
+                metadata.external_tool_use_id.as_deref(),
+                outbox_id,
+            ],
+        )?
+    } else {
+        0
+    };
+    if updated > 0 {
+        return Ok(outbox_metric_id.expect("updated compact outbox row has an id"));
+    }
+
+    tx.execute(
+        r#"
+        INSERT INTO metrics (
+            event_json, delivered_ts, event_ts, event_kind, trace_id,
+            session_id, parent_session_id, tool, external_session_id,
+            external_parent_session_id, external_event_id,
+            external_parent_event_id, external_tool_use_id
+        ) VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+        params![
+            event_json,
+            i64::from(metadata.event_ts),
+            i64::from(metadata.event_kind),
+            metadata.trace_id.as_deref(),
+            metadata.session_id.as_deref(),
+            metadata.parent_session_id.as_deref(),
+            metadata.tool.as_deref(),
+            metadata.external_session_id.as_deref(),
+            metadata.external_parent_session_id.as_deref(),
+            metadata.external_event_id.as_deref(),
+            metadata.external_parent_event_id.as_deref(),
+            metadata.external_tool_use_id.as_deref(),
+        ],
+    )?;
+    let metric_id = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE session_token_daily SET outbox_metric_id = ?1 WHERE bucket_key = ?2",
+        params![metric_id, bucket_key],
+    )?;
+    Ok(metric_id)
+}
+
+fn u64_to_sqlite(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn compact_repo_matches(repo_url: Option<&str>, repo_filter: Option<&str>) -> bool {
+    match repo_filter {
+        None => true,
+        Some("") => repo_url.is_none(),
+        Some(filter) => repo_url.is_some_and(|url| url.contains(filter)),
+    }
+}
+
+fn daily_token_bucket(
+    timestamp: u32,
+    attrs: &SparseArray,
+    provider: Option<&str>,
+    machine_id: &str,
+    source_key: &str,
+) -> Result<(String, String, String, String, SparseArray), GitAiError> {
+    let local_time = Local
+        .timestamp_opt(i64::from(timestamp), 0)
+        .single()
+        .unwrap_or_else(Local::now);
+    let date_key = local_time.format("%Y-%m-%d").to_string();
+    let timezone = local_time.offset().to_string();
+
+    let mut snapshot_attrs = attrs.clone();
+    for position in [
+        attr_pos::EXTERNAL_SESSION_ID,
+        attr_pos::SESSION_ID,
+        attr_pos::TRACE_ID,
+        attr_pos::PARENT_SESSION_ID,
+        attr_pos::EXTERNAL_PARENT_SESSION_ID,
+    ] {
+        snapshot_attrs.remove(&position.to_string());
+    }
+    canonicalize_snapshot_repo_url(&mut snapshot_attrs);
+
+    // This identity must stay in lock-step with fact_ai_token_daily's unique
+    // business dimensions. Including branch, organization or arbitrary custom
+    // attributes here would split one server row into multiple client snapshots;
+    // the server's freshness upsert would then keep only the largest split and
+    // silently under-count the day.
+    let revision = if source_key.starts_with("ts2:") {
+        "td4"
+    } else {
+        "td3"
+    };
+    let user_email =
+        compact_identity_email(&snapshot_attrs).unwrap_or_else(|| "unknown".to_string());
+    let bucket_key = daily_token_bucket_key(
+        revision,
+        &date_key,
+        &user_email,
+        machine_id,
+        &snapshot_attrs,
+        provider,
+    );
+    let anonymous_bucket_key = daily_token_bucket_key(
+        revision,
+        &date_key,
+        "unknown",
+        machine_id,
+        &snapshot_attrs,
+        provider,
+    );
+    Ok((
+        bucket_key,
+        anonymous_bucket_key,
+        date_key,
+        timezone,
+        snapshot_attrs,
+    ))
+}
+
+fn daily_token_bucket_key(
+    revision: &str,
+    date_key: &str,
+    user_email: &str,
+    machine_id: &str,
+    attrs: &SparseArray,
+    provider: Option<&str>,
+) -> String {
+    let custom_attrs = compact_custom_attributes(attrs);
+    let project_key = first_compact_custom_attr(&custom_attrs, &["project_key", "projectKey"])
+        .or_else(|| {
+            sparse_get_string(attrs, attr_pos::REPO_URL)
+                .flatten()
+                .and_then(|repo_url| crate::repo_url::normalize_repo_url(&repo_url).ok())
+        })
+        .unwrap_or_else(|| "git-ai-unknown".to_string());
+    let ide = first_compact_custom_attr(
+        &custom_attrs,
+        &["ide", "platform", "kilo_platform", "client", "kilo_client"],
+    )
+    .unwrap_or_else(|| "unknown".to_string());
+    let coding_tool =
+        compact_sparse_string(attrs, attr_pos::TOOL).unwrap_or_else(|| "unknown".to_string());
+    let model_provider = provider
+        .and_then(compact_non_empty)
+        .map(str::to_string)
+        .or_else(|| first_compact_custom_attr(&custom_attrs, &["model_provider", "modelProvider"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    let model =
+        compact_sparse_string(attrs, attr_pos::MODEL).unwrap_or_else(|| "unknown".to_string());
+
+    let mut hasher = Sha256::new();
+    for part in [
+        date_key,
+        user_email,
+        machine_id,
+        project_key.as_str(),
+        ide.as_str(),
+        coding_tool.as_str(),
+        model_provider.as_str(),
+        model.as_str(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{}:{:x}", revision, hasher.finalize())
+}
+
+fn latest_daily_token_bucket_revision(bucket_key: &str) -> &str {
+    match bucket_key.split_once(':').map(|(revision, _)| revision) {
+        Some("td2" | "td4") => "td4",
+        _ => "td3",
+    }
+}
+
+fn legacy_daily_token_bucket_revision(bucket_key: &str) -> bool {
+    matches!(
+        bucket_key.split_once(':').map(|(revision, _)| revision),
+        Some("td1" | "td2")
+    )
+}
+
+fn has_explicit_project_key(attrs: &SparseArray) -> bool {
+    first_compact_custom_attr(
+        &compact_custom_attributes(attrs),
+        &["project_key", "projectKey"],
+    )
+    .is_some()
+}
+
+fn mark_legacy_project_identity_ambiguous(
+    attrs: &mut SparseArray,
+    legacy_bucket_key: &str,
+) -> Result<(), GitAiError> {
+    attrs.remove(&attr_pos::REPO_URL.to_string());
+    let mut custom_attrs = compact_custom_attributes(attrs);
+    let (unbound_project_key, identity_sha256) = legacy_unbound_project_identity(legacy_bucket_key);
+    custom_attrs.insert(
+        "legacy_project_identity_sha256".to_string(),
+        Value::String(identity_sha256),
+    );
+    custom_attrs.insert(
+        "project_identity_status".to_string(),
+        Value::String("legacy_basename_ambiguous".to_string()),
+    );
+    custom_attrs.insert(
+        "project_key".to_string(),
+        Value::String(unbound_project_key),
+    );
+    custom_attrs.insert(
+        "project_name".to_string(),
+        Value::String("历史项目归属不可判定".to_string()),
+    );
+    attrs.insert(
+        attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+        Value::String(serde_json::to_string(&custom_attrs)?),
+    );
+    Ok(())
+}
+
+fn legacy_unbound_project_identity(legacy_bucket_key: &str) -> (String, String) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"git-ai-unbound-legacy-project\0");
+    hasher.update(legacy_bucket_key.as_bytes());
+    let identity_sha256 = format!("{:x}", hasher.finalize());
+    let project_key = format!("git-ai-unbound:{}", &identity_sha256[..48]);
+    debug_assert!(project_key.len() <= 64);
+    (project_key, identity_sha256)
+}
+
+fn canonicalize_snapshot_repo_url(attrs: &mut SparseArray) {
+    let repo_url_key = attr_pos::REPO_URL.to_string();
+    let Some(raw_repo_url) = sparse_get_string(attrs, attr_pos::REPO_URL).flatten() else {
+        return;
+    };
+    match crate::repo_url::normalize_repo_url(&raw_repo_url) {
+        Ok(repo_url) => {
+            attrs.insert(repo_url_key, Value::String(repo_url));
+        }
+        Err(_) => {
+            // Never retain an unparseable remote in the compact daily payload:
+            // it may contain credentials, and it cannot bind a server project.
+            attrs.remove(&repo_url_key);
+        }
+    }
+}
+
+fn apply_reporting_attributes(
+    attrs: &mut SparseArray,
+    reporting_attributes: &HashMap<String, String>,
+) -> Result<(), GitAiError> {
+    let mut custom_attrs = compact_custom_attributes(attrs);
+    for key in [
+        "department_name",
+        "office_name",
+        "team_name",
+        "user_name",
+        "user_email",
+    ] {
+        let Some(value) = reporting_attributes.get(key).and_then(|value| {
+            if key == "user_email" {
+                compact_valid_email(value)
+            } else {
+                compact_non_empty(value).map(str::to_string)
+            }
+        }) else {
+            continue;
+        };
+        custom_attrs.insert(key.to_string(), Value::String(value));
+    }
+    attrs.insert(
+        attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+        Value::String(serde_json::to_string(&custom_attrs)?),
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+fn token_snapshot_machine_id() -> String {
+    "git-ai-test-install".to_string()
+}
+
+#[cfg(not(test))]
+fn token_snapshot_machine_id() -> String {
+    crate::config::get_or_create_distinct_id()
+}
+
+fn compact_custom_attributes(attrs: &SparseArray) -> Map<String, Value> {
+    let Some(raw) = attrs.get(&attr_pos::CUSTOM_ATTRIBUTES.to_string()) else {
+        return Map::new();
+    };
+    match raw {
+        Value::Object(values) => values.clone(),
+        Value::String(json) => serde_json::from_str::<Value>(json)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        _ => Map::new(),
+    }
+}
+
+fn first_compact_custom_attr(attrs: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = attrs.get(*key)?;
+        match value {
+            Value::String(value) => compact_non_empty(value).map(str::to_string),
+            Value::Number(_) | Value::Bool(_) => {
+                compact_non_empty(&value.to_string()).map(str::to_string)
+            }
+            _ => None,
+        }
+    })
+}
+
+fn compact_sparse_string(attrs: &SparseArray, position: usize) -> Option<String> {
+    sparse_get_string(attrs, position)
+        .flatten()
+        .and_then(|value| compact_non_empty(&value).map(str::to_string))
+}
+
+fn compact_non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn compact_identity_email(attrs: &SparseArray) -> Option<String> {
+    let custom_attrs = compact_custom_attributes(attrs);
+    first_compact_custom_attr(&custom_attrs, &["user_email", "userEmail", "email"])
+        .or_else(|| {
+            sparse_get_string(attrs, attr_pos::AUTHOR)
+                .flatten()
+                .and_then(|author| compact_author_email(&author))
+        })
+        .and_then(|email| compact_valid_email(&email))
+}
+
+fn compact_valid_email(email: &str) -> Option<String> {
+    let email = compact_non_empty(email)?.to_lowercase();
+    let (local, domain) = email.split_once('@')?;
+    (!local.is_empty()
+        && !local.chars().any(char::is_whitespace)
+        && domain.contains('.')
+        && !domain.ends_with('.')
+        && !domain.chars().any(char::is_whitespace))
+    .then_some(email)
+}
+
+fn compact_author_email(author: &str) -> Option<String> {
+    let author = compact_non_empty(author)?;
+    let open = author.rfind('<')?;
+    let email = author.get(open + 1..)?.strip_suffix('>')?;
+    compact_non_empty(email).map(str::to_string)
+}
+
+fn recovery_event_key(
+    session_id: &str,
+    event_ts: u32,
+    external_tool_use_id: Option<&str>,
+    tool: &str,
+    model: Option<&str>,
+    repo_url: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    let event_ts = event_ts.to_string();
+    let marker_identity = external_tool_use_id
+        .map(|id| format!("tool:{id}"))
+        .unwrap_or_else(|| "second".to_string());
+    for part in [
+        session_id,
+        event_ts.as_str(),
+        marker_identity.as_str(),
+        tool,
+        model.unwrap_or_default(),
+        repo_url.unwrap_or_default(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("sr1:{:x}", hasher.finalize())
+}
+
 fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1399,6 +3249,10 @@ fn metric_row_is_older_than_cutoff(
     delivered_ts: Option<i64>,
     cutoff: u64,
 ) -> bool {
+    if delivered_ts.is_none() {
+        return false;
+    }
+
     if let Some(ts) = event_ts
         && ts >= 0
     {
@@ -1410,6 +3264,61 @@ fn metric_row_is_older_than_cutoff(
     }
 
     delivered_ts.is_some_and(|ts| ts >= 0 && (ts as u64) < cutoff)
+}
+
+fn compact_legacy_content_event(event_json: &str) -> Option<SessionObservation> {
+    let event: MetricEvent = serde_json::from_str(event_json).ok()?;
+    if event.event_id != MetricEventId::SessionEvent as u16
+        && event.event_id != MetricEventId::OtelTrace as u16
+    {
+        return None;
+    }
+    let raw = event.values.get("0")?.clone();
+    let external_event_id = event
+        .values
+        .get("1")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let external_parent_event_id = event
+        .values
+        .get("2")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let external_tool_use_id = event
+        .values
+        .get("3")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let is_codex_fork = sparse_get_string(&event.attrs, attr_pos::TOOL)
+        .flatten()
+        .is_some_and(|tool| tool == "codex")
+        && [
+            attr_pos::PARENT_SESSION_ID,
+            attr_pos::EXTERNAL_PARENT_SESSION_ID,
+        ]
+        .into_iter()
+        .any(|position| {
+            sparse_get_string(&event.attrs, position)
+                .flatten()
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+    let mut observation = compact_session_event(
+        &raw,
+        event.timestamp,
+        event.attrs,
+        external_event_id,
+        external_parent_event_id,
+        external_tool_use_id,
+    );
+    if is_codex_fork {
+        // Legacy content events do not preserve the byte boundary where a
+        // Codex fork starts. Projecting their inherited cumulative counter
+        // would poison the v2 source with the parent's full history. Keep the
+        // activity/recovery projection, then let the reset stream watermark
+        // rebuild this token source from the transcript boundary.
+        observation.token = None;
+    }
+    Some(observation)
 }
 
 fn extract_metric_event_ts(event_json: &str) -> Option<u32> {
@@ -1506,7 +3415,12 @@ fn event_specific_external_tool_use_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::pos_encoded::PosEncoded;
+    use crate::metrics::session_compaction::{SessionObservation, compact_session_event};
+    use crate::metrics::{EventAttributes, MetricsBatch};
     use rusqlite::StatementStatus;
+    use serde_json::json;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     fn create_test_db() -> (MetricsDatabase, TempDir) {
@@ -1551,6 +3465,31 @@ mod tests {
             .prepare("SELECT event_json FROM metrics WHERE delivered_ts IS NULL ORDER BY id DESC")
             .unwrap();
         let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    }
+
+    fn pending_metric_events(db: &MetricsDatabase) -> Vec<(i64, MetricEvent)> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT id, event_json FROM metrics \
+                 WHERE delivered_ts IS NULL AND event_kind = ?1 ORDER BY id ASC",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![MetricEventId::SessionTokenUsage as i64], |row| {
+                let id = row.get::<_, i64>(0)?;
+                let event_json = row.get::<_, String>(1)?;
+                let event = serde_json::from_str(&event_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        event_json.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok((id, event))
+            })
+            .unwrap();
         rows.collect::<Result<Vec<_>, _>>().unwrap()
     }
 
@@ -1648,6 +3587,1348 @@ mod tests {
         )
     }
 
+    fn compact_observation(ts: u32, output_tokens: u64) -> SessionObservation {
+        let raw = json!({
+            "message": {
+                "id": "msg-compact-1",
+                "role": "assistant",
+                "model": "claude-sonnet-4",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": output_tokens,
+                    "cache_read_input_tokens": 20,
+                    "cache_creation_input_tokens": 3
+                },
+                "content": [{"type": "text", "text": "private transcript content"}]
+            }
+        });
+        let attrs = EventAttributes::with_version("test")
+            .repo_url("github.com/acme/repo")
+            .tool("claude")
+            .session_id("session-compact-1")
+            .external_session_id("external-session-compact-1")
+            .trace_id(format!("trace-{ts}"))
+            .to_sparse();
+        compact_session_event(
+            &raw,
+            ts,
+            attrs,
+            Some("external-event-1".to_string()),
+            Some("external-parent-1".to_string()),
+            Some("external-tool-1".to_string()),
+        )
+    }
+
+    fn codex_cumulative_observation(
+        ts: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        baseline_only: bool,
+    ) -> SessionObservation {
+        let raw = json!({
+            "_git_ai_token_baseline_only": baseline_only,
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cached_input_tokens": cache_read_tokens
+                    }
+                }
+            }
+        });
+        let attrs = EventAttributes::with_version("test")
+            .repo_url("github.com/acme/repo")
+            .author("alice@example.com")
+            .tool("codex")
+            .session_id("session-codex-child")
+            .external_session_id("external-codex-child")
+            .trace_id(format!("trace-{ts}"))
+            .custom_attributes(r#"{"project_key":"repo","ide":"codex"}"#)
+            .to_sparse();
+        compact_session_event(&raw, ts, attrs, None, None, None)
+    }
+
+    fn with_reporting_email(
+        mut observation: SessionObservation,
+        user_email: &str,
+    ) -> SessionObservation {
+        observation.attrs.insert(
+            attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+            Value::String(
+                json!({
+                    "project_key": "repo",
+                    "ide": "codex",
+                    "user_email": user_email,
+                })
+                .to_string(),
+            ),
+        );
+        observation
+    }
+
+    fn reporting_attributes(user_email: &str) -> HashMap<String, String> {
+        [
+            ("department_name", "云计算研发部"),
+            ("office_name", "研发四处"),
+            ("team_name", "研发一组"),
+            ("user_name", "Alice"),
+            ("user_email", user_email),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn test_codex_fork_baseline_seeds_source_without_daily_usage() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+
+        let baseline = codex_cumulative_observation(first_ts, 200, 20, 80, true);
+        assert!(
+            db.insert_session_observations(&[baseline])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM session_token_sources", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM session_token_daily", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let child = codex_cumulative_observation(first_ts + 1, 230, 25, 90, false);
+        let metric_ids = db.insert_session_observations(&[child]).unwrap();
+        assert_eq!(metric_ids.len(), 1);
+        let event = serde_json::from_str::<MetricEvent>(&pending_event_jsons(&db)[0]).unwrap();
+        assert_eq!(event.values.get("1").and_then(Value::as_u64), Some(30));
+        assert_eq!(event.values.get("2").and_then(Value::as_u64), Some(5));
+        assert_eq!(event.values.get("3").and_then(Value::as_u64), Some(10));
+        assert_eq!(event.values.get("5").and_then(Value::as_u64), Some(1));
+        assert!(
+            event
+                .values
+                .get("0")
+                .and_then(Value::as_str)
+                .is_some_and(|key| key.starts_with("td4:"))
+        );
+        let history = db.get_compact_token_history(0, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            (history[0].input, history[0].output, history[0].cache_read),
+            (30, 5, 10)
+        );
+    }
+
+    #[test]
+    fn test_corrected_codex_source_hides_legacy_source_from_local_history() {
+        let (mut db, _temp_dir) = create_test_db();
+        let event_ts = seconds_ago(60);
+
+        db.conn
+            .execute(
+                r#"
+                INSERT INTO session_token_sources (
+                    source_key, session_id, first_ts, last_ts, tool, model,
+                    input_tokens, output_tokens, cumulative_source
+                ) VALUES ('ts1:legacy', 'session-codex-child', ?1, ?1, 'codex', 'gpt-5',
+                          10000, 1000, 1)
+                "#,
+                params![i64::from(event_ts)],
+            )
+            .unwrap();
+        db.insert_session_observations(&[
+            codex_cumulative_observation(event_ts, 200, 20, 80, true),
+            codex_cumulative_observation(event_ts + 1, 230, 25, 90, false),
+        ])
+        .unwrap();
+
+        let history = db.get_compact_token_history(0, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].source_key.starts_with("ts2:"));
+        assert_eq!((history[0].input, history[0].output), (30, 5));
+    }
+
+    #[test]
+    fn test_legacy_codex_fork_content_waits_for_boundary_aware_stream_replay() {
+        let event = MetricEvent {
+            timestamp: seconds_ago(60),
+            event_id: MetricEventId::SessionEvent as u16,
+            values: [
+                (
+                    "0".to_string(),
+                    json!({
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": 10000,
+                                    "output_tokens": 1000
+                                }
+                            }
+                        }
+                    }),
+                ),
+                ("1".to_string(), json!("event-1")),
+            ]
+            .into_iter()
+            .collect(),
+            attrs: EventAttributes::with_version("test")
+                .tool("codex")
+                .session_id("session-codex-child")
+                .parent_session_id("session-codex-parent")
+                .external_session_id("external-codex-child")
+                .external_parent_session_id("external-codex-parent")
+                .to_sparse(),
+        };
+
+        let observation =
+            compact_legacy_content_event(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(observation.attrs, event.attrs);
+        assert!(
+            observation.token.is_none(),
+            "legacy fork totals must not seed the corrected v2 source"
+        );
+    }
+
+    fn recovery_observation(
+        ts: u32,
+        session_id: &str,
+        external_session_id: Option<&str>,
+        tool: &str,
+        repo_url: Option<&str>,
+    ) -> SessionObservation {
+        let mut attrs = EventAttributes::with_version("test")
+            .tool(tool)
+            .model("gpt-5")
+            .session_id(session_id)
+            .trace_id(format!("trace-{session_id}"));
+        if let Some(external_session_id) = external_session_id {
+            attrs = attrs.external_session_id(external_session_id);
+        }
+        if let Some(repo_url) = repo_url {
+            attrs = attrs.repo_url(repo_url);
+        }
+        SessionObservation {
+            timestamp: ts,
+            attrs: attrs.to_sparse(),
+            external_event_id: Some(format!("event-{session_id}")),
+            external_parent_event_id: None,
+            external_tool_use_id: Some(format!("tool-use-{session_id}")),
+            token: None,
+        }
+    }
+
+    #[test]
+    fn test_session_observations_keep_compact_state_and_coalesce_pending_daily_snapshot() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let final_ts = first_ts + 1;
+
+        let first_ids = db
+            .insert_session_observations(&[compact_observation(first_ts, 8)])
+            .unwrap();
+        assert_eq!(first_ids.len(), 1);
+
+        // Replaying an already persisted stream batch must be idempotent.
+        let replay_ids = db
+            .insert_session_observations(&[compact_observation(first_ts, 8)])
+            .unwrap();
+        assert!(replay_ids.is_empty());
+
+        let final_ids = db
+            .insert_session_observations(&[compact_observation(final_ts, 41)])
+            .unwrap();
+        assert_eq!(final_ids.len(), 1);
+        assert_eq!(final_ids[0], first_ids[0]);
+
+        let event_jsons = pending_event_jsons(&db);
+        assert_eq!(event_jsons.len(), 1);
+        assert!(
+            event_jsons
+                .iter()
+                .all(|event| !event.contains("private transcript content"))
+        );
+        assert!(
+            event_jsons.iter().all(|event| event.len() < 1_024),
+            "compact upload event unexpectedly exceeded 1 KiB"
+        );
+        let output_snapshots = event_jsons
+            .iter()
+            .map(|event| serde_json::from_str::<MetricEvent>(event).unwrap())
+            .map(|event| {
+                assert_eq!(event.event_id, MetricEventId::SessionTokenUsage as u16);
+                event.values.get("2").and_then(Value::as_u64).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_snapshots, vec![41]);
+
+        let (session_rows, recovery_rows, token_rows, daily_rows): (i64, i64, i64, i64) = (
+            db.conn
+                .query_row("SELECT COUNT(*) FROM session_activity", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            db.conn
+                .query_row("SELECT COUNT(*) FROM session_recovery_events", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            db.conn
+                .query_row("SELECT COUNT(*) FROM session_token_sources", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            db.conn
+                .query_row("SELECT COUNT(*) FROM session_token_daily", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+        );
+        assert_eq!(
+            (session_rows, recovery_rows, token_rows, daily_rows),
+            (1, 2, 1, 1)
+        );
+        let (input, output, cache_read, cache_write): (i64, i64, i64, i64) = db.conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens FROM session_token_sources",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((input, output, cache_read, cache_write), (10, 41, 20, 3));
+        let (daily_input, daily_output, daily_requests): (i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, request_count FROM session_token_daily",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((daily_input, daily_output, daily_requests), (10, 41, 1));
+    }
+
+    #[test]
+    fn test_streaming_token_copies_in_one_batch_emit_one_daily_snapshot() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let metric_ids = db
+            .insert_session_observations(&[
+                compact_observation(first_ts, 8),
+                compact_observation(first_ts + 1, 41),
+            ])
+            .unwrap();
+
+        assert_eq!(metric_ids.len(), 1);
+        let event_jsons = pending_event_jsons(&db);
+        assert_eq!(event_jsons.len(), 1);
+        let event = serde_json::from_str::<MetricEvent>(&event_jsons[0]).unwrap();
+        assert_eq!(event.event_id, MetricEventId::SessionTokenUsage as u16);
+        assert_eq!(event.values.get("1").and_then(Value::as_u64), Some(10));
+        assert_eq!(event.values.get("2").and_then(Value::as_u64), Some(41));
+        assert_eq!(event.values.get("3").and_then(Value::as_u64), Some(20));
+        assert_eq!(event.values.get("4").and_then(Value::as_u64), Some(3));
+        assert_eq!(event.values.get("5").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            event.values.get("10").and_then(Value::as_str),
+            Some("git-ai-test-install")
+        );
+    }
+
+    #[test]
+    fn test_daily_snapshot_coalesces_sessions_with_the_same_business_dimensions() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let first = compact_observation(first_ts, 8);
+        let mut second = compact_observation(first_ts + 1, 8);
+        second.attrs.insert(
+            attr_pos::SESSION_ID.to_string(),
+            Value::String("session-compact-2".to_string()),
+        );
+        second.attrs.insert(
+            attr_pos::EXTERNAL_SESSION_ID.to_string(),
+            Value::String("external-session-compact-2".to_string()),
+        );
+        second.token.as_mut().unwrap().source_key = "ts1:second-session".to_string();
+
+        db.insert_session_observations(&[first, second]).unwrap();
+
+        let event_jsons = pending_event_jsons(&db);
+        assert_eq!(event_jsons.len(), 1);
+        let event = serde_json::from_str::<MetricEvent>(&event_jsons[0]).unwrap();
+        assert_eq!(event.values.get("1").and_then(Value::as_u64), Some(20));
+        assert_eq!(event.values.get("2").and_then(Value::as_u64), Some(16));
+        assert_eq!(event.values.get("5").and_then(Value::as_u64), Some(2));
+        assert!(
+            sparse_get_string(&event.attrs, attr_pos::SESSION_ID)
+                .flatten()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_daily_snapshot_bucket_matches_server_unique_dimensions() {
+        let attrs = |branch: &str, custom_attributes: &str| {
+            EventAttributes::with_version("test")
+                .repo_url("git@github.com:acme/repo.git")
+                .author("Alice <Alice@Example.COM>")
+                .branch(branch)
+                .tool("claude")
+                .model("claude-sonnet-4")
+                .session_id(format!("session-{branch}"))
+                .custom_attributes(custom_attributes)
+                .to_sparse()
+        };
+        let timestamp = seconds_ago(60);
+        let base = attrs(
+            "main",
+            r#"{"project_key":"repo","ide":"vscode","organization_id":"org-a"}"#,
+        );
+        let irrelevant_changes = attrs(
+            "feature/new-ui",
+            r#"{"project_key":"repo","ide":"vscode","organization_id":"org-b","display_name":"Alice B"}"#,
+        );
+        let different_ide = attrs(
+            "main",
+            r#"{"project_key":"repo","ide":"intellij","organization_id":"org-a"}"#,
+        );
+        let different_project = attrs(
+            "main",
+            r#"{"project_key":"another-repo","ide":"vscode","organization_id":"org-a"}"#,
+        );
+
+        let base_key =
+            daily_token_bucket(timestamp, &base, Some("anthropic"), "install-1", "ts1:test")
+                .unwrap()
+                .0;
+        assert_eq!(
+            base_key,
+            daily_token_bucket(
+                timestamp,
+                &irrelevant_changes,
+                Some("anthropic"),
+                "install-1",
+                "ts1:test",
+            )
+            .unwrap()
+            .0,
+            "branch and organization are descriptive fields, not daily fact dimensions"
+        );
+        assert_ne!(
+            base_key,
+            daily_token_bucket(
+                timestamp,
+                &different_ide,
+                Some("anthropic"),
+                "install-1",
+                "ts1:test",
+            )
+            .unwrap()
+            .0
+        );
+        assert_ne!(
+            base_key,
+            daily_token_bucket(
+                timestamp,
+                &different_project,
+                Some("anthropic"),
+                "install-1",
+                "ts1:test",
+            )
+            .unwrap()
+            .0
+        );
+        assert_ne!(
+            base_key,
+            daily_token_bucket(timestamp, &base, Some("anthropic"), "install-2", "ts1:test",)
+                .unwrap()
+                .0,
+            "separate installations must not overwrite each other's cumulative snapshots"
+        );
+    }
+
+    #[test]
+    fn test_daily_snapshot_uses_credential_free_canonical_remote_identity() {
+        let attrs = |repo_url: Option<&str>| {
+            let mut attrs = EventAttributes::with_version("test")
+                .author("Alice <alice@example.com>")
+                .tool("claude")
+                .model("claude-sonnet-4")
+                .custom_attributes(r#"{"ide":"vscode"}"#);
+            if let Some(repo_url) = repo_url {
+                attrs = attrs.repo_url(repo_url);
+            }
+            attrs.to_sparse()
+        };
+        let timestamp = seconds_ago(60);
+        let bucket = |repo_url: Option<&str>| {
+            daily_token_bucket(
+                timestamp,
+                &attrs(repo_url),
+                Some("anthropic"),
+                "install-1",
+                "ts1:test",
+            )
+            .unwrap()
+        };
+
+        let org_a_ssh = bucket(Some("git@github.com:org-a/api.git"));
+        let org_a_https_with_secret = bucket(Some("https://oauth:secret@GitHub.COM/org-a/api.GIT"));
+        let org_a_https_with_rotated_secret =
+            bucket(Some("https://oauth:rotated@github.com/org-a/api.git"));
+        let org_b_same_basename = bucket(Some("https://github.com/org-b/api"));
+        assert!(org_a_ssh.0.starts_with("td3:"));
+        assert_eq!(org_a_ssh.0, org_a_https_with_secret.0);
+        assert_eq!(org_a_https_with_secret.0, org_a_https_with_rotated_secret.0);
+        assert_ne!(org_a_ssh.0, org_b_same_basename.0);
+        assert_eq!(
+            sparse_get_string(&org_a_https_with_secret.4, attr_pos::REPO_URL).flatten(),
+            Some("https://github.com/org-a/api".to_string())
+        );
+
+        let gerrit_ssh = bucket(Some(
+            "ssh://git@review.example.com:29418/a/platform/api.git",
+        ));
+        let gerrit_https = bucket(Some("https://review.example.com:29418/platform/api"));
+        let other_gerrit_port = bucket(Some(
+            "ssh://git@review.example.com:29419/a/platform/api.git",
+        ));
+        assert_eq!(gerrit_ssh.0, gerrit_https.0);
+        assert_ne!(gerrit_ssh.0, other_gerrit_port.0);
+        assert_eq!(
+            sparse_get_string(&gerrit_ssh.4, attr_pos::REPO_URL).flatten(),
+            Some("https://review.example.com:29418/platform/api".to_string())
+        );
+
+        let no_remote = bucket(None);
+        assert!(
+            sparse_get_string(&no_remote.4, attr_pos::REPO_URL)
+                .flatten()
+                .is_none(),
+            "without a remote the compact fact remains unbound to a project"
+        );
+    }
+
+    #[test]
+    fn test_new_daily_snapshot_does_not_mutate_an_in_flight_snapshot() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let first_id = db
+            .insert_session_observations(&[compact_observation(first_ts, 8)])
+            .unwrap()[0];
+        let claimed = db.dequeue_pending_batch(1).unwrap();
+        assert_eq!(claimed[0].id, first_id);
+
+        let successor_id = db
+            .insert_session_observations(&[compact_observation(first_ts + 1, 41)])
+            .unwrap()[0];
+        assert_ne!(successor_id, first_id);
+
+        db.mark_records_delivered(&[first_id], unix_now()).unwrap();
+        let remaining = pending_event_jsons(&db);
+        assert_eq!(remaining.len(), 1);
+        let event = serde_json::from_str::<MetricEvent>(&remaining[0]).unwrap();
+        assert_eq!(event.values.get("2").and_then(Value::as_u64), Some(41));
+    }
+
+    #[test]
+    fn test_daily_snapshot_migrates_unknown_identity_into_known_in_flight_bucket() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let first_id = db
+            .insert_session_observations(&[codex_cumulative_observation(
+                first_ts, 100, 0, 0, false,
+            )])
+            .unwrap()[0];
+        let anonymous_event =
+            serde_json::from_str::<MetricEvent>(&pending_event_jsons(&db)[0]).unwrap();
+        let anonymous_source_key = anonymous_event
+            .values
+            .get("0")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let anonymous_snapshot_instance_id = anonymous_event
+            .values
+            .get("12")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        assert_eq!(db.dequeue_pending_batch(1).unwrap()[0].id, first_id);
+
+        let known = with_reporting_email(
+            codex_cumulative_observation(first_ts + 1, 150, 0, 0, false),
+            "alice@example.com",
+        );
+        let successor_id = db.insert_session_observations(&[known]).unwrap()[0];
+        assert_ne!(
+            successor_id, first_id,
+            "an in-flight snapshot must remain immutable"
+        );
+
+        let daily_rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM session_token_daily", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            daily_rows, 1,
+            "unknown and known identity snapshots must share one cumulative bucket"
+        );
+
+        db.mark_records_delivered(&[first_id], unix_now()).unwrap();
+        let remaining = pending_event_jsons(&db);
+        assert_eq!(remaining.len(), 1);
+        let event = serde_json::from_str::<MetricEvent>(&remaining[0]).unwrap();
+        assert_eq!(event.values.get("1").and_then(Value::as_u64), Some(150));
+        assert_eq!(
+            event.values["11"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec![anonymous_source_key.as_str()]
+        );
+        assert_eq!(
+            event.values["13"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec![anonymous_snapshot_instance_id.as_str()]
+        );
+        assert_ne!(
+            event.values.get("12").and_then(Value::as_str),
+            Some(anonymous_snapshot_instance_id.as_str())
+        );
+        assert_eq!(
+            compact_custom_attributes(&event.attrs)
+                .get("user_email")
+                .and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+    }
+
+    #[test]
+    fn test_daily_snapshot_replaces_pending_unknown_bucket_with_known_total() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        db.insert_session_observations(&[codex_cumulative_observation(first_ts, 100, 0, 0, false)])
+            .unwrap();
+
+        let known = with_reporting_email(
+            codex_cumulative_observation(first_ts + 1, 150, 0, 0, false),
+            "alice@example.com",
+        );
+        db.insert_session_observations(&[known]).unwrap();
+
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM session_token_daily", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let pending = pending_event_jsons(&db);
+        assert_eq!(pending.len(), 1);
+        let event = serde_json::from_str::<MetricEvent>(&pending[0]).unwrap();
+        assert_eq!(event.values.get("1").and_then(Value::as_u64), Some(150));
+        assert_eq!(
+            compact_identity_email(&event.attrs).as_deref(),
+            Some("alice@example.com")
+        );
+    }
+
+    #[test]
+    fn test_daily_snapshot_restart_rehydrates_and_resends_without_new_tokens_idempotently() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("restart-metrics.db");
+        let first_ts = seconds_ago(60);
+        let mut db = MetricsDatabase::open_at_path(&db_path).unwrap();
+        let anonymous_id = db
+            .insert_session_observations(&[codex_cumulative_observation(
+                first_ts, 100, 0, 0, false,
+            )])
+            .unwrap()[0];
+        db.mark_records_delivered(&[anonymous_id], unix_now())
+            .unwrap();
+        drop(db);
+
+        let mut restarted = MetricsDatabase::open_at_path(&db_path).unwrap();
+        let refreshed = restarted
+            .rehydrate_unknown_daily_token_identity(&reporting_attributes("alice@example.com"))
+            .unwrap();
+        assert_eq!(refreshed.len(), 1);
+        let pending = pending_event_jsons(&restarted);
+        assert_eq!(pending.len(), 1);
+        let event = serde_json::from_str::<MetricEvent>(&pending[0]).unwrap();
+        assert_eq!(event.values.get("1").and_then(Value::as_u64), Some(100));
+        assert_eq!(
+            compact_identity_email(&event.attrs).as_deref(),
+            Some("alice@example.com")
+        );
+
+        let first_successor_id = refreshed[0];
+        drop(restarted);
+        let mut restarted_again = MetricsDatabase::open_at_path(&db_path).unwrap();
+        assert!(
+            restarted_again
+                .rehydrate_unknown_daily_token_identity(&reporting_attributes("alice@example.com",))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(pending_event_jsons(&restarted_again).len(), 1);
+        let persisted_outbox_id: i64 = restarted_again
+            .conn
+            .query_row(
+                "SELECT outbox_metric_id FROM session_token_daily",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_outbox_id, first_successor_id);
+    }
+
+    #[test]
+    fn test_daily_snapshot_rekeys_legacy_project_identity_with_exact_supersession() {
+        let (mut db, _temp_dir) = create_test_db();
+        let timestamp = seconds_ago(60);
+        let with_email_but_no_project_key = |mut observation: SessionObservation| {
+            observation.attrs.insert(
+                attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+                Value::String(
+                    json!({
+                        "ide": "codex",
+                        "user_email": "alice@example.com",
+                    })
+                    .to_string(),
+                ),
+            );
+            observation
+        };
+        let observation = with_email_but_no_project_key(compact_observation(timestamp, 8));
+        db.insert_session_observations(&[observation]).unwrap();
+        let initial_event = pending_metric_events(&db)[0].1.clone();
+        let canonical_bucket_key = initial_event.values["0"].as_str().unwrap().to_string();
+        let legacy_bucket_key = "td1:legacy-basename-project-key";
+        let legacy_instance_id = initial_event.values["12"].as_str().unwrap().to_string();
+
+        db.conn
+            .execute(
+                "UPDATE session_token_daily SET bucket_key = ?1 WHERE bucket_key = ?2",
+                params![legacy_bucket_key, canonical_bucket_key],
+            )
+            .unwrap();
+        let tx = db.conn.transaction().unwrap();
+        refresh_daily_token_outbox(&tx, legacy_bucket_key).unwrap();
+        tx.commit().unwrap();
+
+        let refreshed = db
+            .rehydrate_unknown_daily_token_identity(&HashMap::new())
+            .unwrap();
+        assert_eq!(refreshed.len(), 1);
+        let ambiguous_event = pending_metric_events(&db)[0].1.clone();
+        assert_ne!(
+            ambiguous_event.values["0"].as_str(),
+            Some(canonical_bucket_key.as_str())
+        );
+        assert!(
+            ambiguous_event.values["0"]
+                .as_str()
+                .unwrap()
+                .starts_with("td3:")
+        );
+        assert_eq!(
+            ambiguous_event.values["11"].as_array().unwrap(),
+            &[Value::String(legacy_bucket_key.to_string())]
+        );
+        assert_eq!(
+            ambiguous_event.values["13"].as_array().unwrap(),
+            &[Value::String(legacy_instance_id)]
+        );
+        assert_eq!(
+            sparse_get_string(&ambiguous_event.attrs, attr_pos::REPO_URL).flatten(),
+            None
+        );
+        assert_eq!(
+            compact_custom_attributes(&ambiguous_event.attrs)
+                .get("project_identity_status")
+                .and_then(Value::as_str),
+            Some("legacy_basename_ambiguous")
+        );
+        let ambiguous_attrs = compact_custom_attributes(&ambiguous_event.attrs);
+        let project_key = ambiguous_attrs
+            .get("project_key")
+            .and_then(Value::as_str)
+            .unwrap();
+        let identity_sha256 = ambiguous_attrs
+            .get("legacy_project_identity_sha256")
+            .and_then(Value::as_str)
+            .unwrap();
+        let expected_identity = legacy_unbound_project_identity(legacy_bucket_key);
+        assert_eq!(
+            (project_key, identity_sha256),
+            (expected_identity.0.as_str(), expected_identity.1.as_str())
+        );
+        assert!(project_key.starts_with("git-ai-unbound:"));
+        assert!(project_key.len() <= 64);
+        assert_eq!(identity_sha256.len(), 64);
+        assert_ne!(
+            legacy_unbound_project_identity("td1:another-legacy-bucket").0,
+            project_key
+        );
+        let mut undomained_hasher = Sha256::new();
+        undomained_hasher.update(legacy_bucket_key.as_bytes());
+        assert_ne!(
+            identity_sha256,
+            format!("{:x}", undomained_hasher.finalize())
+        );
+        assert_eq!(
+            ambiguous_attrs.get("project_name").and_then(Value::as_str),
+            Some("历史项目归属不可判定")
+        );
+        assert_eq!(ambiguous_event.values["1"].as_u64(), Some(10));
+        assert_eq!(ambiguous_event.values["2"].as_u64(), Some(8));
+
+        let follow_up = with_email_but_no_project_key(compact_observation(timestamp + 1, 20));
+        db.insert_session_observations(&[follow_up]).unwrap();
+        let events = pending_metric_events(&db)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        let canonical_event = events
+            .iter()
+            .find(|event| {
+                sparse_get_string(&event.attrs, attr_pos::REPO_URL).flatten()
+                    == Some("https://github.com/acme/repo".to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            canonical_event.values["0"].as_str(),
+            Some(canonical_bucket_key.as_str())
+        );
+        assert_eq!(canonical_event.values["1"].as_u64(), Some(0));
+        assert_eq!(canonical_event.values["2"].as_u64(), Some(12));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.values["1"].as_u64().unwrap())
+                .sum::<u64>(),
+            10
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.values["2"].as_u64().unwrap())
+                .sum::<u64>(),
+            20
+        );
+    }
+
+    #[test]
+    fn test_daily_snapshot_keeps_valid_email_a_to_b_as_distinct_business_buckets() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let user_a = with_reporting_email(
+            codex_cumulative_observation(first_ts, 100, 0, 0, false),
+            "alice@example.com",
+        );
+        let temporarily_unknown = codex_cumulative_observation(first_ts + 1, 120, 0, 0, false);
+        let user_b = with_reporting_email(
+            codex_cumulative_observation(first_ts + 2, 170, 0, 0, false),
+            "bob@example.com",
+        );
+        db.insert_session_observations(&[user_a]).unwrap();
+        db.insert_session_observations(&[temporarily_unknown])
+            .unwrap();
+        db.insert_session_observations(&[user_b]).unwrap();
+
+        assert!(
+            db.rehydrate_unknown_daily_token_identity(&reporting_attributes("bob@example.com"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM session_token_daily", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let mut snapshots = pending_event_jsons(&db)
+            .into_iter()
+            .map(|event| serde_json::from_str::<MetricEvent>(&event).unwrap())
+            .map(|event| {
+                (
+                    compact_identity_email(&event.attrs).unwrap(),
+                    event.values.get("1").and_then(Value::as_u64).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort();
+        assert_eq!(
+            snapshots,
+            vec![
+                ("alice@example.com".to_string(), 100),
+                ("bob@example.com".to_string(), 70),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_daily_snapshot_same_batch_assigns_transient_unknown_delta_to_latest_identity() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let user_a = with_reporting_email(
+            codex_cumulative_observation(first_ts, 100, 0, 0, false),
+            "alice@example.com",
+        );
+        let temporarily_unknown = codex_cumulative_observation(first_ts + 1, 120, 0, 0, false);
+        let user_b = with_reporting_email(
+            codex_cumulative_observation(first_ts + 2, 170, 0, 0, false),
+            "bob@example.com",
+        );
+
+        db.insert_session_observations(&[user_a, temporarily_unknown, user_b])
+            .unwrap();
+
+        let mut snapshots = pending_event_jsons(&db)
+            .into_iter()
+            .map(|event| serde_json::from_str::<MetricEvent>(&event).unwrap())
+            .map(|event| {
+                (
+                    compact_identity_email(&event.attrs).unwrap(),
+                    event.values.get("1").and_then(Value::as_u64).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort();
+        assert_eq!(
+            snapshots,
+            vec![
+                ("alice@example.com".to_string(), 100),
+                ("bob@example.com".to_string(), 70),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reused_anonymous_bucket_generations_have_exact_supersession_ids() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(90);
+
+        let anonymous_generation_one_id = db
+            .insert_session_observations(&[codex_cumulative_observation(
+                first_ts, 100, 0, 0, false,
+            )])
+            .unwrap()[0];
+        let anonymous_generation_one = pending_metric_events(&db)[0].1.clone();
+        let shared_anonymous_source_key = anonymous_generation_one.values["0"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let anonymous_instance_one = anonymous_generation_one.values["12"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            db.dequeue_pending_batch(1).unwrap()[0].id,
+            anonymous_generation_one_id
+        );
+
+        let user_a = with_reporting_email(
+            codex_cumulative_observation(first_ts + 1, 150, 0, 0, false),
+            "alice@example.com",
+        );
+        db.insert_session_observations(&[user_a]).unwrap();
+        let user_a_id = pending_metric_events(&db)
+            .into_iter()
+            .find(|(_, event)| {
+                compact_identity_email(&event.attrs).as_deref() == Some("alice@example.com")
+            })
+            .unwrap()
+            .0;
+        assert_eq!(db.dequeue_pending_batch(10).unwrap()[0].id, user_a_id);
+
+        let anonymous_generation_two_id = db
+            .insert_session_observations(&[codex_cumulative_observation(
+                first_ts + 2,
+                170,
+                0,
+                0,
+                false,
+            )])
+            .unwrap()[0];
+        let anonymous_generation_two = pending_metric_events(&db)
+            .into_iter()
+            .find(|(id, _)| *id == anonymous_generation_two_id)
+            .unwrap()
+            .1;
+        assert_eq!(
+            anonymous_generation_two.values["0"].as_str(),
+            Some(shared_anonymous_source_key.as_str())
+        );
+        let anonymous_instance_two = anonymous_generation_two.values["12"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(anonymous_instance_one, anonymous_instance_two);
+        assert_eq!(
+            db.dequeue_pending_batch(1).unwrap()[0].id,
+            anonymous_generation_two_id
+        );
+
+        let user_b = with_reporting_email(
+            codex_cumulative_observation(first_ts + 3, 220, 0, 0, false),
+            "bob@example.com",
+        );
+        db.insert_session_observations(&[user_b]).unwrap();
+
+        let identified = pending_metric_events(&db)
+            .into_iter()
+            .filter_map(|(id, event)| {
+                compact_identity_email(&event.attrs).map(|email| (email, (id, event)))
+            })
+            .collect::<HashMap<_, _>>();
+        let (_, user_a_event) = identified.get("alice@example.com").unwrap();
+        let (user_b_id, user_b_event) = identified.get("bob@example.com").unwrap();
+        assert_eq!(
+            user_a_event.values["13"].as_array().unwrap()[0].as_str(),
+            Some(anonymous_instance_one.as_str())
+        );
+        assert_eq!(
+            user_b_event.values["13"].as_array().unwrap()[0].as_str(),
+            Some(anonymous_instance_two.as_str())
+        );
+        assert_eq!(
+            user_a_event.values["11"].as_array().unwrap()[0].as_str(),
+            Some(shared_anonymous_source_key.as_str())
+        );
+        assert_eq!(
+            user_b_event.values["11"].as_array().unwrap()[0].as_str(),
+            Some(shared_anonymous_source_key.as_str())
+        );
+
+        // ACK corrections out of order. Each ACK clears only the aliases owned
+        // by that exact identified outbox generation.
+        db.mark_records_delivered(&[*user_b_id], unix_now())
+            .unwrap();
+        db.mark_records_delivered(&[user_a_id], unix_now()).unwrap();
+        let alias_rows: Vec<(String, String)> = {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "SELECT supersedes_source_keys_json, \
+                            supersedes_snapshot_instance_ids_json \
+                     FROM session_token_daily ORDER BY bucket_key",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(
+            alias_rows
+                .iter()
+                .all(|(source_keys, instances)| source_keys == "[]" && instances == "[]")
+        );
+    }
+
+    #[test]
+    fn test_identity_rekey_does_not_supersede_other_project_or_ide_bucket() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let mut project_a = compact_observation(first_ts, 8);
+        project_a.attrs.insert(
+            attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+            Value::String(r#"{"project_key":"project-a","ide":"vscode"}"#.to_string()),
+        );
+        let mut project_b = compact_observation(first_ts + 1, 8);
+        project_b.attrs.insert(
+            attr_pos::SESSION_ID.to_string(),
+            Value::String("session-project-b".to_string()),
+        );
+        project_b.attrs.insert(
+            attr_pos::EXTERNAL_SESSION_ID.to_string(),
+            Value::String("external-project-b".to_string()),
+        );
+        project_b.attrs.insert(
+            attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+            Value::String(r#"{"project_key":"project-b","ide":"intellij"}"#.to_string()),
+        );
+        project_b.token.as_mut().unwrap().source_key = "ts1:project-b".to_string();
+        db.insert_session_observations(&[project_a, project_b])
+            .unwrap();
+
+        let anonymous_events = pending_metric_events(&db);
+        assert_eq!(anonymous_events.len(), 2);
+        let project_a_event = anonymous_events
+            .iter()
+            .find(|(_, event)| {
+                compact_custom_attributes(&event.attrs)
+                    .get("project_key")
+                    .and_then(Value::as_str)
+                    == Some("project-a")
+            })
+            .unwrap()
+            .1
+            .clone();
+        let project_b_event = anonymous_events
+            .iter()
+            .find(|(_, event)| {
+                compact_custom_attributes(&event.attrs)
+                    .get("project_key")
+                    .and_then(Value::as_str)
+                    == Some("project-b")
+            })
+            .unwrap()
+            .1
+            .clone();
+
+        let mut known_a = compact_observation(first_ts + 2, 41);
+        known_a.attrs.insert(
+            attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+            Value::String(
+                r#"{"project_key":"project-a","ide":"vscode","user_email":"alice@example.com"}"#
+                    .to_string(),
+            ),
+        );
+        db.insert_session_observations(&[known_a]).unwrap();
+
+        let events = pending_metric_events(&db);
+        let corrected_a = events
+            .iter()
+            .find(|(_, event)| {
+                compact_identity_email(&event.attrs).as_deref() == Some("alice@example.com")
+            })
+            .unwrap();
+        assert_eq!(
+            corrected_a.1.values["11"].as_array().unwrap()[0].as_str(),
+            project_a_event.values["0"].as_str()
+        );
+        assert_eq!(
+            corrected_a.1.values["13"].as_array().unwrap()[0].as_str(),
+            project_a_event.values["12"].as_str()
+        );
+        assert!(
+            corrected_a.1.values["11"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|key| key.as_str() != project_b_event.values["0"].as_str())
+        );
+        assert!(
+            events.iter().any(|(_, event)| {
+                compact_identity_email(&event.attrs).is_none()
+                    && event.values["12"] == project_b_event.values["12"]
+            }),
+            "the unrelated project/IDE anonymous snapshot must remain independently pending"
+        );
+    }
+
+    #[test]
+    fn test_compact_history_clamps_sources_that_cross_the_query_boundary() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(120);
+        let since_ts = first_ts + 30;
+        let final_ts = first_ts + 60;
+        db.insert_session_observations(&[
+            compact_observation(first_ts, 8),
+            compact_observation(final_ts, 41),
+        ])
+        .unwrap();
+
+        let sessions = db.get_compact_session_history(since_ts, None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].first_ts, since_ts);
+        assert_eq!(sessions[0].last_ts, final_ts);
+
+        let tokens = db.get_compact_token_history(since_ts, None).unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].usage_ts, since_ts);
+        assert_eq!(tokens[0].output, 41);
+    }
+
+    #[test]
+    fn test_delivered_compact_token_events_are_deleted_while_history_events_remain() {
+        let (mut db, _temp_dir) = create_test_db();
+        let compact_ids = db
+            .insert_session_observations(&[compact_observation(seconds_ago(30), 8)])
+            .unwrap();
+        let history_ids = db.insert_events(&[event_json(seconds_ago(20))]).unwrap();
+
+        db.mark_records_delivered(&[compact_ids[0], history_ids[0]], unix_now())
+            .unwrap();
+
+        let compact_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM metrics WHERE event_kind = ?1",
+                params![MetricEventId::SessionTokenUsage as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compact_count, 0);
+        let retained_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM metrics", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained_count, 1);
+        assert_eq!(db.status().unwrap().delivered, 1);
+    }
+
+    #[test]
+    fn test_transient_compact_token_failures_remain_retryable_after_attempt_limit() {
+        let (mut db, _temp_dir) = create_test_db();
+        let compact_ids = db
+            .insert_session_observations(&[compact_observation(seconds_ago(30), 8)])
+            .unwrap();
+        let compact_id = compact_ids[0];
+
+        for attempt in 0..10 {
+            db.mark_records_failed(&[compact_id], "backend unavailable", attempt)
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "UPDATE metrics SET next_retry_at = 0 WHERE id = ?1",
+                params![compact_id],
+            )
+            .unwrap();
+
+        let attempts: i64 = db
+            .conn
+            .query_row(
+                "SELECT attempts FROM metrics WHERE id = ?1",
+                params![compact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, (MAX_METRIC_UPLOAD_ATTEMPTS - 1) as i64);
+        assert_eq!(db.dequeue_pending_batch(10).unwrap()[0].id, compact_id);
+    }
+
+    #[test]
+    fn test_deferred_request_failures_remain_retryable_after_attempt_limit() {
+        let (mut db, _temp_dir) = create_test_db();
+        let event_id = db.insert_events(&[event_json(seconds_ago(30))]).unwrap()[0];
+
+        for attempt in 0..10 {
+            db.mark_records_deferred(&[event_id], "HTTP 503: backend unavailable", attempt)
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "UPDATE metrics SET next_retry_at = 0 WHERE id = ?1",
+                params![event_id],
+            )
+            .unwrap();
+
+        let attempts: i64 = db
+            .conn
+            .query_row(
+                "SELECT attempts FROM metrics WHERE id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, (MAX_METRIC_UPLOAD_ATTEMPTS - 1) as i64);
+        assert_eq!(db.dequeue_pending_batch(10).unwrap()[0].id, event_id);
+    }
+
+    #[test]
+    fn test_compact_recovery_markers_preserve_attribution_candidate_metadata() {
+        let (mut db, _temp_dir) = create_test_db();
+        let event_ts = seconds_ago(10);
+        db.insert_session_observations(&[compact_observation(event_ts, 8)])
+            .unwrap();
+
+        let candidates = db
+            .session_event_candidates_near_timestamps(
+                &[u128::from(event_ts) * NS_PER_SECOND + 500_000_000],
+                NS_PER_SECOND,
+            )
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.event_ts, event_ts);
+        assert_eq!(candidate.session_id, "session-compact-1");
+        assert_eq!(candidate.external_session_id, "external-session-compact-1");
+        assert_eq!(
+            candidate.external_tool_use_id.as_deref(),
+            Some("external-tool-1")
+        );
+        assert_eq!(candidate.model.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(candidate.repo_url.as_deref(), Some("github.com/acme/repo"));
+
+        let latest = db
+            .latest_session_event_candidates_for_tools(&["claude"])
+            .unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0], *candidate);
+    }
+
+    #[test]
+    fn test_recovery_markers_coalesce_same_second_content_but_keep_distinct_tool_calls() {
+        let (mut db, _temp_dir) = create_test_db();
+        let event_ts = seconds_ago(10);
+        let mut first = compact_observation(event_ts, 8);
+        first.token = None;
+        first.external_event_id = Some("content-a".to_string());
+        first.external_parent_event_id = Some("parent-a".to_string());
+        first.external_tool_use_id = None;
+        let mut second = first.clone();
+        second.external_event_id = Some("content-b".to_string());
+        second.external_parent_event_id = Some("parent-b".to_string());
+        let mut tool_a = first.clone();
+        tool_a.external_tool_use_id = Some("tool-call-a".to_string());
+        let mut tool_b = first.clone();
+        tool_b.external_tool_use_id = Some("tool-call-b".to_string());
+
+        db.insert_session_observations(&[first, second, tool_a, tool_b])
+            .unwrap();
+
+        let recovery_rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM session_recovery_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recovery_rows, 3);
+        let candidates = db
+            .session_event_candidates_near_timestamps(
+                &[u128::from(event_ts) * NS_PER_SECOND + 500_000_000],
+                NS_PER_SECOND,
+            )
+            .unwrap();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter_map(|candidate| candidate.external_tool_use_id.as_deref())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["tool-call-a", "tool-call-b"])
+        );
+    }
+
     #[test]
     fn test_initialize_schema() {
         let (db, _temp_dir) = create_test_db();
@@ -1672,7 +4953,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
 
         for column in [
             "delivered_ts",
@@ -1709,16 +4990,45 @@ mod tests {
             "metrics_event_ts_kind",
             "metrics_session_kind_ts",
             "metrics_parent_session_kind_ts",
+            "session_activity_last_ts",
+            "session_recovery_event_ts",
+            "session_recovery_tool_latest",
+            "session_token_sources_history",
+            "session_token_daily_history",
         ] {
             assert_metric_index_exists(&db, index);
         }
+
+        for table in [
+            "session_activity",
+            "session_recovery_events",
+            "session_token_sources",
+            "session_token_daily",
+            "deferred_commit_metric_jobs",
+            "deferred_lifecycle_metric_jobs",
+        ] {
+            let table_count: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_count, 1, "missing table {table}");
+        }
+        assert!(
+            db.column_exists("deferred_commit_metric_jobs", "parent_authorship_note")
+                .unwrap(),
+            "deferred Event 1 jobs must persist the parent-note snapshot"
+        );
     }
 
     #[test]
-    fn test_fallback_database_initializes_schema() {
+    fn test_open_at_path_initializes_schema() {
         let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("fallback-metrics.db");
-        let mut db = MetricsDatabase::new_fallback_at_path(&db_path).unwrap();
+        let db_path = temp_dir.path().join("explicit-metrics.db");
+        let mut db = MetricsDatabase::open_at_path(&db_path).unwrap();
 
         db.insert_events(&[event_json(days_ago(1))]).unwrap();
 
@@ -1727,6 +5037,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM metrics", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        let busy_timeout_ms: u64 = db
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            busy_timeout_ms,
+            METRICS_SQLITE_BUSY_TIMEOUT.as_millis() as u64
+        );
     }
 
     #[test]
@@ -1768,7 +5086,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
     }
 
     #[test]
@@ -1807,7 +5125,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
         assert_eq!(db.count().unwrap(), 1);
         assert_eq!(db.count_retryable().unwrap(), 1);
     }
@@ -1850,7 +5168,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
 
         for column in [
             "delivered_ts",
@@ -1919,7 +5237,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
         assert!(db.column_exists("metrics", "event_ts").unwrap());
         assert!(db.column_exists("metrics", "event_kind").unwrap());
         for index in [
@@ -1978,11 +5296,186 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
         assert_metric_index_exists(&db, "metrics_retryable");
         assert_metric_index_missing(&db, "metrics_pending_retry");
         assert_eq!(db.count().unwrap(), 1);
         assert_eq!(db.status().unwrap().stopped_after_errors, 1);
+    }
+
+    #[test]
+    fn test_migrates_version_5_to_compact_session_schema() {
+        let (mut db, _temp_dir) = create_test_db();
+        db.conn
+            .execute_batch(
+                r#"
+                DROP TABLE session_token_sources;
+                DROP TABLE session_token_daily;
+                DROP TABLE session_recovery_events;
+                DROP TABLE session_activity;
+                UPDATE schema_metadata SET value = '5' WHERE key = 'version';
+                "#,
+            )
+            .unwrap();
+
+        db.initialize_schema().unwrap();
+
+        let version: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+        assert!(db.column_exists("session_activity", "last_ts").unwrap());
+        assert!(
+            db.column_exists("session_recovery_events", "external_tool_use_id")
+                .unwrap()
+        );
+        assert!(
+            db.column_exists("session_token_sources", "cumulative_source")
+                .unwrap()
+        );
+        assert!(
+            db.column_exists("session_token_daily", "outbox_metric_id")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_migrates_version_6_by_projecting_then_removing_legacy_content_rows() {
+        let (mut db, _temp_dir) = create_test_db();
+        let auto_vacuum_before: i64 = db
+            .conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            auto_vacuum_before, 0,
+            "the legacy database must exercise auto_vacuum=NONE"
+        );
+        let event_ts = unix_now().min(u32::MAX as u64) as u32;
+        let session = format!(
+            r#"{{
+                "t":{event_ts},"e":5,
+                "v":{{"0":{{"message":{{"id":"msg-1","role":"assistant","model":"claude-sonnet-4","usage":{{"input_tokens":10,"output_tokens":20}},"content":"private response"}}}},"1":"event-1","3":"tool-1"}},
+                "a":{{"20":"claude","23":"external-1","24":"session-1","25":"trace-1","1":"github.com/acme/repo"}}
+            }}"#,
+        );
+        let otel = format!(
+            r#"{{
+                "t":{event_ts},"e":6,
+                "v":{{"0":{{"span":{{"prompt":"private prompt"}}}},"1":"span-1"}},
+                "a":{{"20":"copilot","23":"external-2","24":"session-2","25":"trace-2"}}
+            }}"#,
+        );
+        db.conn
+            .execute_batch(
+                r#"
+                DROP TRIGGER metrics_reject_legacy_content_insert;
+                UPDATE schema_metadata SET value = '6' WHERE key = 'version';
+                "#,
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO metrics (event_json, event_ts, event_kind) VALUES (?1, ?2, 5), (?3, ?2, 6)",
+                params![session, i64::from(event_ts), otel],
+            )
+            .unwrap();
+
+        db.initialize_schema().unwrap();
+
+        let version: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+        let raw_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM metrics WHERE event_kind IN (5, 6)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_rows, 0);
+        let activities: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM session_activity", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(activities, 2);
+        let token_sources: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM session_token_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(token_sources, 1);
+        let content_leaks: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM metrics WHERE event_json LIKE '%private response%' OR event_json LIKE '%private prompt%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content_leaks, 0);
+        let auto_vacuum_after: i64 = db
+            .conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            auto_vacuum_after, 0,
+            "migration must not run a full VACUUM or rewrite a legacy database"
+        );
+
+        db.conn
+            .execute(
+                "UPDATE schema_metadata SET value = '6' WHERE key = 'version'",
+                [],
+            )
+            .unwrap();
+        db.initialize_schema().unwrap();
+        let projection_counts: (i64, i64, i64) = db
+            .conn
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM session_activity),
+                    (SELECT COUNT(*) FROM session_recovery_events),
+                    (SELECT COUNT(*) FROM session_token_sources)
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(projection_counts, (2, 2, 1));
+    }
+
+    #[test]
+    fn test_schema_v7_rejects_new_legacy_content_rows_even_for_old_insert_shape() {
+        let (mut db, _temp_dir) = create_test_db();
+        let event = format!(
+            r#"{{"t":{},"e":5,"v":{{"0":{{"content":"private"}}}},"a":{{}}}}"#,
+            seconds_ago(0)
+        );
+
+        let structured_insert = db.insert_events(std::slice::from_ref(&event));
+        assert!(structured_insert.is_err());
+        let old_binary_insert = db.conn.execute(
+            "INSERT INTO metrics (event_json) VALUES (?1)",
+            params![event],
+        );
+        assert!(old_binary_insert.is_err());
+        assert_eq!(db.count().unwrap(), 0);
     }
 
     #[test]
@@ -2012,7 +5505,7 @@ mod tests {
     fn test_insert_events_populates_existing_common_metadata_from_attrs() {
         let (mut db, _temp_dir) = create_test_db();
         let event_ts = days_ago(1);
-        db.insert_events(&[event_json_with_all_common_metadata(event_ts, 5)])
+        db.insert_events(&[event_json_with_all_common_metadata(event_ts, 7)])
             .unwrap();
 
         let row: (Option<i64>, Option<i64>) = db
@@ -2021,7 +5514,7 @@ mod tests {
                 Ok((row.get(0)?, row.get(1)?))
             })
             .unwrap();
-        assert_eq!(row, (Some(event_ts as i64), Some(5)));
+        assert_eq!(row, (Some(event_ts as i64), Some(7)));
         assert_eq!(
             metric_identifier_rows(&db),
             vec![MetricIdentifierRow {
@@ -2044,7 +5537,7 @@ mod tests {
         let delivered_ts = unix_now();
         let event_ts = days_ago(1);
         db.insert_events_with_delivered_ts(
-            &[event_json_with_all_common_metadata(event_ts, 6)],
+            &[event_json_with_all_common_metadata(event_ts, 8)],
             Some(delivered_ts),
         )
         .unwrap();
@@ -2061,7 +5554,7 @@ mod tests {
             row,
             (
                 Some(event_ts as i64),
-                Some(6),
+                Some(8),
                 Some(delivered_ts as i64),
                 Some("trace-1".to_string())
             )
@@ -2069,136 +5562,101 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_events_populates_event_specific_external_ids() {
+    fn test_metadata_parser_preserves_legacy_external_ids_without_persisting_content() {
         let (mut db, _temp_dir) = create_test_db();
         let session_event_ts = days_ago(2);
         let otel_trace_ts = days_ago(1);
         let checkpoint_ts = unix_now().min(u32::MAX as u64) as u32;
-        let events = vec![
-            format!(
-                r#"{{
+        let session_event = format!(
+            r#"{{
                     "t":{session_event_ts},
                     "e":5,
                     "v":{{"1":"legacy-event","2":"legacy-parent","3":"legacy-tool"}},
                     "a":{{"24":"session-from-attrs"}}
                 }}"#
-            ),
-            format!(
-                r#"{{
+        );
+        let otel_trace = format!(
+            r#"{{
                     "t":{otel_trace_ts},
                     "e":6,
                     "v":{{"1":"otel-event","2":"otel-parent","3":"otel-tool"}},
                     "a":{{"25":"trace-from-attrs"}}
                 }}"#
-            ),
-            format!(
-                r#"{{
+        );
+        let session_metadata = extract_metric_event_metadata(&session_event).unwrap();
+        assert_eq!(
+            session_metadata.external_event_id.as_deref(),
+            Some("legacy-event")
+        );
+        assert_eq!(
+            session_metadata.external_parent_event_id.as_deref(),
+            Some("legacy-parent")
+        );
+        assert_eq!(
+            session_metadata.external_tool_use_id.as_deref(),
+            Some("legacy-tool")
+        );
+        let otel_metadata = extract_metric_event_metadata(&otel_trace).unwrap();
+        assert_eq!(
+            otel_metadata.external_event_id.as_deref(),
+            Some("otel-event")
+        );
+        assert_eq!(
+            otel_metadata.external_parent_event_id.as_deref(),
+            Some("otel-parent")
+        );
+        assert_eq!(
+            otel_metadata.external_tool_use_id.as_deref(),
+            Some("otel-tool")
+        );
+
+        db.insert_events(&[format!(
+            r#"{{
                     "t":{checkpoint_ts},
                     "e":4,
                     "v":{{"7":"checkpoint-tool-use"}},
                     "a":{{"20":"claude-code"}}
                 }}"#
-            ),
-        ];
-
-        db.insert_events(&events).unwrap();
+        )])
+        .unwrap();
 
         assert_eq!(
             metric_identifier_rows(&db),
-            vec![
-                MetricIdentifierRow {
-                    trace_id: None,
-                    session_id: Some("session-from-attrs".to_string()),
-                    parent_session_id: None,
-                    tool: None,
-                    external_session_id: None,
-                    external_parent_session_id: None,
-                    external_event_id: Some("legacy-event".to_string()),
-                    external_parent_event_id: Some("legacy-parent".to_string()),
-                    external_tool_use_id: Some("legacy-tool".to_string()),
-                },
-                MetricIdentifierRow {
-                    trace_id: Some("trace-from-attrs".to_string()),
-                    session_id: None,
-                    parent_session_id: None,
-                    tool: None,
-                    external_session_id: None,
-                    external_parent_session_id: None,
-                    external_event_id: Some("otel-event".to_string()),
-                    external_parent_event_id: Some("otel-parent".to_string()),
-                    external_tool_use_id: Some("otel-tool".to_string()),
-                },
-                MetricIdentifierRow {
-                    trace_id: None,
-                    session_id: None,
-                    parent_session_id: None,
-                    tool: Some("claude-code".to_string()),
-                    external_session_id: None,
-                    external_parent_session_id: None,
-                    external_event_id: None,
-                    external_parent_event_id: None,
-                    external_tool_use_id: Some("checkpoint-tool-use".to_string()),
-                },
-            ]
+            vec![MetricIdentifierRow {
+                trace_id: None,
+                session_id: None,
+                parent_session_id: None,
+                tool: Some("claude-code".to_string()),
+                external_session_id: None,
+                external_parent_session_id: None,
+                external_event_id: None,
+                external_parent_event_id: None,
+                external_tool_use_id: Some("checkpoint-tool-use".to_string()),
+            }]
         );
-    }
-
-    fn session_event_json(
-        ts: u32,
-        session_id: &str,
-        external_session_id: &str,
-        tool: &str,
-        repo_url: Option<&str>,
-    ) -> String {
-        let repo_attr = repo_url
-            .map(|url| format!(r#","{}":"{}""#, attr_pos::REPO_URL, url))
-            .unwrap_or_default();
-        format!(
-            r#"{{
-                "t":{ts},
-                "e":5,
-                "v":{{"0":{{"type":"assistant"}},"1":"event-{session_id}","3":"tool-use-{session_id}"}},
-                "a":{{
-                    "20":"{tool}",
-                    "21":"gpt-5",
-                    "23":"{external_session_id}",
-                    "24":"{session_id}",
-                    "25":"trace-{session_id}"
-                    {repo_attr}
-                }}
-            }}"#
-        )
     }
 
     #[test]
     fn test_session_event_candidates_near_timestamps_filters_kind_and_window() {
         let (mut db, _temp_dir) = create_test_db();
         let base_ts = seconds_ago(60);
-        let events = vec![
-            session_event_json(
+        db.insert_session_observations(&[
+            recovery_observation(
                 base_ts,
                 "session-near",
-                "external-near",
+                Some("external-near"),
                 "codex",
                 Some("https://github.com/acme/repo"),
             ),
-            session_event_json(
+            recovery_observation(
                 base_ts + 10,
                 "session-far",
-                "external-far",
+                Some("external-far"),
                 "codex",
                 Some("https://github.com/acme/repo"),
             ),
-            format!(
-                r#"{{
-                    "t":{base_ts},
-                    "e":4,
-                    "v":{{"7":"checkpoint-tool-use"}},
-                    "a":{{"20":"codex","23":"external-checkpoint","24":"session-checkpoint"}}
-                }}"#
-            ),
-        ];
-        db.insert_events(&events).unwrap();
+        ])
+        .unwrap();
 
         let timestamp_ns = (base_ts as u128 * 1_000_000_000) + 500_000_000;
         let candidates = db
@@ -2215,10 +5673,10 @@ mod tests {
     fn test_session_event_candidates_treat_event_ts_as_second_bucket() {
         let (mut db, _temp_dir) = create_test_db();
         let base_ts = seconds_ago(60);
-        db.insert_events(&[session_event_json(
+        db.insert_session_observations(&[recovery_observation(
             base_ts,
             "session-bucket",
-            "external-bucket",
+            Some("external-bucket"),
             "codex",
             Some("https://github.com/acme/repo"),
         )])
@@ -2237,22 +5695,15 @@ mod tests {
     fn test_session_event_candidates_parse_required_and_optional_metadata() {
         let (mut db, _temp_dir) = create_test_db();
         let ts = seconds_ago(30);
-        db.insert_events(&[
-            session_event_json(
+        db.insert_session_observations(&[
+            recovery_observation(
                 ts,
                 "session-complete",
-                "external-complete",
+                Some("external-complete"),
                 "claude-code",
                 Some("https://github.com/acme/repo"),
             ),
-            format!(
-                r#"{{
-                    "t":{ts},
-                    "e":5,
-                    "v":{{"0":{{"type":"assistant"}}}},
-                    "a":{{"20":"codex","24":"missing-external-session"}}
-                }}"#
-            ),
+            recovery_observation(ts, "missing-external-session", None, "codex", None),
         ])
         .unwrap();
 
@@ -2348,9 +5799,7 @@ mod tests {
                 "INSERT INTO metrics (event_json) VALUES (?1), (?2), (?3)",
                 params![
                     event_json_with_all_common_metadata(ts1, 1),
-                    format!(
-                        r#"{{"t":{ts2},"e":5,"v":{{"1":"legacy-event","2":"legacy-parent","3":"legacy-tool"}},"a":{{"1":"https://github.com/acme/project"}}}}"#
-                    ),
+                    format!(r#"{{"t":{ts2},"e":4,"v":{{"7":"legacy-tool"}},"a":{{"1":"https://github.com/acme/project"}}}}"#),
                     "not-json",
                 ],
             )
@@ -2364,7 +5813,7 @@ mod tests {
             metric_metadata_rows(&db),
             vec![
                 (Some(ts1 as i64), Some(1)),
-                (Some(ts2 as i64), Some(5)),
+                (Some(ts2 as i64), Some(4)),
                 (None, None),
             ]
         );
@@ -2389,8 +5838,8 @@ mod tests {
                     tool: None,
                     external_session_id: None,
                     external_parent_session_id: None,
-                    external_event_id: Some("legacy-event".to_string()),
-                    external_parent_event_id: Some("legacy-parent".to_string()),
+                    external_event_id: None,
+                    external_parent_event_id: None,
                     external_tool_use_id: Some("legacy-tool".to_string()),
                 },
                 MetricIdentifierRow {
@@ -2486,7 +5935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dequeue_pending_batch_prefers_newest_retryable_rows() {
+    fn test_dequeue_pending_batch_prefers_oldest_retryable_rows() {
         let (mut db, _temp_dir) = create_test_db();
         let oldest_ts = days_ago(3);
         let middle_ts = days_ago(2);
@@ -2500,9 +5949,92 @@ mod tests {
 
         let batch = db.dequeue_pending_batch(2).unwrap();
         assert_eq!(batch.len(), 2);
-        assert!(batch[0].id > batch[1].id);
-        assert!(batch[0].event_json.contains(&format!("\"t\":{newest_ts}")));
+        assert!(batch[0].id < batch[1].id);
+        assert!(batch[0].event_json.contains(&format!("\"t\":{oldest_ts}")));
         assert!(batch[1].event_json.contains(&format!("\"t\":{middle_ts}")));
+    }
+
+    #[test]
+    fn test_due_old_row_is_not_starved_by_continuous_new_writes() {
+        let (mut db, _temp_dir) = create_test_db();
+        let old_id = db.insert_events(&[event_json(days_ago(7))]).unwrap()[0];
+
+        let mut old_was_selected = false;
+        for offset in 0..20 {
+            db.insert_events(&[event_json(seconds_ago(offset))])
+                .unwrap();
+            let batch = db.dequeue_pending_batch(1).unwrap();
+            old_was_selected |= batch[0].id == old_id;
+            db.mark_records_delivered(&[batch[0].id], unix_now())
+                .unwrap();
+        }
+        assert!(
+            old_was_selected,
+            "the old due formal fact must eventually win while newer rows keep arriving"
+        );
+    }
+
+    #[test]
+    fn test_dequeue_pending_batch_respects_byte_budget_and_locks_only_selected_rows() {
+        let (mut db, _temp_dir) = create_test_db();
+        let payload = "x".repeat(4 * 1024 * 1024);
+        let large_event = |ts| {
+            json!({
+                "t": ts,
+                "e": MetricEventId::Committed as u16,
+                "v": {},
+                "a": {"99": payload}
+            })
+            .to_string()
+        };
+        db.insert_events(&[large_event(seconds_ago(1)), large_event(seconds_ago(0))])
+            .unwrap();
+
+        let batch = db.dequeue_pending_batch(1000).unwrap();
+
+        assert_eq!(batch.len(), 1);
+        let locked_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM metrics WHERE processing_started_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(locked_rows, 1);
+        assert_eq!(db.count_retryable().unwrap(), 1);
+
+        let event = serde_json::from_str::<MetricEvent>(&batch[0].event_json).unwrap();
+        let serialized = serde_json::to_vec(&MetricsBatch::new(vec![event])).unwrap();
+        assert!(serialized.len() < 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_single_oversized_old_row_can_be_quarantined_without_blocking_followers() {
+        let (mut db, _temp_dir) = create_test_db();
+        let oversized = json!({
+            "t": seconds_ago(2),
+            "e": MetricEventId::Committed as u16,
+            "v": {},
+            "a": {"99": "x".repeat(MAX_METRICS_UPLOAD_BODY_BYTES + 1024)}
+        })
+        .to_string();
+        let small = event_json(seconds_ago(1));
+        let ids = db.insert_events(&[oversized, small.clone()]).unwrap();
+
+        let first = db.dequeue_pending_batch(100).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, ids[0]);
+        db.mark_records_undeliverable(
+            &[(ids[0], "request exceeds upload limit".to_string())],
+            unix_now(),
+        )
+        .unwrap();
+
+        let second = db.dequeue_pending_batch(100).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, ids[1]);
+        assert_eq!(second[0].event_json, small);
     }
 
     #[test]
@@ -2736,7 +6268,7 @@ mod tests {
 
         db.insert_events(&events).unwrap();
 
-        // Dequeue newest rows and mark them delivered.
+        // Dequeue oldest rows and mark them delivered.
         let batch = db.dequeue_pending_batch(2).unwrap();
         let ids: Vec<i64> = batch.iter().map(|r| r.id).collect();
 
@@ -2746,10 +6278,10 @@ mod tests {
         let count = db.count().unwrap();
         assert_eq!(count, 1);
 
-        // Verify remaining pending row is the oldest one.
+        // Verify remaining pending row is the newest one.
         let remaining = pending_event_jsons(&db);
         assert_eq!(remaining.len(), 1);
-        assert!(remaining[0].contains(&format!("\"t\":{ts1}")));
+        assert!(remaining[0].contains(&format!("\"t\":{ts3}")));
 
         // Verify delivered rows are retained.
         let total: i64 = db
@@ -2802,7 +6334,7 @@ mod tests {
         let pending = vec![
             event_json_with_repo(ts2, 4, "https://github.com/acme/project"),
             event_json_with_repo(ts3, 2, "https://github.com/acme/project"),
-            event_json_with_repo(ts4, 5, "https://github.com/other/repo"),
+            event_json_with_repo(ts4, 7, "https://github.com/other/repo"),
         ];
 
         db.insert_events_with_delivered_ts(&delivered, Some(delivered_ts))
@@ -2810,7 +6342,7 @@ mod tests {
         db.insert_events(&pending).unwrap();
 
         let records = db
-            .get_metric_history(0, Some("acme/project"), &[1, 4, 5])
+            .get_metric_history(0, Some("acme/project"), &[1, 4, 7])
             .unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].event_id, 1);
@@ -2823,7 +6355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_metric_history_reads_legacy_rows_before_and_after_metadata_backfill() {
+    fn test_get_metric_history_reads_rows_without_cached_metadata_before_and_after_backfill() {
         let (mut db, _temp_dir) = create_test_db();
         let ts1 = days_ago(2);
         let ts2 = days_ago(1);
@@ -2832,20 +6364,20 @@ mod tests {
                 "INSERT INTO metrics (event_json) VALUES (?1), (?2)",
                 params![
                     event_json_with_repo(ts1, 4, "https://github.com/acme/project"),
-                    event_json_with_repo(ts2, 5, "https://github.com/acme/project"),
+                    event_json_with_repo(ts2, 7, "https://github.com/acme/project"),
                 ],
             )
             .unwrap();
 
         let before = db
-            .get_metric_history(0, Some("acme/project"), &[4, 5])
+            .get_metric_history(0, Some("acme/project"), &[4, 7])
             .unwrap();
         assert_eq!(
             before
                 .iter()
                 .map(|record| (record.event_id, record.ts))
                 .collect::<Vec<_>>(),
-            vec![(4, ts1), (5, ts2)]
+            vec![(4, ts1), (7, ts2)]
         );
 
         let summary = db.backfill_event_metadata_batch(100).unwrap();
@@ -2853,14 +6385,14 @@ mod tests {
         assert_eq!(summary.updated, 2);
 
         let after = db
-            .get_metric_history(0, Some("acme/project"), &[4, 5])
+            .get_metric_history(0, Some("acme/project"), &[4, 7])
             .unwrap();
         assert_eq!(
             after
                 .iter()
                 .map(|record| (record.event_id, record.ts))
                 .collect::<Vec<_>>(),
-            vec![(4, ts1), (5, ts2)]
+            vec![(4, ts1), (7, ts2)]
         );
     }
 
@@ -2895,8 +6427,14 @@ mod tests {
         let recent_json_ts = days_ago(1);
         db.conn
             .execute(
-                "INSERT INTO metrics (event_json, event_ts, event_kind) VALUES (?1, ?2, ?3)",
-                params![event_json(recent_json_ts), old_event_ts as i64, 1],
+                "INSERT INTO metrics (event_json, event_ts, event_kind, delivered_ts) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    event_json(recent_json_ts),
+                    old_event_ts as i64,
+                    1,
+                    unix_now() as i64
+                ],
             )
             .unwrap();
 
@@ -2910,7 +6448,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prunes_old_pending_metric_rows() {
+    fn test_old_pending_metric_rows_are_retained_until_delivered() {
         let (mut db, _temp_dir) = create_test_db();
 
         let old_event_ts = seconds_ago(MetricsDatabase::METRICS_RETENTION_SECS + 1);
@@ -2923,16 +6461,25 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM metrics", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(db.count().unwrap(), 1);
+        assert_eq!(total, 2);
+        assert_eq!(db.count().unwrap(), 2);
 
         let batch = pending_event_jsons(&db);
-        assert_eq!(batch.len(), 1);
-        assert!(batch[0].contains(&format!("\"t\":{recent_event_ts}")));
+        assert_eq!(batch.len(), 2);
+        assert!(
+            batch
+                .iter()
+                .any(|event| event.contains(&format!("\"t\":{old_event_ts}")))
+        );
+        assert!(
+            batch
+                .iter()
+                .any(|event| event.contains(&format!("\"t\":{recent_event_ts}")))
+        );
     }
 
     #[test]
-    fn test_prunes_pending_rows_with_timestamp_even_when_kind_is_missing() {
+    fn test_old_pending_rows_without_kind_are_retained_until_delivered() {
         let (mut db, _temp_dir) = create_test_db();
 
         let old_event_ts = seconds_ago(MetricsDatabase::METRICS_RETENTION_SECS + 1);
@@ -2948,12 +6495,56 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM metrics", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(total, 1);
-        let remaining: String = db
+        assert_eq!(total, 2);
+        let mut statement = db
             .conn
-            .query_row("SELECT event_json FROM metrics", [], |row| row.get(0))
+            .prepare("SELECT event_json FROM metrics ORDER BY id")
             .unwrap();
-        assert!(remaining.contains(&format!("\"t\":{recent_event_ts}")));
+        let remaining = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        assert!(
+            remaining
+                .iter()
+                .any(|event| event.contains(&format!("\"t\":{old_event_ts}")))
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|event| event.contains(&format!("\"t\":{recent_event_ts}")))
+        );
+    }
+
+    #[test]
+    fn test_old_stopped_after_errors_metric_row_is_retained_and_visible() {
+        let (mut db, _temp_dir) = create_test_db();
+
+        let old_event_ts = seconds_ago(MetricsDatabase::METRICS_RETENTION_SECS + 1);
+        let event_id = db.insert_events(&[event_json(old_event_ts)]).unwrap()[0];
+        db.mark_records_undeliverable(
+            &[(event_id, "server rejected formal metric".to_string())],
+            unix_now(),
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM schema_metadata WHERE key = 'metrics_last_prune_ts'",
+                [],
+            )
+            .unwrap();
+
+        db.prune_old_metrics_if_due().unwrap();
+
+        let status = db.status().unwrap();
+        assert_eq!(status.not_delivered, 1);
+        assert_eq!(status.stopped_after_errors, 1);
+        assert_eq!(status.rows_with_errors, 1);
+        assert_eq!(
+            status.latest_error.as_deref(),
+            Some("server rejected formal metric")
+        );
     }
 
     #[test]

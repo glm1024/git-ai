@@ -2,7 +2,11 @@
 //!
 //! Uploads pending metrics database rows to the API.
 
-use crate::api::{ApiClient, ApiContext, metrics_upload_allowed, upload_metrics_with_retry};
+use crate::api::{
+    ApiClient, ApiContext, metrics_upload_allowed, metrics_upload_error_is_permanent,
+    upload_metrics_with_retry,
+};
+use crate::config::Config;
 use crate::metrics::db::MetricsDatabase;
 use crate::metrics::{MetricEvent, MetricsBatch};
 
@@ -28,6 +32,22 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
             return;
         }
     };
+    let reporting_attributes = Config::fresh().metrics_custom_attributes().clone();
+    match db.lock() {
+        Ok(mut db_lock) => {
+            if let Err(e) = db_lock.rehydrate_unknown_daily_token_identity(&reporting_attributes) {
+                eprintln!(
+                    "flush-metrics-db: failed to repair compact token identity before upload: {}",
+                    e
+                );
+                return;
+            }
+        }
+        Err(e) => {
+            eprintln!("flush-metrics-db: failed to acquire db lock: {}", e);
+            return;
+        }
+    }
 
     let mut total_uploaded = 0usize;
     let mut total_batches = 0usize;
@@ -63,15 +83,19 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
         let mut record_ids = Vec::new();
 
         for record in &batch {
-            if let Ok(event) = serde_json::from_str::<MetricEvent>(&record.event_json) {
-                events.push(event);
-                record_ids.push(record.id);
-            } else {
-                total_invalid += 1;
-                // Invalid JSON cannot upload successfully. Mark it delivered so
-                // future flushes can continue past the malformed historical row.
-                if let Ok(mut db_lock) = db.lock() {
-                    let _ = db_lock.mark_records_delivered(&[record.id], current_unix_ts());
+            match serde_json::from_str::<MetricEvent>(&record.event_json) {
+                Ok(event) => {
+                    events.push(event);
+                    record_ids.push(record.id);
+                }
+                Err(error) => {
+                    total_invalid += 1;
+                    if let Ok(mut db_lock) = db.lock() {
+                        let _ = db_lock.mark_records_undeliverable(
+                            &[(record.id, format!("invalid local metric JSON: {error}"))],
+                            current_unix_ts(),
+                        );
+                    }
                 }
             }
         }
@@ -94,7 +118,7 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                     if let Ok(mut db_lock) = db.lock() {
                         let now = current_unix_ts();
                         let error = e.to_string();
-                        let _ = db_lock.mark_records_failed(&record_ids, &error, now);
+                        let _ = db_lock.mark_records_deferred(&record_ids, &error, now);
                     }
                     break;
                 }
@@ -132,15 +156,30 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                 }
             }
             Err(e) => {
-                // All retries failed - keep records in DB for a later queued retry.
-                eprintln!(
-                    "  ✗ batch upload failed ({} events kept for retry): {}",
-                    event_count, e
-                );
+                let permanent = metrics_upload_error_is_permanent(&e);
+                if permanent {
+                    eprintln!(
+                        "  ✗ batch upload was permanently rejected ({} events retained locally without retry): {}",
+                        event_count, e
+                    );
+                } else {
+                    eprintln!(
+                        "  ✗ batch upload failed ({} events kept for retry): {}",
+                        event_count, e
+                    );
+                }
                 if let Ok(mut db_lock) = db.lock() {
                     let now = current_unix_ts();
                     let error = e.to_string();
-                    let _ = db_lock.mark_records_failed(&record_ids, &error, now);
+                    if permanent {
+                        let records = record_ids
+                            .iter()
+                            .map(|id| (*id, error.clone()))
+                            .collect::<Vec<_>>();
+                        let _ = db_lock.mark_records_undeliverable(&records, now);
+                    } else {
+                        let _ = db_lock.mark_records_deferred(&record_ids, &error, now);
+                    }
                 }
                 break;
             }
@@ -149,7 +188,7 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
 
     if total_invalid > 0 {
         eprintln!(
-            "flush-metrics-db: marked {} invalid record(s) delivered",
+            "flush-metrics-db: retained {} invalid record(s) as undeliverable",
             total_invalid
         );
     }

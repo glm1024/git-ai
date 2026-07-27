@@ -12,7 +12,7 @@ use crate::authorship::virtual_attribution::{AuthorshipLogDiffContext, VirtualAt
 use crate::authorship::working_log::{Checkpoint, CheckpointKind, WorkingLogEntry};
 use crate::config::Config;
 use crate::error::GitAiError;
-use crate::git::notes_api::write_note;
+use crate::git::notes_api::{read_note, write_note};
 use crate::git::repository::{Repository, batch_read_paths_at_treeishes, exec_git};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
@@ -20,7 +20,10 @@ use std::io::IsTerminal;
 /// Skip expensive post-commit stats when this threshold is exceeded.
 /// High hunk density is the strongest predictor of slow diff_ai_accepted_stats.
 #[doc(hidden)]
-pub const STATS_SKIP_MAX_HUNKS: usize = 1000;
+/// The backend admits at most 512 hunk-evidence rows per legacy Event 1.
+/// A 513th hunk must use the durable bundled path.
+pub const STATS_SKIP_MAX_HUNKS: usize = 513;
+const MAX_LEGACY_COMMITTED_EVENT_HUNKS: usize = 512;
 /// Skip expensive stats for very large net additions even if hunks are moderate.
 #[doc(hidden)]
 pub const STATS_SKIP_MAX_ADDED_LINES: usize = 6000;
@@ -281,6 +284,15 @@ where
     // Use base_commit parameter if provided, otherwise use "initial" for empty repos
     // This matches the convention in checkpoint.rs
     let parent_sha = base_commit.unwrap_or_else(|| "initial".to_string());
+    // Metrics describe exactly the finalized commit, even when the daemon's
+    // update-ref path supplies a branch tip from before a multi-commit
+    // fast-forward. Resolve the actual first parent before the authorship note
+    // is written so every later metric failure can still enter durable retry.
+    let commit_metric_context = if options.compute_stats {
+        Some(resolve_commit_metric_parent(repo, &commit_sha)?)
+    } else {
+        None
+    };
 
     // Initialize the new storage system
     let repo_storage = &repo.storage;
@@ -435,14 +447,18 @@ where
     let mut skip_reason = None;
 
     if options.compute_stats {
-        let stats_diff_base = single_commit_diff_base(&parent_sha, &commit_sha);
-        let is_merge_commit = repo
-            .find_commit(commit_sha.clone())
-            .map(|commit| commit.parent_count().unwrap_or(0) > 1)
-            .unwrap_or(false);
+        let (metric_parent_sha, is_merge_commit) = commit_metric_context
+            .as_ref()
+            .expect("metric commit context is resolved when stats are enabled");
+        let stats_diff_base = single_commit_diff_base(metric_parent_sha, &commit_sha);
+        let parent_authorship_note = if *is_merge_commit {
+            String::new()
+        } else {
+            snapshot_parent_authorship_note(repo, &commit_sha, metric_parent_sha)
+        };
         let ignore_patterns = effective_ignore_patterns(repo, &[], &[]);
-        skip_reason = if is_merge_commit {
-            Some(StatsSkipReason::MergeCommit)
+        skip_reason = if *is_merge_commit {
+            Some(StatsSkipReason::Merge)
         } else {
             estimate_stats_cost(repo, &stats_diff_base, &commit_sha, &ignore_patterns)
                 .ok()
@@ -455,60 +471,112 @@ where
                 })
         };
 
-        if skip_reason.is_none() {
-            let diff_hunks = crate::commands::diff::get_diff_with_line_numbers(
+        if let Some(reason) = skip_reason.as_ref() {
+            let kind = match reason {
+                StatsSkipReason::Merge => {
+                    crate::metrics::deferred_commit_jobs::DeferredCommitMetricKind::MergeNovel
+                }
+                StatsSkipReason::Expensive(_)
+                | StatsSkipReason::Evidence(_)
+                | StatsSkipReason::AfterError(_) => {
+                    crate::metrics::deferred_commit_jobs::DeferredCommitMetricKind::SingleParent
+                }
+            };
+            enqueue_deferred_commit_metric_job(
+                repo,
+                kind,
+                &commit_sha,
+                metric_parent_sha,
+                &human_author,
+                &authorship_note_str,
+                &parent_authorship_note,
+                &parent_working_log,
+                &ignore_patterns,
+            )?;
+        } else {
+            match compute_and_record_immediate_commit_metric(
                 repo,
                 &stats_diff_base,
                 &commit_sha,
-            )?;
-
-            let computed = stats_for_commit_stats_from_hunks(
-                repo,
-                &commit_sha,
-                &ignore_patterns,
-                &diff_hunks,
-                Some(&authorship_log),
-            )?;
-
-            let hunks_json = crate::commands::diff::build_diff_artifacts_from_hunks(
-                repo,
-                diff_hunks,
-                &commit_sha,
-                Some(&authorship_log),
-            )
-            .ok()
-            .and_then(|artifacts| serde_json::to_string(&artifacts.json_hunks).ok());
-
-            // Record metrics only when we have full stats.
-            record_commit_metrics(
-                repo,
-                &commit_sha,
-                // Store the recorded parent as `base_commit_sha`, not the
-                // `<commit>^` diff rev-expression used for the diff spawns.
-                &parent_sha,
+                metric_parent_sha,
                 &human_author,
                 &authorship_note_str,
-                &computed,
+                &parent_authorship_note,
                 &parent_working_log,
-                hunks_json.as_deref(),
-            );
-            stats = Some(computed);
+                &ignore_patterns,
+                &authorship_log,
+            ) {
+                Ok((computed, ImmediateCommitMetricOutcome::RequiresDeferred)) => {
+                    enqueue_deferred_commit_metric_job(
+                        repo,
+                        crate::metrics::deferred_commit_jobs::DeferredCommitMetricKind::SingleParent,
+                        &commit_sha,
+                        metric_parent_sha,
+                        &human_author,
+                        &authorship_note_str,
+                        &parent_authorship_note,
+                        &parent_working_log,
+                        &ignore_patterns,
+                    )?;
+                    skip_reason = Some(StatsSkipReason::Evidence(
+                        "legacy Event 1 exceeded the 512-hunk or 7 MiB envelope limit".to_string(),
+                    ));
+                    stats = Some(computed);
+                }
+                Ok((computed, _)) => {
+                    stats = Some(computed);
+                }
+                Err(error) => {
+                    // Once the note exists, every diff/stats/artifact/serialization
+                    // or immediate-persistence failure must become durable retry
+                    // work. Cleanup and INITIAL propagation still continue.
+                    enqueue_deferred_commit_metric_job(
+                        repo,
+                        crate::metrics::deferred_commit_jobs::DeferredCommitMetricKind::SingleParent,
+                        &commit_sha,
+                        metric_parent_sha,
+                        &human_author,
+                        &authorship_note_str,
+                        &parent_authorship_note,
+                        &parent_working_log,
+                        &ignore_patterns,
+                    )?;
+                    skip_reason = Some(StatsSkipReason::AfterError(error.to_string()));
+                }
+            }
         }
     }
 
     if options.compute_stats && skip_reason.is_some() {
         match skip_reason.as_ref() {
-            Some(StatsSkipReason::MergeCommit) => {
-                tracing::debug!("Skipping post-commit stats for merge commit {}", commit_sha);
+            Some(StatsSkipReason::Merge) => {
+                tracing::debug!(
+                    "Deferred complete post-commit metric for merge commit {}",
+                    commit_sha
+                );
             }
             Some(StatsSkipReason::Expensive(estimate)) => {
                 tracing::debug!(
-                    "Skipping expensive post-commit stats for {} (files_with_additions={}, added_lines={}, deleted_lines={}, hunks={})",
+                    "Deferred expensive post-commit metric for {} (files_with_additions={}, added_lines={}, deleted_lines={}, hunks={})",
                     commit_sha,
                     estimate.files_with_additions,
                     estimate.added_lines,
                     estimate.deleted_lines,
                     estimate.hunk_ranges
+                );
+            }
+            Some(StatsSkipReason::Evidence(reason)) => {
+                tracing::debug!(
+                    commit_sha,
+                    reason,
+                    "Deferred committed metric for bounded bundle delivery"
+                );
+            }
+            Some(StatsSkipReason::AfterError(error)) => {
+                tracing::warn!(
+                    commit_sha,
+                    error,
+                    "Deferred formal committed metric after hunk evidence construction failed"
                 );
             }
             None => {}
@@ -538,19 +606,31 @@ where
             write_stats_to_terminal(stats, is_interactive);
         } else {
             match skip_reason.as_ref() {
-                Some(StatsSkipReason::MergeCommit) => {
+                Some(StatsSkipReason::Merge) => {
                     eprintln!(
-                        "[git-ai] Skipped git-ai stats for merge commit {}.",
+                        "[git-ai] Queued complete git-ai metrics for merge commit {}.",
                         commit_sha
                     );
                 }
                 Some(StatsSkipReason::Expensive(estimate)) => {
                     eprintln!(
-                        "[git-ai] Skipped git-ai stats for large commit (files_with_additions={}, added_lines={}, deleted_lines={}, hunks={}). Run `git-ai stats {}` to compute stats on demand.",
+                        "[git-ai] Queued complete git-ai metrics for large commit (files_with_additions={}, added_lines={}, deleted_lines={}, hunks={}) {}.",
                         estimate.files_with_additions,
                         estimate.added_lines,
                         estimate.deleted_lines,
                         estimate.hunk_ranges,
+                        commit_sha
+                    );
+                }
+                Some(StatsSkipReason::Evidence(_)) => {
+                    eprintln!(
+                        "[git-ai] Queued complete bundled git-ai metrics for commit {}.",
+                        commit_sha
+                    );
+                }
+                Some(StatsSkipReason::AfterError(_)) => {
+                    eprintln!(
+                        "[git-ai] Queued a retry for complete git-ai metrics for commit {}.",
                         commit_sha
                     );
                 }
@@ -859,8 +939,10 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
 
 #[derive(Debug, Clone)]
 enum StatsSkipReason {
-    MergeCommit,
+    Merge,
     Expensive(StatsCostEstimate),
+    Evidence(String),
+    AfterError(String),
 }
 
 #[doc(hidden)]
@@ -1091,8 +1173,12 @@ pub(crate) fn commit_metric_attrs(
 ) -> crate::metrics::EventAttributes {
     let mut attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
         .author(human_author)
-        .commit_sha(commit_sha)
-        .base_commit_sha(parent_sha);
+        .commit_sha(commit_sha);
+    attrs = if parent_sha == "initial" {
+        attrs.base_commit_sha_null()
+    } else {
+        attrs.base_commit_sha(parent_sha)
+    };
 
     if let Ok(Some(remote_name)) = repo.get_default_remote()
         && let Ok(remotes) = repo.remotes_with_urls()
@@ -1111,8 +1197,104 @@ pub(crate) fn commit_metric_attrs(
     attrs.custom_attributes_map(Config::fresh().metrics_custom_attributes())
 }
 
+fn resolve_commit_metric_parent(
+    repo: &Repository,
+    commit_sha: &str,
+) -> Result<(String, bool), GitAiError> {
+    let mut args = repo.global_args_for_exec();
+    args.extend([
+        "show".to_string(),
+        "-s".to_string(),
+        "--no-notes".to_string(),
+        "--format=%P".to_string(),
+        commit_sha.to_string(),
+    ]);
+    let output = exec_git(&args)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let parents = stdout.split_whitespace().collect::<Vec<_>>();
+    Ok((
+        parents
+            .first()
+            .map(|parent| (*parent).to_string())
+            .unwrap_or_else(|| "initial".to_string()),
+        parents.len() > 1,
+    ))
+}
+
 /// Record metrics for a committed change.
-/// This is a best-effort operation - failures are silently ignored.
+///
+/// Persistence failures propagate to the sequenced side-effect pipeline so a
+/// successful completion/await cannot hide a missing formal commit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImmediateCommitMetricOutcome {
+    Recorded,
+    NotApplicable,
+    RequiresDeferred,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_and_record_immediate_commit_metric(
+    repo: &Repository,
+    stats_diff_base: &str,
+    commit_sha: &str,
+    parent_sha: &str,
+    human_author: &str,
+    authorship_note: &str,
+    parent_authorship_note: &str,
+    checkpoints: &[Checkpoint],
+    ignore_patterns: &[String],
+    authorship_log: &AuthorshipLog,
+) -> Result<
+    (
+        crate::authorship::stats::CommitStats,
+        ImmediateCommitMetricOutcome,
+    ),
+    GitAiError,
+> {
+    let diff_hunks = crate::commands::diff::get_commit_metric_diff_with_line_numbers(
+        repo,
+        stats_diff_base,
+        commit_sha,
+    )?;
+    let computed = stats_for_commit_stats_from_hunks(
+        repo,
+        commit_sha,
+        ignore_patterns,
+        &diff_hunks,
+        Some(authorship_log),
+    )?;
+    let parent_authorship_log = if parent_authorship_note.is_empty() {
+        None
+    } else {
+        AuthorshipLog::deserialize_from_string(parent_authorship_note).ok()
+    };
+    let artifacts =
+        crate::commands::diff::build_diff_artifacts_from_hunks_with_parent_note_and_ignore_patterns(
+            repo,
+            diff_hunks,
+            commit_sha,
+            Some(authorship_log),
+            parent_authorship_log
+                .as_ref()
+                .map(|parent_note| (parent_sha, parent_note)),
+            ignore_patterns,
+        )?;
+    let hunks_json = serde_json::to_string(&artifacts.json_hunks)?;
+    let outcome = record_commit_metrics(
+        repo,
+        commit_sha,
+        // Store the recorded parent as `base_commit_sha`, not the
+        // `<commit>^` diff rev-expression used for diff spawns.
+        parent_sha,
+        human_author,
+        authorship_note,
+        &computed,
+        checkpoints,
+        &hunks_json,
+    )?;
+    Ok((computed, outcome))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_commit_metrics(
     repo: &Repository,
@@ -1122,13 +1304,80 @@ fn record_commit_metrics(
     authorship_note: &str,
     stats: &crate::authorship::stats::CommitStats,
     checkpoints: &[Checkpoint],
-    hunks_json: Option<&str>,
-) {
-    use crate::metrics::{CommittedValues, record};
+    hunks_json: &str,
+) -> Result<ImmediateCommitMetricOutcome, GitAiError> {
+    use crate::metrics::record;
 
-    let Some(breakdown) = metric_tool_model_breakdown(stats) else {
-        return;
+    let Some(values) = build_commit_metric_values(
+        repo,
+        commit_sha,
+        authorship_note,
+        stats,
+        checkpoints.first().map(|checkpoint| checkpoint.timestamp),
+        hunks_json,
+    ) else {
+        return Ok(ImmediateCommitMetricOutcome::NotApplicable);
     };
+
+    let attrs = commit_metric_attrs(repo, commit_sha, parent_sha, human_author);
+    let hunk_count = serde_json::from_str::<Vec<serde_json::Value>>(hunks_json)?.len();
+    let event =
+        crate::metrics::MetricEvent::new(&values, crate::metrics::PosEncoded::to_sparse(&attrs));
+    let event_bytes = serde_json::to_vec(&crate::metrics::MetricsBatch::new(vec![event]))?.len();
+    if !legacy_committed_event_fits_limits(hunk_count, event_bytes) {
+        return Ok(ImmediateCommitMetricOutcome::RequiresDeferred);
+    }
+
+    record(values, attrs)?;
+    Ok(ImmediateCommitMetricOutcome::Recorded)
+}
+
+fn legacy_committed_event_fits_limits(hunk_count: usize, serialized_batch_bytes: usize) -> bool {
+    hunk_count <= MAX_LEGACY_COMMITTED_EVENT_HUNKS
+        && serialized_batch_bytes < crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES
+}
+
+fn snapshot_parent_authorship_note(
+    repo: &Repository,
+    commit_sha: &str,
+    parent_sha: &str,
+) -> String {
+    if parent_sha == "initial" {
+        return String::new();
+    }
+    read_note(repo, parent_sha)
+        .filter(|raw_note| {
+            if AuthorshipLog::deserialize_from_string(raw_note).is_ok() {
+                true
+            } else {
+                tracing::warn!(
+                    commit_sha,
+                    parent_sha,
+                    "parent authorship note is invalid; deletion provenance will remain unknown"
+                );
+                false
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Build a complete Event 1 value payload from immutable commit inputs.
+///
+/// Deferred jobs call this only after both stats and line-evidence hunks have
+/// been computed successfully.  `hunks_json` is deliberately non-optional:
+/// formal committed events must never be persisted without their admission
+/// evidence.
+pub(crate) fn build_commit_metric_values(
+    repo: &Repository,
+    commit_sha: &str,
+    authorship_note: &str,
+    stats: &crate::authorship::stats::CommitStats,
+    first_checkpoint_ts: Option<u64>,
+    hunks_json: &str,
+) -> Option<crate::metrics::CommittedValues> {
+    use crate::metrics::CommittedValues;
+
+    let breakdown = metric_tool_model_breakdown(stats)?;
 
     // Build values with all stats
     let values = CommittedValues::new()
@@ -1140,8 +1389,8 @@ fn record_commit_metrics(
         .ai_accepted(breakdown.ai_accepted);
 
     // Add first checkpoint timestamp (null if no checkpoints)
-    let values = if let Some(first) = checkpoints.first() {
-        values.first_checkpoint_ts(first.timestamp)
+    let values = if let Some(first_checkpoint_ts) = first_checkpoint_ts {
+        values.first_checkpoint_ts(first_checkpoint_ts)
     } else {
         values.first_checkpoint_ts_null()
     };
@@ -1169,16 +1418,42 @@ fn record_commit_metrics(
     }
     .authorship_note(authorship_note);
 
-    let values = if let Some(hunks) = hunks_json {
-        values.hunks(hunks)
-    } else {
-        values.hunks_null()
-    };
+    Some(values.hunks(hunks_json))
+}
 
+#[allow(clippy::too_many_arguments)]
+fn enqueue_deferred_commit_metric_job(
+    repo: &Repository,
+    kind: crate::metrics::deferred_commit_jobs::DeferredCommitMetricKind,
+    commit_sha: &str,
+    parent_sha: &str,
+    human_author: &str,
+    authorship_note: &str,
+    parent_authorship_note: &str,
+    checkpoints: &[Checkpoint],
+    ignore_patterns: &[String],
+) -> Result<(), GitAiError> {
     let attrs = commit_metric_attrs(repo, commit_sha, parent_sha, human_author);
-
-    // Record the metric
-    record(values, attrs);
+    let parent_authorship_note =
+        if kind == crate::metrics::deferred_commit_jobs::DeferredCommitMetricKind::SingleParent {
+            parent_authorship_note
+        } else {
+            ""
+        };
+    let spec = crate::metrics::deferred_commit_jobs::DeferredCommitMetricJobSpec::from_commit(
+        repo,
+        kind,
+        commit_sha,
+        parent_sha,
+        human_author,
+        authorship_note,
+        parent_authorship_note,
+        checkpoints.first().map(|checkpoint| checkpoint.timestamp),
+        &attrs,
+        ignore_patterns,
+    )?;
+    crate::metrics::deferred_commit_jobs::enqueue(&spec)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1275,6 +1550,22 @@ mod tests {
             deleted_lines: STATS_SKIP_MAX_DELETED_LINES,
         };
         assert!(should_skip_expensive_post_commit_stats(&by_deleted_lines));
+    }
+
+    #[test]
+    fn legacy_event_limit_routes_513th_hunk_and_7_mib_payload_to_deferred_bundle() {
+        assert!(legacy_committed_event_fits_limits(
+            512,
+            crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES - 1
+        ));
+        assert!(!legacy_committed_event_fits_limits(
+            513,
+            crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES - 1
+        ));
+        assert!(!legacy_committed_event_fits_limits(
+            1,
+            crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES
+        ));
     }
 
     #[test]

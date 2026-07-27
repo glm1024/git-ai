@@ -275,6 +275,22 @@ mod tests {
     }
 
     #[test]
+    fn test_kilo_plugin_only_tracks_call_after_pre_checkpoint_succeeds() {
+        let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
+        let pre_checkpoint = content
+            .find("await runCheckpoint(hookInput)")
+            .expect("pre checkpoint call");
+        let track_pending_call = content
+            .find("pendingCalls.set(callID")
+            .expect("pending call insertion");
+
+        assert!(
+            pre_checkpoint < track_pending_call,
+            "a failed Kilo pre checkpoint must not enable a post-only checkpoint"
+        );
+    }
+
+    #[test]
     fn test_kilo_plugin_windows_path_is_escaped() {
         let content = KiloInstaller::generate_plugin_content(Path::new(
             r"C:\Users\developer\.git-ai\bin\git-ai.exe",

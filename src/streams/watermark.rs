@@ -21,6 +21,7 @@ pub trait WatermarkStrategy: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatermarkType {
     ByteOffset,
+    CodexByteOffset,
     RecordIndex,
     Timestamp,
     Hybrid,
@@ -31,6 +32,7 @@ impl fmt::Display for WatermarkType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WatermarkType::ByteOffset => write!(f, "ByteOffset"),
+            WatermarkType::CodexByteOffset => write!(f, "CodexByteOffset"),
             WatermarkType::RecordIndex => write!(f, "RecordIndex"),
             WatermarkType::Timestamp => write!(f, "Timestamp"),
             WatermarkType::Hybrid => write!(f, "Hybrid"),
@@ -45,6 +47,7 @@ impl FromStr for WatermarkType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "ByteOffset" => Ok(WatermarkType::ByteOffset),
+            "CodexByteOffset" => Ok(WatermarkType::CodexByteOffset),
             "RecordIndex" => Ok(WatermarkType::RecordIndex),
             "Timestamp" => Ok(WatermarkType::Timestamp),
             "Hybrid" => Ok(WatermarkType::Hybrid),
@@ -62,6 +65,7 @@ impl WatermarkType {
     pub fn deserialize(&self, s: &str) -> Result<Box<dyn WatermarkStrategy>, StreamError> {
         match self {
             WatermarkType::ByteOffset => Ok(Box::new(ByteOffsetWatermark::from_str(s)?)),
+            WatermarkType::CodexByteOffset => Ok(Box::new(CodexByteOffsetWatermark::from_str(s)?)),
             WatermarkType::RecordIndex => Ok(Box::new(RecordIndexWatermark::from_str(s)?)),
             WatermarkType::Timestamp => Ok(Box::new(TimestampWatermark::from_str(s)?)),
             WatermarkType::Hybrid => Ok(Box::new(HybridWatermark::from_str(s)?)),
@@ -72,6 +76,7 @@ impl WatermarkType {
     pub fn create_initial_watermark(&self) -> Box<dyn WatermarkStrategy> {
         match self {
             WatermarkType::ByteOffset => Box::new(ByteOffsetWatermark::new(0)),
+            WatermarkType::CodexByteOffset => Box::new(CodexByteOffsetWatermark::initial()),
             WatermarkType::RecordIndex => Box::new(RecordIndexWatermark::new(0)),
             WatermarkType::Timestamp => Box::new(TimestampWatermark::new(
                 chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
@@ -116,6 +121,74 @@ impl FromStr for ByteOffsetWatermark {
                 line: 0,
                 message: format!("Invalid byte offset watermark: {}", e),
             })
+    }
+}
+
+/// Codex byte offset plus a durable marker that the inherited fork prefix has
+/// already been rebased. Keeping this state in the watermark prevents every
+/// incremental read from rescanning a potentially very large copied history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexByteOffsetWatermark {
+    pub offset: u64,
+    pub fork_prefix_complete: bool,
+}
+
+impl CodexByteOffsetWatermark {
+    pub fn new(offset: u64, fork_prefix_complete: bool) -> Self {
+        Self {
+            offset,
+            fork_prefix_complete,
+        }
+    }
+
+    pub fn initial() -> Self {
+        Self::new(0, false)
+    }
+}
+
+impl WatermarkStrategy for CodexByteOffsetWatermark {
+    fn serialize(&self) -> String {
+        format!("{}|{}", self.offset, u8::from(self.fork_prefix_complete))
+    }
+
+    fn advance(&mut self, bytes_read: usize, _records_read: usize) {
+        self.offset += bytes_read as u64;
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl FromStr for CodexByteOffsetWatermark {
+    type Err = StreamError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (offset, complete) = s.split_once('|').ok_or_else(|| StreamError::Parse {
+            line: 0,
+            message: format!(
+                "Invalid Codex byte offset watermark: expected 'offset|0-or-1', got '{}'",
+                s
+            ),
+        })?;
+        let offset = offset.parse::<u64>().map_err(|e| StreamError::Parse {
+            line: 0,
+            message: format!("Invalid Codex byte offset: {}", e),
+        })?;
+        let fork_prefix_complete = match complete {
+            "0" => false,
+            "1" => true,
+            _ => {
+                return Err(StreamError::Parse {
+                    line: 0,
+                    message: format!(
+                        "Invalid Codex fork-prefix marker: expected 0 or 1, got '{}'",
+                        complete
+                    ),
+                });
+            }
+        };
+        Ok(Self::new(offset, fork_prefix_complete))
     }
 }
 
@@ -526,6 +599,17 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_byte_offset_watermark_roundtrip() {
+        let original = CodexByteOffsetWatermark::new(1234, true);
+        let serialized = original.serialize();
+        assert_eq!(serialized, "1234|1");
+        assert_eq!(
+            CodexByteOffsetWatermark::from_str(&serialized).unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn test_watermark_type_deserialize_record_index() {
         let wm = WatermarkType::RecordIndex.deserialize("42").unwrap();
         assert_eq!(wm.serialize(), "42");
@@ -554,6 +638,10 @@ mod tests {
     #[test]
     fn test_watermark_type_display() {
         assert_eq!(WatermarkType::ByteOffset.to_string(), "ByteOffset");
+        assert_eq!(
+            WatermarkType::CodexByteOffset.to_string(),
+            "CodexByteOffset"
+        );
         assert_eq!(WatermarkType::RecordIndex.to_string(), "RecordIndex");
         assert_eq!(WatermarkType::Timestamp.to_string(), "Timestamp");
         assert_eq!(WatermarkType::Hybrid.to_string(), "Hybrid");
@@ -568,6 +656,10 @@ mod tests {
         assert_eq!(
             WatermarkType::from_str("ByteOffset").unwrap(),
             WatermarkType::ByteOffset
+        );
+        assert_eq!(
+            WatermarkType::from_str("CodexByteOffset").unwrap(),
+            WatermarkType::CodexByteOffset
         );
         assert_eq!(
             WatermarkType::from_str("RecordIndex").unwrap(),
@@ -603,6 +695,7 @@ mod tests {
     fn test_watermark_type_roundtrip() {
         let types = [
             WatermarkType::ByteOffset,
+            WatermarkType::CodexByteOffset,
             WatermarkType::RecordIndex,
             WatermarkType::Timestamp,
             WatermarkType::Hybrid,

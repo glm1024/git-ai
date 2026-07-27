@@ -299,6 +299,26 @@ fn test_reporting_profile_stdin_update_is_atomic_and_normalized() {
     );
 }
 
+#[test]
+fn test_metrics_api_base_url_strips_every_supported_full_endpoint() {
+    let repo = TestRepo::new();
+    for endpoint_path in [
+        "/worker/metrics/upload",
+        "/api/v1/ai-code-stats/organization-options",
+        "/api/v1/ingest/ai-code-stats",
+        "/api/v1/ingest/ai-token-usage",
+    ] {
+        let full_endpoint = format!("http://stats.example.com/prod-api{endpoint_path}");
+        repo.git_ai(&["config", "set", "metrics_api_base_url", &full_endpoint])
+            .expect("set full metrics endpoint");
+        assert_eq!(
+            get_json(&repo, "metrics_api_base_url"),
+            Value::String("http://stats.example.com/prod-api".to_string()),
+            "full endpoint {endpoint_path} must be stored as a base URL"
+        );
+    }
+}
+
 /// Map a `FileConfig` field name to the CLI key used to read it back, when the
 /// two differ. Most fields share a name with their CLI key; the exceptions are
 /// enumerated here so the divergence stays explicit and reviewed.

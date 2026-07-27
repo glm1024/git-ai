@@ -480,20 +480,44 @@ pub fn get_diff_with_line_numbers(
     parse_diff_hunks(&diff_text)
 }
 
+/// Build the commit diff used by committed metrics.
+///
+/// Metrics must use Git's standard 50% rename threshold so their added/deleted
+/// line counts stay aligned with the server-side repository scan. The more
+/// permissive 1% threshold used by the interactive diff command is valuable
+/// for tracking heavily edited renames, but can misclassify an unrelated
+/// delete/add pair as a rename and silently drop AI-attributed added lines.
+pub fn get_commit_metric_diff_with_line_numbers(
+    repo: &Repository,
+    from: &str,
+    to: &str,
+) -> Result<Vec<DiffHunk>, GitAiError> {
+    let diff_text = get_diff_text_with_rename_threshold(repo, from, to, true, "50%")?;
+    parse_diff_hunks(&diff_text)
+}
+
 fn get_diff_text(
     repo: &Repository,
     from: &str,
     to: &str,
     zero_context: bool,
 ) -> Result<String, GitAiError> {
+    get_diff_text_with_rename_threshold(repo, from, to, zero_context, "1%")
+}
+
+fn get_diff_text_with_rename_threshold(
+    repo: &Repository,
+    from: &str,
+    to: &str,
+    zero_context: bool,
+    rename_threshold: &str,
+) -> Result<String, GitAiError> {
     let mut args = repo.global_args_for_exec();
     args.push("diff".to_string());
     if zero_context {
         args.push("-U0".to_string()); // No context lines, just changes
     }
-    // Use permissive rename detection so rename+edit commits are represented
-    // as renames with edit hunks instead of delete/add file pairs.
-    args.push("--find-renames=1%".to_string());
+    args.push(format!("--find-renames={rename_threshold}"));
     args.push("--no-color".to_string());
     args.push(from.to_string());
     args.push(to.to_string());
@@ -591,7 +615,7 @@ fn normalize_diff_path_token(path: &str) -> String {
     stripped.nfc().collect()
 }
 
-fn parse_new_file_path_from_plus_header_line(line: &str) -> Option<Option<String>> {
+pub(crate) fn parse_new_file_path_from_plus_header_line(line: &str) -> Option<Option<String>> {
     parse_file_path_from_header_line(line, "+++ ")
 }
 
@@ -837,7 +861,49 @@ pub fn build_diff_artifacts_from_hunks(
     authorship_log: Option<&AuthorshipLog>,
 ) -> Result<DiffBuildArtifacts, GitAiError> {
     let effective_patterns = effective_ignore_patterns(repo, &[], &[]);
-    let ignore_matcher = build_ignore_matcher(&effective_patterns);
+    build_diff_artifacts_from_hunks_with_ignore_patterns(
+        repo,
+        hunks,
+        to_commit,
+        authorship_log,
+        &effective_patterns,
+    )
+}
+
+/// Build committed-metric diff artifacts with the ignore snapshot captured
+/// when the durable metric job was enqueued.  Deferred computation may run
+/// after repository attributes or user configuration change; reusing the
+/// captured patterns keeps the headline counts and formal hunk payload aligned.
+pub(crate) fn build_diff_artifacts_from_hunks_with_ignore_patterns(
+    repo: &Repository,
+    hunks: Vec<DiffHunk>,
+    to_commit: &str,
+    authorship_log: Option<&AuthorshipLog>,
+    ignore_patterns: &[String],
+) -> Result<DiffBuildArtifacts, GitAiError> {
+    build_diff_artifacts_from_hunks_with_parent_note_and_ignore_patterns(
+        repo,
+        hunks,
+        to_commit,
+        authorship_log,
+        None,
+        ignore_patterns,
+    )
+}
+
+/// Build formal single-parent commit evidence from immutable authorship-note
+/// snapshots. Additions use the committed note; deletions use the parent note
+/// and the old-side path/line numbers. A missing parent note deliberately
+/// leaves deletions unknown rather than reconstructing provenance later.
+pub(crate) fn build_diff_artifacts_from_hunks_with_parent_note_and_ignore_patterns(
+    repo: &Repository,
+    hunks: Vec<DiffHunk>,
+    to_commit: &str,
+    authorship_log: Option<&AuthorshipLog>,
+    parent_authorship: Option<(&str, &AuthorshipLog)>,
+    ignore_patterns: &[String],
+) -> Result<DiffBuildArtifacts, GitAiError> {
+    let ignore_matcher = build_ignore_matcher(ignore_patterns);
 
     let mut hunks = hunks;
     hunks.retain(|hunk| {
@@ -850,7 +916,7 @@ pub fn build_diff_artifacts_from_hunks(
 
     let (annotations_by_file, attributions, line_details, prompts, sessions, humans, mut commits) =
         if let Some(note) = authorship_log {
-            build_line_attribution_from_note(to_commit, &hunks, note)
+            build_line_attribution_from_notes(to_commit, &hunks, note, parent_authorship)
         } else {
             (
                 BTreeMap::new(),
@@ -968,10 +1034,11 @@ fn build_line_attribution_data(
 }
 
 #[allow(clippy::type_complexity)]
-fn build_line_attribution_from_note(
+fn build_line_attribution_from_notes(
     to_commit: &str,
     hunks: &[DiffHunk],
     note: &AuthorshipLog,
+    parent_authorship: Option<(&str, &AuthorshipLog)>,
 ) -> (
     BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
     HashMap<DiffLineKey, Attribution>,
@@ -985,10 +1052,22 @@ fn build_line_attribution_from_note(
         BTreeMap::new();
     let mut attributions: HashMap<DiffLineKey, Attribution> = HashMap::new();
     let mut line_details: HashMap<DiffLineKey, LineAttributionDetail> = HashMap::new();
-    let prompts: BTreeMap<String, PromptRecord> = note.metadata.prompts.clone();
-    let sessions: BTreeMap<String, SessionRecord> = note.metadata.sessions.clone();
-    let humans: BTreeMap<String, HumanRecord> = note.metadata.humans.clone();
+    let mut prompts: BTreeMap<String, PromptRecord> = note.metadata.prompts.clone();
+    let mut sessions: BTreeMap<String, SessionRecord> = note.metadata.sessions.clone();
+    let mut humans: BTreeMap<String, HumanRecord> = note.metadata.humans.clone();
     let commits: BTreeMap<String, DiffCommitMetadata> = BTreeMap::new();
+
+    if let Some((_, parent_note)) = parent_authorship {
+        for (id, record) in &parent_note.metadata.prompts {
+            prompts.entry(id.clone()).or_insert_with(|| record.clone());
+        }
+        for (id, record) in &parent_note.metadata.sessions {
+            sessions.entry(id.clone()).or_insert_with(|| record.clone());
+        }
+        for (id, record) in &parent_note.metadata.humans {
+            humans.entry(id.clone()).or_insert_with(|| record.clone());
+        }
+    }
 
     let added_lines_by_file = collect_lines_by_file(hunks, LineSide::New);
     for (file_path, lines) in &added_lines_by_file {
@@ -1017,30 +1096,8 @@ fn build_line_attribution_from_note(
             }
 
             if let Some(hash) = found_hash {
-                let is_prompt = prompts.contains_key(hash) || hash.starts_with("s_");
-                let is_human = hash.starts_with("h_");
-
-                let (prompt_id, human_id, attribution) = if is_prompt {
-                    let tool = prompts
-                        .get(hash)
-                        .map(|p| p.agent_id.tool.clone())
-                        .unwrap_or_else(|| {
-                            let session_key = extract_session_id(hash);
-                            sessions
-                                .get(session_key)
-                                .map(|s| s.agent_id.tool.clone())
-                                .unwrap_or_else(|| "unknown".to_string())
-                        });
-                    (Some(hash.to_string()), None, Attribution::Ai(tool))
-                } else if is_human {
-                    (
-                        None,
-                        Some(hash.to_string()),
-                        Attribution::Human(hash.to_string()),
-                    )
-                } else {
-                    (None, None, Attribution::NoData)
-                };
+                let (prompt_id, human_id, attribution) =
+                    attribution_for_note_hash(hash, &prompts, &sessions);
 
                 if let Some(ref pid) = prompt_id {
                     file_annotations
@@ -1076,22 +1133,54 @@ fn build_line_attribution_from_note(
         }
     }
 
-    // Deleted lines: include with NoData attribution (no blame)
-    // Use file_path (new name) for DiffLineKey to match build_json_hunk_segments lookup
+    // Deleted lines use only the immutable parent-note snapshot. If it was not
+    // available when the metric job was enqueued, provenance stays unknown.
     for hunk in hunks {
+        let old_file_path = hunk.old_file_path.as_deref().unwrap_or(&hunk.file_path);
+        let parent_file_attestation = parent_authorship.and_then(|(_, parent_note)| {
+            parent_note
+                .attestations
+                .iter()
+                .find(|attestation| attestation.file_path == old_file_path)
+        });
         for line in &hunk.deleted_lines {
             let key = DiffLineKey {
-                file: hunk.file_path.clone(),
+                file: old_file_path.to_string(),
                 line: *line,
                 side: LineSide::Old,
             };
-            attributions.insert(key.clone(), Attribution::NoData);
+            let found_hash = parent_file_attestation.and_then(|attestation| {
+                attestation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.line_ranges.iter().any(|range| range.contains(*line)))
+                    .map(|entry| entry.hash.as_str())
+            });
+            let (prompt_id, human_id, attribution) = if let Some(hash) = found_hash {
+                let parent_note = parent_authorship
+                    .map(|(_, parent_note)| parent_note)
+                    .expect("parent note exists when a parent attestation was found");
+                attribution_for_note_hash(
+                    hash,
+                    &parent_note.metadata.prompts,
+                    &parent_note.metadata.sessions,
+                )
+            } else {
+                (None, None, Attribution::NoData)
+            };
+            let original_commit_sha =
+                if matches!(&attribution, Attribution::Ai(_) | Attribution::Human(_)) {
+                    parent_authorship.map(|(parent_sha, _)| parent_sha.to_string())
+                } else {
+                    None
+                };
+            attributions.insert(key.clone(), attribution);
             line_details.insert(
                 key,
                 LineAttributionDetail {
-                    commit_sha: None,
-                    prompt_id: None,
-                    human_id: None,
+                    commit_sha: original_commit_sha,
+                    prompt_id,
+                    human_id,
                 },
             );
         }
@@ -1106,6 +1195,34 @@ fn build_line_attribution_from_note(
         humans,
         commits,
     )
+}
+
+fn attribution_for_note_hash(
+    hash: &str,
+    prompts: &BTreeMap<String, PromptRecord>,
+    sessions: &BTreeMap<String, SessionRecord>,
+) -> (Option<String>, Option<String>, Attribution) {
+    if prompts.contains_key(hash) || hash.starts_with("s_") {
+        let tool = prompts
+            .get(hash)
+            .map(|prompt| prompt.agent_id.tool.clone())
+            .unwrap_or_else(|| {
+                let session_key = extract_session_id(hash);
+                sessions
+                    .get(session_key)
+                    .map(|session| session.agent_id.tool.clone())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+        (Some(hash.to_string()), None, Attribution::Ai(tool))
+    } else if hash.starts_with("h_") {
+        (
+            None,
+            Some(hash.to_string()),
+            Attribution::Human(hash.to_string()),
+        )
+    } else {
+        (None, None, Attribution::NoData)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1349,7 +1466,10 @@ fn collect_old_lines_by_blame_and_result(
             .old_file_path
             .clone()
             .unwrap_or_else(|| hunk.file_path.clone());
-        let result_file = hunk.file_path.clone();
+        // Formal deletion evidence is keyed and emitted on the old side. This
+        // is especially important for renames where the removed content never
+        // existed under the result path.
+        let result_file = blame_file.clone();
         lines_by_file_pair
             .entry((blame_file, result_file))
             .or_default()
@@ -1369,9 +1489,10 @@ fn build_line_content_map(hunks: &[DiffHunk]) -> HashMap<DiffLineKey, String> {
 
     for hunk in hunks {
         for (line, content) in hunk.deleted_lines.iter().zip(hunk.deleted_contents.iter()) {
+            let file_path = hunk.old_file_path.as_deref().unwrap_or(&hunk.file_path);
             content_map.insert(
                 DiffLineKey {
-                    file: hunk.file_path.clone(),
+                    file: file_path.to_string(),
                     line: *line,
                     side: LineSide::Old,
                 },
@@ -1448,6 +1569,13 @@ fn build_json_hunk_segments(
         return Ok(Vec::new());
     }
 
+    let evidence_file_path = match side {
+        LineSide::Old => diff_hunk
+            .old_file_path
+            .as_deref()
+            .unwrap_or(&diff_hunk.file_path),
+        LineSide::New => &diff_hunk.file_path,
+    };
     let mut segments: Vec<DiffJsonHunk> = Vec::new();
     let mut current_start = 0u32;
     let mut current_end = 0u32;
@@ -1483,7 +1611,7 @@ fn build_json_hunk_segments(
             original_commit_sha: current_original_commit_sha.clone(),
             start_line: *current_start,
             end_line: *current_end,
-            file_path: diff_hunk.file_path.clone(),
+            file_path: evidence_file_path.to_string(),
             prompt_id: current_prompt_id.clone(),
             session_id,
             human_id: current_human_id.clone(),
@@ -1499,7 +1627,7 @@ fn build_json_hunk_segments(
 
     for line in lines {
         let key = DiffLineKey {
-            file: diff_hunk.file_path.clone(),
+            file: evidence_file_path.to_string(),
             line: *line,
             side: side.clone(),
         };
@@ -2241,6 +2369,7 @@ pub fn get_diff_json_filtered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authorship::authorship_log_serialization::{AttestationEntry, FileAttestation};
     use crate::authorship::working_log::AgentId;
     use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -2695,6 +2824,174 @@ index 7f4f5e8..1c84817 100644
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].file_path, "new_name.txt");
         assert_eq!(result[0].old_file_path, Some("old_name.txt".to_string()));
+    }
+
+    #[test]
+    fn parent_note_attributes_renamed_deletion_on_old_side() {
+        let prompt_id = "s_parent-session::t_parent-tool";
+        let session_id = extract_session_id(prompt_id);
+        let mut parent_note = AuthorshipLog::new();
+        let mut file = FileAttestation::new("old_name.txt".to_string());
+        file.add_entry(AttestationEntry::new(
+            prompt_id.to_string(),
+            vec![LineRange::Single(2)],
+        ));
+        parent_note.attestations.push(file);
+        parent_note.metadata.prompts.insert(
+            prompt_id.to_string(),
+            PromptRecord {
+                agent_id: AgentId {
+                    tool: "codex".to_string(),
+                    id: "parent-session".to_string(),
+                    model: "gpt-5".to_string(),
+                },
+                human_author: None,
+                messages_url: None,
+                total_additions: 1,
+                total_deletions: 0,
+                accepted_lines: 1,
+                overriden_lines: 0,
+                custom_attributes: None,
+            },
+        );
+        parent_note.metadata.sessions.insert(
+            session_id.to_string(),
+            SessionRecord {
+                agent_id: AgentId {
+                    tool: "codex".to_string(),
+                    id: "parent-session".to_string(),
+                    model: "gpt-5".to_string(),
+                },
+                human_author: None,
+                custom_attributes: None,
+            },
+        );
+
+        let current_note = AuthorshipLog::new();
+        let hunk = DiffHunk {
+            file_path: "new_name.txt".to_string(),
+            old_file_path: Some("old_name.txt".to_string()),
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 0,
+            deleted_lines: vec![2],
+            added_lines: Vec::new(),
+            deleted_contents: vec!["AI-owned old line".to_string()],
+            added_contents: Vec::new(),
+        };
+        let (_, attributions, details, prompts, sessions, _, _) = build_line_attribution_from_notes(
+            "new-commit",
+            std::slice::from_ref(&hunk),
+            &current_note,
+            Some(("parent-commit", &parent_note)),
+        );
+        let key = DiffLineKey {
+            file: "old_name.txt".to_string(),
+            line: 2,
+            side: LineSide::Old,
+        };
+        assert!(matches!(
+            attributions.get(&key),
+            Some(Attribution::Ai(tool)) if tool == "codex"
+        ));
+        let detail = details.get(&key).expect("old-side detail");
+        assert_eq!(detail.prompt_id.as_deref(), Some(prompt_id));
+        assert_eq!(detail.commit_sha.as_deref(), Some("parent-commit"));
+        assert!(detail.human_id.is_none());
+        assert!(prompts.contains_key(prompt_id));
+        assert!(sessions.contains_key(session_id));
+
+        let contents = build_line_content_map(&[hunk]);
+        assert_eq!(
+            contents.get(&key).map(String::as_str),
+            Some("AI-owned old line")
+        );
+        assert_eq!(
+            hash_hunk_content(&["AI-owned old line".to_string()]),
+            format!("{:x}", Sha256::digest(b"AI-owned old line"))
+        );
+    }
+
+    #[test]
+    fn parent_note_human_and_unknown_deletions_are_not_ai() {
+        let mut parent_note = AuthorshipLog::new();
+        let mut file = FileAttestation::new("old.txt".to_string());
+        file.add_entry(AttestationEntry::new(
+            "h_known".to_string(),
+            vec![LineRange::Single(1)],
+        ));
+        file.add_entry(AttestationEntry::new(
+            "legacy-unrecognized".to_string(),
+            vec![LineRange::Single(2)],
+        ));
+        parent_note.attestations.push(file);
+        parent_note.metadata.humans.insert(
+            "h_known".to_string(),
+            HumanRecord {
+                author: "Known Human <human@example.com>".to_string(),
+            },
+        );
+        let hunk = DiffHunk {
+            file_path: "old.txt".to_string(),
+            old_file_path: None,
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 0,
+            deleted_lines: vec![1, 2, 3],
+            added_lines: Vec::new(),
+            deleted_contents: vec![
+                "human".to_string(),
+                "legacy".to_string(),
+                "unknown".to_string(),
+            ],
+            added_contents: Vec::new(),
+        };
+        let current_note = AuthorshipLog::new();
+        let (_, attributions, details, _, _, _, _) = build_line_attribution_from_notes(
+            "new-commit",
+            &[hunk],
+            &current_note,
+            Some(("parent-commit", &parent_note)),
+        );
+
+        let key = |line| DiffLineKey {
+            file: "old.txt".to_string(),
+            line,
+            side: LineSide::Old,
+        };
+        assert!(matches!(
+            attributions.get(&key(1)),
+            Some(Attribution::Human(id)) if id == "h_known"
+        ));
+        assert!(matches!(
+            attributions.get(&key(2)),
+            Some(Attribution::NoData)
+        ));
+        assert!(matches!(
+            attributions.get(&key(3)),
+            Some(Attribution::NoData)
+        ));
+        assert!(details.values().all(|detail| detail.prompt_id.is_none()));
+        assert_eq!(
+            details
+                .get(&key(1))
+                .and_then(|detail| detail.commit_sha.as_deref()),
+            Some("parent-commit")
+        );
+        assert!(
+            details
+                .get(&key(2))
+                .and_then(|detail| detail.commit_sha.as_deref())
+                .is_none()
+        );
+        assert!(
+            details
+                .get(&key(3))
+                .and_then(|detail| detail.commit_sha.as_deref())
+                .is_none()
+        );
     }
 
     #[test]

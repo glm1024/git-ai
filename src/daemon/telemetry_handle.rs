@@ -221,14 +221,54 @@ pub fn send_via_daemon(request: &ControlRequest) -> Result<ControlResponse, Stri
 
 /// Submit telemetry envelopes to the daemon over the control socket.
 ///
-/// Fire-and-forget: sends the request but doesn't propagate errors
-/// (silently drops on failure since telemetry is best-effort).
-pub fn submit_telemetry(envelopes: Vec<TelemetryEnvelope>) {
+/// Formal metric events fall back to a synchronous local SQLite transaction
+/// when the daemon cannot be reached or rejects the request. Other telemetry
+/// retains its existing best-effort behavior.
+pub fn submit_telemetry(envelopes: Vec<TelemetryEnvelope>) -> Result<(), String> {
     if envelopes.is_empty() {
-        return;
+        return Ok(());
     }
+    submit_telemetry_with(envelopes, send_via_daemon, |events| {
+        crate::daemon::telemetry_worker::persist_metrics_to_db_blocking(events)
+    })
+}
+
+fn submit_telemetry_with<Send, Persist>(
+    envelopes: Vec<TelemetryEnvelope>,
+    send: Send,
+    persist: Persist,
+) -> Result<(), String>
+where
+    Send: FnOnce(&ControlRequest) -> Result<ControlResponse, String>,
+    Persist: FnOnce(&[crate::metrics::MetricEvent]) -> Result<(), crate::error::GitAiError>,
+{
+    let metric_events = envelopes
+        .iter()
+        .filter_map(|envelope| match envelope {
+            TelemetryEnvelope::Metrics { events } => Some(events.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
     let request = ControlRequest::SubmitTelemetry { envelopes };
-    let _ = send_via_daemon(&request);
+    let submission_error = match send(&request) {
+        Ok(response) if response.ok => return Ok(()),
+        Ok(response) => response
+            .error
+            .unwrap_or_else(|| "daemon rejected telemetry without an error message".to_string()),
+        Err(error) => error,
+    };
+
+    if metric_events.is_empty() {
+        return Ok(());
+    }
+
+    persist(&metric_events).map_err(|fallback_error| {
+        format!(
+            "daemon metric submission failed ({submission_error}); synchronous local fallback failed ({fallback_error})"
+        )
+    })
 }
 
 /// Submit CAS sync records to the daemon over the control socket.
@@ -250,4 +290,70 @@ pub fn submit_cas(records: Vec<CasSyncPayload>) {
 pub fn submit_notes() {
     let request = ControlRequest::FlushNotes;
     let _ = send_via_daemon(&request);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::GitAiError;
+    use crate::metrics::MetricEvent;
+    use std::cell::Cell;
+
+    fn metric_envelope() -> TelemetryEnvelope {
+        TelemetryEnvelope::Metrics {
+            events: vec![MetricEvent {
+                timestamp: 1,
+                event_id: 1,
+                values: Default::default(),
+                attrs: Default::default(),
+            }],
+        }
+    }
+
+    #[test]
+    fn failed_daemon_submission_persists_metrics_with_local_fallback() {
+        let fallback_called = Cell::new(false);
+
+        submit_telemetry_with(
+            vec![metric_envelope()],
+            |_| Err("daemon socket closed".to_string()),
+            |_| {
+                fallback_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(fallback_called.get());
+    }
+
+    #[test]
+    fn negative_daemon_ack_uses_fallback_and_reports_fallback_failure() {
+        let error = submit_telemetry_with(
+            vec![metric_envelope()],
+            |_| Ok(ControlResponse::err("metrics transaction failed")),
+            |_| Err(GitAiError::Generic("fallback database failed".to_string())),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("metrics transaction failed"));
+        assert!(error.contains("fallback database failed"));
+    }
+
+    #[test]
+    fn successful_daemon_ack_does_not_duplicate_metrics_in_fallback() {
+        let fallback_called = Cell::new(false);
+
+        submit_telemetry_with(
+            vec![metric_envelope()],
+            |_| Ok(ControlResponse::ok(None, None)),
+            |_| {
+                fallback_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!fallback_called.get());
+    }
 }

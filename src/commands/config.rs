@@ -3,12 +3,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Read;
-use url::Url;
 
 use crate::config::{AuthorConfig, CodexHooksFormat, NotesBackendKind, ReportingProfile};
 use crate::git::repository::find_repository_in_path;
-
-const METRICS_UPLOAD_PATH: &str = "/worker/metrics/upload";
 
 #[derive(Debug, Deserialize)]
 struct ReportingProfilePayload {
@@ -1678,28 +1675,7 @@ fn parse_custom_attributes_object(value: &str) -> Result<HashMap<String, String>
 }
 
 fn parse_metrics_api_base_url(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("metrics_api_base_url cannot be empty".to_string());
-    }
-    let mut url = Url::parse(trimmed)
-        .map_err(|e| format!("metrics_api_base_url is not a valid URL: {}", e))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("metrics_api_base_url must use http:// or https://".to_string());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("metrics_api_base_url must not include user credentials".to_string());
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("metrics_api_base_url must not include a query or fragment".to_string());
-    }
-
-    let path = url.path().trim_end_matches('/').to_string();
-    if let Some(prefix) = path.strip_suffix(METRICS_UPLOAD_PATH) {
-        url.set_path(if prefix.is_empty() { "/" } else { prefix });
-    }
-    let normalized = url.as_str().trim_end_matches('/').to_string();
-    Ok(normalized)
+    crate::config::normalize_metrics_api_base_url(value)
 }
 
 fn validate_reporting_profile(profile: ReportingProfile) -> Result<ReportingProfile, String> {

@@ -16,6 +16,13 @@ pub enum GitAiError {
     FromUtf8Error(std::string::FromUtf8Error),
     PresetError(String),
     SqliteError(rusqlite::Error),
+    /// HTTP response returned by a remote API. Keeping the status structured
+    /// lets callers distinguish retryable outages from deterministic payload
+    /// failures without parsing display text.
+    HttpStatusError {
+        status: u16,
+        message: String,
+    },
     Generic(String),
 }
 
@@ -38,6 +45,9 @@ impl fmt::Display for GitAiError {
             GitAiError::FromUtf8Error(e) => write!(f, "From UTF-8 error: {}", e),
             GitAiError::PresetError(e) => write!(f, "{}", e),
             GitAiError::SqliteError(e) => write!(f, "SQLite error: {}", e),
+            GitAiError::HttpStatusError { status, message } => {
+                write!(f, "HTTP {}: {}", status, message)
+            }
             GitAiError::Generic(e) => write!(f, "Generic error: {}", e),
             GitAiError::GixError(e) => write!(f, "Gix error: {}", e),
         }
@@ -92,6 +102,10 @@ impl Clone for GitAiError {
             GitAiError::FromUtf8Error(e) => GitAiError::FromUtf8Error(e.clone()),
             GitAiError::PresetError(s) => GitAiError::PresetError(s.clone()),
             GitAiError::SqliteError(e) => GitAiError::Generic(format!("SQLite error: {}", e)),
+            GitAiError::HttpStatusError { status, message } => GitAiError::HttpStatusError {
+                status: *status,
+                message: message.clone(),
+            },
             GitAiError::Generic(s) => GitAiError::Generic(s.clone()),
             GitAiError::GixError(e) => GitAiError::Generic(format!("Gix error: {}", e)),
         }
@@ -188,6 +202,19 @@ mod tests {
         let display = format!("{}", err);
         assert!(display.contains("Generic error"));
         assert!(display.contains("custom error message"));
+    }
+
+    #[test]
+    fn test_http_status_error_preserves_status_across_display_and_clone() {
+        let error = GitAiError::HttpStatusError {
+            status: 413,
+            message: "payload too large".to_string(),
+        };
+        assert_eq!(error.to_string(), "HTTP 413: payload too large");
+        assert!(matches!(
+            error.clone(),
+            GitAiError::HttpStatusError { status: 413, .. }
+        ));
     }
 
     #[test]

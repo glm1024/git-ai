@@ -6,7 +6,9 @@ const YIELD_WINDOW_SECS: u32 = 4 * 3600;
 
 use crate::error::GitAiError;
 use crate::metrics::attrs::attr_pos;
-use crate::metrics::db::{MetricHistoryRecord, MetricsDatabase};
+use crate::metrics::db::{
+    CompactSessionRecord, CompactTokenRecord, MetricHistoryRecord, MetricsDatabase,
+};
 use crate::metrics::events::{checkpoint_pos, committed_pos, session_event_pos};
 use crate::metrics::pos_encoded::{
     sparse_get_string, sparse_get_u32, sparse_get_vec_string, sparse_get_vec_u32,
@@ -186,16 +188,25 @@ const USAGE_EVENT_IDS: &[u16] = &[
 ];
 const SESSION_RAW_JSON_KEY: &str = "0";
 
-/// Acquire the global DB lock and fetch metric history for the given window.
-fn fetch_metric_history(
+type ActivitySources = (
+    Vec<MetricHistoryRecord>,
+    Vec<CompactSessionRecord>,
+    Vec<CompactTokenRecord>,
+);
+
+fn fetch_activity_sources(
     since_ts: u32,
     repo_filter: Option<&str>,
-) -> Result<Vec<MetricHistoryRecord>, GitAiError> {
+) -> Result<ActivitySources, GitAiError> {
     let db = MetricsDatabase::global()?;
     let db_lock = db
         .lock()
         .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
-    db_lock.get_metric_history(since_ts, repo_filter, USAGE_EVENT_IDS)
+    Ok((
+        db_lock.get_metric_history(since_ts, repo_filter, USAGE_EVENT_IDS)?,
+        db_lock.get_compact_session_history(since_ts, repo_filter)?,
+        db_lock.get_compact_token_history(since_ts, repo_filter)?,
+    ))
 }
 
 /// Aggregate metric history since `since_ts` (Unix seconds) into activity stats.
@@ -208,17 +219,36 @@ pub fn compute_activity(
     granularity: BucketGranularity,
     repo_filter: Option<&str>,
 ) -> Result<LocalActivityStats, GitAiError> {
-    let records = fetch_metric_history(since_ts, repo_filter)?;
+    let (records, sessions, tokens) = fetch_activity_sources(since_ts, repo_filter)?;
     let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
-    compute_activity_from_records(&refs, since_ts, period_label, granularity)
+    compute_activity_from_sources(
+        &refs,
+        &sessions,
+        &tokens,
+        since_ts,
+        period_label,
+        granularity,
+    )
 }
 
 /// Aggregate a pre-fetched slice of `MetricHistoryRecord`s into activity stats.
 ///
 /// Separated from `compute_activity` so callers that already hold all events
 /// (e.g. `compute_repo_summaries`) can avoid re-fetching from the DB per repo.
+#[cfg(test)]
 fn compute_activity_from_records(
     records: &[&MetricHistoryRecord],
+    since_ts: u32,
+    period_label: String,
+    granularity: BucketGranularity,
+) -> Result<LocalActivityStats, GitAiError> {
+    compute_activity_from_sources(records, &[], &[], since_ts, period_label, granularity)
+}
+
+fn compute_activity_from_sources(
+    records: &[&MetricHistoryRecord],
+    compact_sessions: &[CompactSessionRecord],
+    compact_tokens: &[CompactTokenRecord],
     since_ts: u32,
     period_label: String,
     granularity: BucketGranularity,
@@ -268,6 +298,51 @@ fn compute_activity_from_records(
     // First timestamp seen per session, for longest-session duration.
     let mut session_first_ts: HashMap<String, u32> = HashMap::new();
     let mut commit_timestamps: Vec<u32> = Vec::new();
+
+    for session in compact_sessions {
+        if session_ids.insert(session.session_id.clone()) {
+            *session_tool_counts.entry(session.tool.clone()).or_insert(0) += 1;
+        }
+        session_first_ts
+            .entry(session.session_id.clone())
+            .and_modify(|first| *first = (*first).min(session.first_ts))
+            .or_insert(session.first_ts);
+        session_last_ts
+            .entry(session.session_id.clone())
+            .and_modify(|last| *last = (*last).max(session.last_ts))
+            .or_insert(session.last_ts);
+    }
+
+    let mut compact_token_start_by_session: HashMap<String, u32> = HashMap::new();
+    let mut compact_cumulative_sessions: HashSet<String> = HashSet::new();
+    for token in compact_tokens {
+        compact_token_start_by_session
+            .entry(token.session_id.clone())
+            .and_modify(|first| *first = (*first).min(token.usage_ts))
+            .or_insert(token.usage_ts);
+        if token.cumulative_source {
+            compact_cumulative_sessions.insert(token.session_id.clone());
+        }
+        let input = if token.cumulative_source {
+            token.input.saturating_sub(token.cache_read)
+        } else {
+            token.input
+        };
+        message_usage.insert(
+            token.source_key.clone(),
+            (
+                token.model.clone().unwrap_or_else(|| "unknown".to_string()),
+                TokenAccum {
+                    input,
+                    output: token.output,
+                    cache_read: token.cache_read,
+                    cache_creation: token.cache_write,
+                },
+                token.usage_ts,
+                token.session_id.clone(),
+            ),
+        );
+    }
 
     for record in records {
         let event = &record.event;
@@ -327,16 +402,22 @@ fn compute_activity_from_records(
                     let first = session_first_ts.entry(sid).or_insert(record.ts);
                     *first = (*first).min(record.ts);
                 }
-                let tool = sparse_get_string(&event.attrs, attr_pos::TOOL)
+                let session_id = sparse_get_string(&event.attrs, attr_pos::SESSION_ID)
                     .flatten()
                     .unwrap_or_default();
-                if tool == "codex" {
-                    aggregate_codex_tokens(event, record.ts, &mut codex_sessions);
-                } else {
-                    let sid = sparse_get_string(&event.attrs, attr_pos::SESSION_ID)
+                let covered_by_compact = compact_cumulative_sessions.contains(&session_id)
+                    || compact_token_start_by_session
+                        .get(&session_id)
+                        .is_some_and(|first_compact_ts| record.ts >= *first_compact_ts);
+                if !covered_by_compact {
+                    let tool = sparse_get_string(&event.attrs, attr_pos::TOOL)
                         .flatten()
                         .unwrap_or_default();
-                    aggregate_session_tokens(event, record.ts, sid, &mut message_usage);
+                    if tool == "codex" {
+                        aggregate_codex_tokens(event, record.ts, &mut codex_sessions);
+                    } else {
+                        aggregate_session_tokens(event, record.ts, session_id, &mut message_usage);
+                    }
                 }
             }
             _ => {}
@@ -1224,26 +1305,63 @@ pub struct RepoActivitySummary {
 }
 
 /// Aggregate a pre-fetched slice of events into a per-repository breakdown.
+#[cfg(test)]
 fn repo_summaries_from_records(
     all_records: &[MetricHistoryRecord],
     since_ts: u32,
     granularity: BucketGranularity,
 ) -> Result<Vec<RepoActivitySummary>, GitAiError> {
-    // Group records by repo_url, skipping events with no repo (NULL) — these
-    // predate repo_url emission and have no meaningful identity to display.
-    let mut by_repo: HashMap<&str, Vec<&MetricHistoryRecord>> = HashMap::new();
-    for record in all_records {
-        if let Some(ref url) = record.repo_url {
-            by_repo.entry(url.as_str()).or_default().push(record);
-        }
-    }
+    repo_summaries_from_sources(all_records, &[], &[], since_ts, granularity)
+}
 
-    let mut summaries: Vec<RepoActivitySummary> = by_repo
+fn repo_summaries_from_sources(
+    all_records: &[MetricHistoryRecord],
+    all_sessions: &[CompactSessionRecord],
+    all_tokens: &[CompactTokenRecord],
+    since_ts: u32,
+    granularity: BucketGranularity,
+) -> Result<Vec<RepoActivitySummary>, GitAiError> {
+    let mut repo_urls: BTreeSet<&str> = all_records
+        .iter()
+        .filter_map(|record| record.repo_url.as_deref())
+        .collect();
+    repo_urls.extend(
+        all_sessions
+            .iter()
+            .filter_map(|session| session.repo_url.as_deref()),
+    );
+    repo_urls.extend(
+        all_tokens
+            .iter()
+            .filter_map(|token| token.repo_url.as_deref()),
+    );
+
+    let mut summaries: Vec<RepoActivitySummary> = repo_urls
         .into_iter()
-        .filter_map(|(url, records)| {
-            let stats =
-                compute_activity_from_records(&records, since_ts, String::new(), granularity)
-                    .ok()?;
+        .filter_map(|url| {
+            let records = all_records
+                .iter()
+                .filter(|record| record.repo_url.as_deref() == Some(url))
+                .collect::<Vec<_>>();
+            let sessions = all_sessions
+                .iter()
+                .filter(|session| session.repo_url.as_deref() == Some(url))
+                .cloned()
+                .collect::<Vec<_>>();
+            let tokens = all_tokens
+                .iter()
+                .filter(|token| token.repo_url.as_deref() == Some(url))
+                .cloned()
+                .collect::<Vec<_>>();
+            let stats = compute_activity_from_sources(
+                &records,
+                &sessions,
+                &tokens,
+                since_ts,
+                String::new(),
+                granularity,
+            )
+            .ok()?;
             Some(RepoActivitySummary {
                 repo_url: url.to_string(),
                 ai_lines: stats.commits.ai_lines,
@@ -1266,10 +1384,17 @@ pub fn compute_all(
     granularity: BucketGranularity,
     repo_filter: Option<&str>,
 ) -> Result<(LocalActivityStats, Vec<RepoActivitySummary>), GitAiError> {
-    let records = fetch_metric_history(since_ts, repo_filter)?;
+    let (records, sessions, tokens) = fetch_activity_sources(since_ts, repo_filter)?;
     let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
-    let stats = compute_activity_from_records(&refs, since_ts, period_label, granularity)?;
-    let repos = repo_summaries_from_records(&records, since_ts, granularity)?;
+    let stats = compute_activity_from_sources(
+        &refs,
+        &sessions,
+        &tokens,
+        since_ts,
+        period_label,
+        granularity,
+    )?;
+    let repos = repo_summaries_from_sources(&records, &sessions, &tokens, since_ts, granularity)?;
     Ok((stats, repos))
 }
 
@@ -1283,8 +1408,8 @@ pub fn compute_repo_summaries(
     granularity: BucketGranularity,
     repo_filter: Option<&str>,
 ) -> Result<Vec<RepoActivitySummary>, GitAiError> {
-    let all_records = fetch_metric_history(since_ts, repo_filter)?;
-    repo_summaries_from_records(&all_records, since_ts, granularity)
+    let (records, sessions, tokens) = fetch_activity_sources(since_ts, repo_filter)?;
+    repo_summaries_from_sources(&records, &sessions, &tokens, since_ts, granularity)
 }
 
 #[cfg(test)]
@@ -1362,16 +1487,27 @@ mod tests {
     }
 
     fn claude_session(ts: u32, repo_url: Option<&str>, session_id: &str) -> MetricHistoryRecord {
+        claude_session_usage(ts, repo_url, session_id, "msg-1", (100, 50, 20, 10))
+    }
+
+    fn claude_session_usage(
+        ts: u32,
+        repo_url: Option<&str>,
+        session_id: &str,
+        message_id: &str,
+        usage: (u64, u64, u64, u64),
+    ) -> MetricHistoryRecord {
+        let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) = usage;
         let values = SessionEventValues::new(json!({
             "message": {
-                "id": "msg-1",
+                "id": message_id,
                 "role": "assistant",
                 "model": "claude-sonnet-4-6-20250101",
                 "usage": {
-                    "input_tokens": 100,
-                    "output_tokens": 50,
-                    "cache_read_input_tokens": 20,
-                    "cache_creation_input_tokens": 10
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_input_tokens": cache_read_tokens,
+                    "cache_creation_input_tokens": cache_write_tokens
                 }
             }
         }));
@@ -1427,6 +1563,101 @@ mod tests {
         assert_eq!(stats.tokens.cache_creation, 10);
         assert_eq!(stats.tokens.by_model[0].model, "claude-sonnet-4-6");
         assert!(stats.buckets.iter().any(|bucket| bucket.ai_lines == 10));
+    }
+
+    #[test]
+    fn compact_session_history_matches_raw_session_usage_semantics() {
+        let now = now_ts();
+        let repo = "github.com/acme/project";
+        let session_ts = now.saturating_sub(600);
+        let commit_ts = now.saturating_sub(300);
+        let records = [
+            checkpoint(session_ts + 10, repo, 12),
+            committed(commit_ts, repo, 10, 2, 12),
+        ];
+        let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
+        let sessions = [CompactSessionRecord {
+            session_id: "session-1".to_string(),
+            first_ts: session_ts,
+            last_ts: session_ts,
+            tool: "claude".to_string(),
+            model: Some("claude-sonnet-4-6-20250101".to_string()),
+            repo_url: Some(repo.to_string()),
+        }];
+        let tokens = [CompactTokenRecord {
+            source_key: "ts1:test".to_string(),
+            session_id: "session-1".to_string(),
+            usage_ts: session_ts,
+            model: Some("claude-sonnet-4-6-20250101".to_string()),
+            input: 100,
+            output: 50,
+            cache_read: 20,
+            cache_write: 10,
+            cumulative_source: false,
+            repo_url: Some(repo.to_string()),
+        }];
+
+        let stats = compute_activity_from_sources(
+            &refs,
+            &sessions,
+            &tokens,
+            now.saturating_sub(24 * 3600),
+            "last 1 day".to_string(),
+            BucketGranularity::Daily,
+        )
+        .unwrap();
+
+        assert_eq!(stats.sessions.total, 1);
+        assert_eq!(stats.sessions.yield_stats.shipped, 1);
+        assert_eq!(stats.tokens.input, 100);
+        assert_eq!(stats.tokens.output, 50);
+        assert_eq!(stats.tokens.cache_read, 20);
+        assert_eq!(stats.tokens.cache_creation, 10);
+        assert_eq!(stats.tokens.by_model[0].model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn mixed_legacy_and_compact_history_keeps_old_tokens_without_counting_overlap_twice() {
+        let now = now_ts();
+        let repo = "github.com/acme/project";
+        let old_ts = now.saturating_sub(1_000);
+        let compact_start_ts = now.saturating_sub(500);
+        let records = [
+            claude_session_usage(old_ts, Some(repo), "session-1", "msg-old", (10, 5, 0, 0)),
+            claude_session_usage(
+                compact_start_ts,
+                Some(repo),
+                "session-1",
+                "msg-overlap",
+                (20, 10, 0, 0),
+            ),
+        ];
+        let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
+        let tokens = [CompactTokenRecord {
+            source_key: "ts1:compact-overlap".to_string(),
+            session_id: "session-1".to_string(),
+            usage_ts: compact_start_ts,
+            model: Some("claude-sonnet-4-6-20250101".to_string()),
+            input: 20,
+            output: 10,
+            cache_read: 0,
+            cache_write: 0,
+            cumulative_source: false,
+            repo_url: Some(repo.to_string()),
+        }];
+
+        let stats = compute_activity_from_sources(
+            &refs,
+            &[],
+            &tokens,
+            now.saturating_sub(24 * 3600),
+            "last 1 day".to_string(),
+            BucketGranularity::Daily,
+        )
+        .unwrap();
+
+        assert_eq!(stats.tokens.input, 30);
+        assert_eq!(stats.tokens.output, 15);
     }
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {

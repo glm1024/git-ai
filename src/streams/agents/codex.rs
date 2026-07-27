@@ -4,12 +4,25 @@ use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::mdm::utils::codex_home_dir;
 use crate::streams::agent::{Agent, PathResolverKind, StreamDescriptor};
 use crate::streams::sweep::{DiscoveredSession, StreamFormat, SweepStrategy};
-use crate::streams::types::{StreamBatch, StreamError};
-use crate::streams::watermark::{ByteOffsetWatermark, WatermarkStrategy};
+use crate::streams::types::{StreamBatch, StreamError, TOKEN_BASELINE_ONLY_FIELD};
+use crate::streams::watermark::{CodexByteOffsetWatermark, WatermarkStrategy};
+use chrono::DateTime;
+use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+struct CodexForkPrefix {
+    boundary_offset: u64,
+    baseline_event: Option<Value>,
+}
+
+enum InitialRead {
+    Regular,
+    IncompleteSubagent,
+    ReadySubagent(CodexForkPrefix),
+}
 
 /// Codex agent that reads Codex JSONL transcript files.
 pub struct CodexAgent {
@@ -143,6 +156,170 @@ impl CodexAgent {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
+
+    fn prepare_initial_read(path: &Path) -> Result<InitialRead, StreamError> {
+        let file = File::open(path).map_err(|e| StreamError::Transient {
+            message: format!("Failed to open Codex transcript {}: {}", path.display(), e),
+            retry_after: Duration::from_secs(5),
+        })?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut current_offset = 0u64;
+
+        let first_bytes = match crate::streams::types::read_jsonl_line(&mut reader, &mut line)
+            .map_err(|e| StreamError::Transient {
+                message: format!("I/O error reading Codex session metadata: {}", e),
+                retry_after: Duration::from_secs(5),
+            })? {
+            crate::streams::types::JsonlLineState::Complete(bytes) => bytes,
+            crate::streams::types::JsonlLineState::Eof
+            | crate::streams::types::JsonlLineState::Partial => {
+                return Ok(InitialRead::IncompleteSubagent);
+            }
+        };
+        current_offset += first_bytes as u64;
+        let first: Value = serde_json::from_str(&line).map_err(|e| StreamError::Parse {
+            line: 1,
+            message: format!("Invalid Codex session metadata: {}", e),
+        })?;
+        let payload = first.get("payload");
+        let is_subagent = first.get("type").and_then(Value::as_str) == Some("session_meta")
+            && payload
+                .and_then(|value| value.get("thread_source"))
+                .and_then(Value::as_str)
+                == Some("subagent")
+            && payload
+                .and_then(|value| value.get("forked_from_id"))
+                .and_then(Value::as_str)
+                .is_some();
+        if !is_subagent {
+            return Ok(InitialRead::Regular);
+        }
+
+        let child_id = payload
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+            .and_then(uuid_v7_timestamp_millis);
+        let child_started_at = first
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp());
+        let (Some(child_id_millis), Some(child_started_at)) = (child_id, child_started_at) else {
+            tracing::warn!(
+                path = %path.display(),
+                "Codex subagent metadata lacks a usable UUIDv7 or timestamp; token accounting waits for a recognized fork boundary"
+            );
+            return Ok(InitialRead::IncompleteSubagent);
+        };
+
+        let mut last_token_event = None;
+        let mut candidate: Option<(u64, String, Option<Value>, bool)> = None;
+        let mut line_number = 1usize;
+        loop {
+            let line_start = current_offset;
+            match crate::streams::types::read_jsonl_line(&mut reader, &mut line).map_err(|e| {
+                StreamError::Transient {
+                    message: format!("I/O error scanning Codex fork prefix: {}", e),
+                    retry_after: Duration::from_secs(5),
+                }
+            })? {
+                crate::streams::types::JsonlLineState::Eof
+                | crate::streams::types::JsonlLineState::Partial => break,
+                crate::streams::types::JsonlLineState::Complete(bytes) => {
+                    current_offset += bytes as u64;
+                    line_number += 1;
+                }
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: Value = match serde_json::from_str(&line) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        line = line_number,
+                        path = %path.display(),
+                        error = %error,
+                        "skipping malformed JSON while scanning Codex fork prefix"
+                    );
+                    continue;
+                }
+            };
+
+            if let Some((boundary_offset, turn_id, baseline_event, saw_turn_context)) =
+                candidate.as_mut()
+            {
+                if event.get("type").and_then(Value::as_str) == Some("turn_context")
+                    && event.pointer("/payload/turn_id").and_then(Value::as_str)
+                        == Some(turn_id.as_str())
+                {
+                    *saw_turn_context = true;
+                } else if *saw_turn_context
+                    && event.get("type").and_then(Value::as_str)
+                        == Some("inter_agent_communication_metadata")
+                    && event
+                        .pointer("/payload/trigger_turn")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    let mut baseline_event = baseline_event.clone();
+                    if let Some(Value::Object(values)) = baseline_event.as_mut() {
+                        values.insert(TOKEN_BASELINE_ONLY_FIELD.to_string(), Value::Bool(true));
+                    }
+                    return Ok(InitialRead::ReadySubagent(CodexForkPrefix {
+                        boundary_offset: *boundary_offset,
+                        baseline_event,
+                    }));
+                }
+                continue;
+            }
+
+            if is_cumulative_token_event(&event) {
+                last_token_event = Some(event.clone());
+            }
+
+            if event.pointer("/payload/type").and_then(Value::as_str) == Some("task_started") {
+                let started_at = event.pointer("/payload/started_at").and_then(Value::as_i64);
+                let turn_id = event.pointer("/payload/turn_id").and_then(Value::as_str);
+                let turn_millis = turn_id.and_then(uuid_v7_timestamp_millis);
+                if started_at.is_some_and(|value| value >= child_started_at)
+                    && turn_millis.is_some_and(|value| value >= child_id_millis)
+                {
+                    candidate = Some((
+                        line_start,
+                        turn_id.unwrap_or_default().to_string(),
+                        last_token_event.clone(),
+                        false,
+                    ));
+                }
+            }
+        }
+
+        tracing::debug!(
+            path = %path.display(),
+            "Codex subagent fork boundary is incomplete; leaving watermark unchanged"
+        );
+        Ok(InitialRead::IncompleteSubagent)
+    }
+}
+
+fn uuid_v7_timestamp_millis(value: &str) -> Option<u64> {
+    if value.as_bytes().get(14).copied()? != b'7' {
+        return None;
+    }
+    let prefix: String = value.chars().filter(|ch| *ch != '-').take(12).collect();
+    if prefix.len() != 12 {
+        return None;
+    }
+    u64::from_str_radix(&prefix, 16).ok()
+}
+
+fn is_cumulative_token_event(event: &Value) -> bool {
+    event.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
+        && event
+            .pointer("/payload/info/total_token_usage")
+            .is_some_and(Value::is_object)
 }
 
 impl Default for CodexAgent {
@@ -195,18 +372,46 @@ impl Agent for CodexAgent {
         watermark: Box<dyn WatermarkStrategy>,
         session_id: &str,
     ) -> Result<StreamBatch, StreamError> {
-        // Downcast watermark to ByteOffsetWatermark
-        let byte_watermark = watermark
+        let codex_watermark = watermark
             .as_any()
-            .downcast_ref::<ByteOffsetWatermark>()
+            .downcast_ref::<CodexByteOffsetWatermark>()
             .ok_or_else(|| StreamError::Fatal {
                 message: format!(
-                    "Codex reader requires ByteOffsetWatermark, got incompatible type for session {}",
+                    "Codex reader requires CodexByteOffsetWatermark, got incompatible type for session {}",
                     session_id
                 ),
             })?;
 
-        let start_offset = byte_watermark.0;
+        if codex_watermark.offset > 0 && !codex_watermark.fork_prefix_complete {
+            return Err(StreamError::Fatal {
+                message: format!(
+                    "Codex session {} has a legacy watermark without fork-prefix state; replay it from offset zero",
+                    session_id
+                ),
+            });
+        }
+
+        let mut start_offset = codex_watermark.offset;
+        let mut fork_prefix_complete = codex_watermark.fork_prefix_complete;
+        let mut baseline_event = None;
+        if start_offset == 0 && !fork_prefix_complete {
+            match Self::prepare_initial_read(path)? {
+                InitialRead::Regular => {
+                    fork_prefix_complete = true;
+                }
+                InitialRead::IncompleteSubagent => {
+                    return Ok(StreamBatch {
+                        events: Vec::new(),
+                        new_watermark: Box::new(CodexByteOffsetWatermark::initial()),
+                    });
+                }
+                InitialRead::ReadySubagent(prefix) => {
+                    start_offset = prefix.boundary_offset;
+                    baseline_event = prefix.baseline_event;
+                    fork_prefix_complete = true;
+                }
+            }
+        }
 
         // Open file
         let file = File::open(path).map_err(|e| {
@@ -238,6 +443,9 @@ impl Agent for CodexAgent {
 
         let batch_limit = self.batch_size_hint();
         let mut events = Vec::with_capacity(batch_limit);
+        if let Some(event) = baseline_event {
+            events.push(event);
+        }
         let mut current_offset = start_offset;
         let mut line_number = 0;
         let mut line = String::new();
@@ -280,7 +488,10 @@ impl Agent for CodexAgent {
             }
         }
 
-        let new_watermark = Box::new(ByteOffsetWatermark::new(current_offset));
+        let new_watermark = Box::new(CodexByteOffsetWatermark::new(
+            current_offset,
+            fork_prefix_complete,
+        ));
 
         Ok(StreamBatch {
             events,
@@ -343,6 +554,7 @@ impl Agent for CodexAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streams::watermark::CodexByteOffsetWatermark;
 
     #[test]
     fn test_sweep_strategy() {
@@ -365,7 +577,7 @@ mod tests {
         path: &Path,
     ) -> (Vec<serde_json::Value>, Box<dyn WatermarkStrategy>) {
         let mut all = Vec::new();
-        let mut wm: Box<dyn WatermarkStrategy> = Box::new(ByteOffsetWatermark::new(0));
+        let mut wm: Box<dyn WatermarkStrategy> = Box::new(CodexByteOffsetWatermark::initial());
         loop {
             let batch = agent.read_incremental(path, wm, "test").unwrap();
             if batch.events.is_empty() {
@@ -479,7 +691,7 @@ mod tests {
         file.flush().unwrap();
 
         let agent = CodexAgent::new();
-        let watermark = Box::new(ByteOffsetWatermark::new(0));
+        let watermark = Box::new(CodexByteOffsetWatermark::initial());
         let result = agent
             .read_incremental(file.path(), watermark, "test")
             .unwrap();
@@ -511,7 +723,7 @@ mod tests {
         file.flush().unwrap();
 
         let agent = CodexAgent::new();
-        let watermark = Box::new(ByteOffsetWatermark::new(0));
+        let watermark = Box::new(CodexByteOffsetWatermark::initial());
         let result = agent
             .read_incremental(file.path(), watermark, "test")
             .unwrap();
@@ -521,6 +733,109 @@ mod tests {
         assert_eq!(result.events[0]["type"], "event_msg");
         assert_eq!(result.events[0]["payload"]["type"], "user_message");
         assert_eq!(result.events[1]["payload"]["type"], "agent_message");
+    }
+
+    #[test]
+    fn test_subagent_skips_inherited_history_and_emits_one_token_baseline() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        let lines = [
+            r#"{"timestamp":"2026-07-23T07:00:46.994Z","type":"session_meta","payload":{"id":"019f8dc6-d84b-7e42-88f6-980f148cdbbb","forked_from_id":"019f8dc4-717b-7d02-bdb3-6f234e32f2e3","thread_source":"subagent"}}"#,
+            r#"{"timestamp":"2026-07-23T07:00:46.995Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019f8dc4-8000-7000-8000-000000000000","started_at":1784789900}}"#,
+            r#"{"timestamp":"2026-07-23T07:00:46.996Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"cached_input_tokens":40}}}}"#,
+            r#"{"timestamp":"2026-07-23T07:00:46.996Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}"#,
+            r#"{"timestamp":"2026-07-23T07:00:46.997Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"output_tokens":20,"cached_input_tokens":80}}}}"#,
+            r#"{"timestamp":"2026-07-23T07:00:47.080Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019f8dc6-d95d-71e1-ab3b-9fbc9bd26a23","started_at":1784790047}}"#,
+            r#"{"timestamp":"2026-07-23T07:00:49.974Z","type":"turn_context","payload":{"turn_id":"019f8dc6-d95d-71e1-ab3b-9fbc9bd26a23"}}"#,
+            r#"{"timestamp":"2026-07-23T07:00:49.999Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}"#,
+            r#"{"timestamp":"2026-07-23T07:00:56.444Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":230,"output_tokens":25,"cached_input_tokens":90}}}}"#,
+        ];
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+
+        let agent = CodexAgent::with_batch_size(2);
+        let mut watermark: Box<dyn WatermarkStrategy> =
+            Box::new(CodexByteOffsetWatermark::initial());
+        let mut events = Vec::new();
+        loop {
+            let batch = agent
+                .read_incremental(file.path(), watermark, "child")
+                .unwrap();
+            watermark = batch.new_watermark;
+            if batch.events.is_empty() {
+                break;
+            }
+            events.extend(batch.events);
+        }
+
+        let token_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
+            })
+            .collect();
+        assert_eq!(token_events.len(), 2);
+        assert_eq!(
+            token_events[0]
+                .pointer("/payload/info/total_token_usage/input_tokens")
+                .and_then(Value::as_u64),
+            Some(200)
+        );
+        assert_eq!(
+            token_events[0]
+                .get("_git_ai_token_baseline_only")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            token_events[1]
+                .pointer("/payload/info/total_token_usage/input_tokens")
+                .and_then(Value::as_u64),
+            Some(230)
+        );
+        assert!(token_events[1].get("_git_ai_token_baseline_only").is_none());
+        assert!(
+            watermark
+                .as_any()
+                .downcast_ref::<CodexByteOffsetWatermark>()
+                .unwrap()
+                .fork_prefix_complete
+        );
+    }
+
+    #[test]
+    fn test_incomplete_subagent_boundary_keeps_initial_watermark() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-07-23T07:00:46.994Z","type":"session_meta","payload":{{"id":"019f8dc6-d84b-7e42-88f6-980f148cdbbb","forked_from_id":"019f8dc4-717b-7d02-bdb3-6f234e32f2e3","thread_source":"subagent"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-07-23T07:00:47.080Z","type":"event_msg","payload":{{"type":"task_started","turn_id":"019f8dc6-d95d-71e1-ab3b-9fbc9bd26a23","started_at":1784790047}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let agent = CodexAgent::with_batch_size(2);
+        let batch = agent
+            .read_incremental(
+                file.path(),
+                Box::new(CodexByteOffsetWatermark::initial()),
+                "child",
+            )
+            .unwrap();
+
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.new_watermark.serialize(), "0|0");
     }
 
     #[test]

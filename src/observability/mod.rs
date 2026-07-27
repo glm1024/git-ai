@@ -9,14 +9,14 @@ pub mod performance_targets;
 pub const MAX_METRICS_PER_ENVELOPE: usize = 1000;
 
 /// Submit telemetry envelopes via the best available path:
-/// 1. External daemon control socket (wrapper processes)
-/// 2. In-process daemon telemetry worker (daemon process itself)
-/// 3. Silently drop if neither is available
+/// 1. In-process daemon telemetry worker (daemon process itself)
+/// 2. External daemon control socket (wrapper processes)
+/// 3. Synchronous local SQLite fallback for formal metrics
 fn submit_telemetry_envelope(envelopes: Vec<crate::daemon::TelemetryEnvelope>) {
-    if crate::daemon::telemetry_handle::daemon_telemetry_available() {
-        crate::daemon::telemetry_handle::submit_telemetry(envelopes);
-    } else if crate::daemon::daemon_process_active() {
+    if crate::daemon::daemon_process_active() {
         crate::daemon::telemetry_worker::submit_daemon_internal_telemetry(envelopes);
+    } else if let Err(error) = crate::daemon::telemetry_handle::submit_telemetry(envelopes) {
+        tracing::warn!(%error, "telemetry: metric submission and local fallback both failed");
     }
 }
 
@@ -59,19 +59,29 @@ pub fn log_message(message: &str, level: &str, context: Option<serde_json::Value
     submit_telemetry_envelope(vec![envelope]);
 }
 
-/// Log a batch of metric events (via daemon telemetry worker).
+/// Durably enqueue a batch of metric events.
 ///
-/// Events are batched into envelopes of up to 1000 events each.
-pub fn log_metrics(events: Vec<MetricEvent>) {
+/// Daemon-owned callers write SQLite synchronously so command side effects and
+/// `git-ai await` cannot overtake the formal metric. Wrapper processes use the
+/// control-plane acknowledgement, whose fallback also commits to the same
+/// SQLite database before returning.
+pub fn log_metrics(events: Vec<MetricEvent>) -> Result<(), crate::error::GitAiError> {
     #[cfg(any(test, feature = "test-support"))]
     {
         if std::env::var_os("GIT_AI_TEST_METRICS_DB_PATH").is_none() {
-            return;
+            return Ok(());
         }
     }
 
     if events.is_empty() {
-        return;
+        return Ok(());
+    }
+
+    if crate::daemon::daemon_process_active() {
+        for chunk in events.chunks(MAX_METRICS_PER_ENVELOPE) {
+            crate::daemon::telemetry_worker::persist_metrics_to_db_blocking(chunk)?;
+        }
+        return Ok(());
     }
 
     // Split into chunks of MAX_METRICS_PER_ENVELOPE
@@ -79,8 +89,10 @@ pub fn log_metrics(events: Vec<MetricEvent>) {
         let envelope = crate::daemon::TelemetryEnvelope::Metrics {
             events: chunk.to_vec(),
         };
-        submit_telemetry_envelope(vec![envelope]);
+        crate::daemon::telemetry_handle::submit_telemetry(vec![envelope])
+            .map_err(crate::error::GitAiError::Generic)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -148,7 +160,7 @@ mod tests {
     // Test metrics logging
     #[test]
     fn test_log_metrics_empty() {
-        log_metrics(vec![]);
+        log_metrics(vec![]).expect("empty metrics should be accepted");
     }
 
     // Test constants
