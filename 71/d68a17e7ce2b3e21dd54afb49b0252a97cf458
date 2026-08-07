@@ -1,0 +1,575 @@
+scripts/offline-build/package-offline-dist.sh
+  s_ecb3b43e603544::t_ebe9240cf73022 31,35-37,65-74,215-216,218,223-237
+  s_ecb3b43e603544::t_9984651b900022 77-91
+  s_ecb3b43e603544::t_82a7404850c88b 14,54-59,109-114,203
+  s_ecb3b43e603544::t_a2b42967014061 34,214,219-222
+  s_ecb3b43e603544::t_728308cb55ceb7 127-137
+  s_ecb3b43e603544::t_7707fca5eae957 94,96,98,100,102,104-106,183,185,187,189,191,193,207-209,212
+  s_ecb3b43e603544::t_c876f3bca71d0c 107-108
+  s_ecb3b43e603544::t_34882c28752fe5 178,196-198
+  s_ecb3b43e603544::t_6e29ff1d9f7f45 15,23-25,201-202
+  s_ecb3b43e603544::t_2010927b15d128 60
+  s_ecb3b43e603544::t_712c3b4abc9887 213
+src/metrics/research.rs
+  s_27b48388057dff::t_16ac2edaf86d32 1-317
+scripts/offline-build/common.sh
+  s_ecb3b43e603544::t_1f95176e745fb2 139-144
+  s_ecb3b43e603544::t_6e29ff1d9f7f45 150,177,179-180,184-187,189-191,194-200,202-204,207-209,211-224,231-234,236-242,245,247,249,251,255,258,260-263,271,273-279,288
+  s_ecb3b43e603544::t_8aef565241f398 175-176,178,183,188,192-193,201,210,225-230,243-244,246,248,250,252,256,280-287
+  s_ecb3b43e603544::t_c876f3bca71d0c 257
+  s_ecb3b43e603544::t_34882c28752fe5 151-174,205-206,266-270
+  s_ecb3b43e603544::t_ebe9240cf73022 32-51
+  s_ecb3b43e603544::t_82a7404850c88b 181-182,235
+  s_ecb3b43e603544::t_f82f57e2482de1 259,272
+  s_ecb3b43e603544::t_7707fca5eae957 253-254,264-265
+install.sh
+  s_ecb3b43e603544::t_e750ef1b674a3a 260-305,310-311,316-324,329-337,342-398,402,426-457,461-462,465,469-478,481-482,484-492,499,502-504,510,515-524,526
+  s_ecb3b43e603544::t_45f6941bbc49e9 459-460
+  s_ecb3b43e603544::t_44475941d1d61b 306-309,312-315,325-328,338-341
+  s_ecb3b43e603544::t_c5e17f80ce1e0f 493-494
+  s_ecb3b43e603544::t_3965fe7a314f9b 546-549,560-563,567-575,629-633
+  s_ecb3b43e603544::t_bcd3a32678c02b 458
+tests/windows_install_script.rs
+  s_ecb3b43e603544::t_391939e53f7d3c 221-228,238-240,504-512,514,517-549,556-584
+  s_ecb3b43e603544::t_58da1d26d3be53 513,515-516,550-555
+  s_ecb3b43e603544::t_25c149940b3949 585
+offline-dist/git-ai-offline-v1.6.16/SHA256SUMS
+  s_ecb3b43e603544::t_aebcd064d4c93e 4
+  s_ecb3b43e603544::t_28c9f4645d8dac 6
+src/config.rs
+  s_ecb3b43e603544::t_78de5f5073bb06 2198-2201,2206,2215,2221-2228,2232-2233,2237-2240
+  s_ecb3b43e603544::t_a169d6ca7a8226 1834-1843,2365-2379
+  s_ecb3b43e603544::t_8c4c2ce06e9573 102-120,156-161,175-194
+  s_ecb3b43e603544::t_14062ee511e83c 1917,1924-1936,1938-1957,2324,2459-2493
+  s_ecb3b43e603544::t_968ea417a80ad8 1777-1778,1785,1805,1963-1965
+  s_ecb3b43e603544::t_4b456b8da13884 100-101,121
+  s_ecb3b43e603544::t_f941738ff6a42a 2325-2356,2361-2364,2380-2421,2426-2446,2453-2458,2494-2496
+  s_ecb3b43e603544::t_f1fed6185f643b 18,1759-1762,1767,1772-1776,1779-1784,1786-1804,1808-1809,1811-1833,1844-1855,1860-1861,1863-1897,1899-1900,1907-1916,1918-1923,1958-1962,1966-1972
+  s_ecb3b43e603544::t_4ed90f0b469945 1901-1906,2357-2360,2422-2425,2447-2452
+  s_ecb3b43e603544::t_2ae24db5be95cd 5-6,34-35
+  s_ecb3b43e603544::t_9a2c4d7d52c84e 2216-2220
+Cargo.toml
+  s_ecb3b43e603544::t_2ae24db5be95cd 42,52
+scripts/offline-build/build-linux-x64.sh
+  s_ecb3b43e603544::t_8aef565241f398 33,52
+  s_ecb3b43e603544::t_6e29ff1d9f7f45 51
+src/daemon/telemetry_worker.rs
+  s_ecb3b43e603544::t_73af306709910f 796,828
+  s_ecb3b43e603544::t_4369ef6eecc824 1687-1714,1716
+  s_ecb3b43e603544::t_4efb899c327fd2 16,24,521,531-544
+  s_ecb3b43e603544::t_9a04621ce979fb 545-546,1715,1782
+src/mdm/agents/kilo.rs
+  s_ecb3b43e603544::t_e1409fc1d47efb 13
+  s_ecb3b43e603544::t_d5e0776338c86c 56-60
+  s_ecb3b43e603544::t_15f52aaf9615ac 11,14,31,36-45,83-84,197,205-211,310-312,316-318,330-341,345,347-349,351-356,371-382,460-481,483-485
+  s_ecb3b43e603544::t_874d3407a655b7 61-65,67-68,346,350,357-370,383-388,486-521
+  s_ecb3b43e603544::t_c876f3bca71d0c 200-203
+  s_ecb3b43e603544::t_001da8f392f2b7 12,46-55,66,69-82,204
+  s_ecb3b43e603544::t_761ed6e06ffe69 482
+  s_ecb3b43e603544::t_b2a001e44572f9 389
+  s_ecb3b43e603544::t_66c4435387223e 522
+scripts/offline-build/build-jetbrains.sh
+  s_ecb3b43e603544::t_8aef565241f398 29,40
+scripts/offline-build/build-linux-arm64.sh
+  s_ecb3b43e603544::t_6e29ff1d9f7f45 48
+  s_ecb3b43e603544::t_8aef565241f398 30,49
+src/metrics/db.rs
+  s_ecb3b43e603544::t_86df8e22410e10 3728-3729
+  s_ecb3b43e603544::t_8af92b188ad749 476-479,4664,5062-5069
+  s_ecb3b43e603544::t_9b59ff055ca24e 4390-4397,4400-4405,4429-4436
+  s_ecb3b43e603544::t_6b9f231d026e51 4415-4416
+  s_ecb3b43e603544::t_157db1a89bc504 3163-3168,3172-3178,4398-4399
+  s_ecb3b43e603544::t_dcd29139045ca4 3188-3193,3747-3749,4882-4890
+  s_ecb3b43e603544::t_5704ea9e1b8e01 3485-3501
+  s_ecb3b43e603544::t_2a06ba19464644 8-11,1316,3069-3071,3090-3095,3179-3187,3194-3200
+  s_ecb3b43e603544::t_9cc49fae6b4240 4382-4389,4406-4414,4417-4428,4437-4438
+  s_ecb3b43e603544::t_d829e416b41757 4665,5038-5061,5070-5071
+  s_ecb3b43e603544::t_5bf2781d6ce87f 3727,4381,4626-4663,4881,5037
+  s_ecb3b43e603544::t_84dbbd7f3efc6d 3153-3162
+  s_ecb3b43e603544::t_2a42417f62cc23 3484,3731,3746,3841,4380,5036
+scripts/offline-build/build-all.sh
+  s_ecb3b43e603544::t_6e29ff1d9f7f45 6
+  s_ecb3b43e603544::t_dd21e444d74090 21-22
+src/commands/config.rs
+  s_ecb3b43e603544::t_9f00a2f6f09cac 508,740,749,758,767,772,777,783,789,800,814,819,828,833,840,848,859,867,873,889,901,907,913,924,935,946,957,969,980,1000,1035,1049,1057,1065,1088,1094,1122,1138,1141,1162,1169,1176,1183,1190,1197,1204,1211,1218,1225,1232,1239,1246,1253,1260,1267,1274,1281,1292,1299,1306,1313,1320,1327,1334,1341,1348,1369,1387,1405,1425,1433,1457,1467,1493,1513,1521
+  s_ecb3b43e603544::t_a46f3344d27ebf 505,732,1154
+  s_ecb3b43e603544::t_4ccf99c796e13c 509
+产品业务.md
+  s_ecb3b43e603544::t_a52cb6f1be530c 47
+  s_ecb3b43e603544::t_2f16bc1c113397 27
+  s_ecb3b43e603544::t_14062ee511e83c 56
+  s_ecb3b43e603544::t_4587475cd2ab95 57
+  s_ecb3b43e603544::t_d4f42fe90ae724 40
+  s_ecb3b43e603544::t_cfcf8255edd4af 28
+  s_ecb3b43e603544::t_1572361c5eff10 44,46
+src/api/metrics.rs
+  s_ecb3b43e603544::t_d829e416b41757 623-633
+  s_ecb3b43e603544::t_73af306709910f 22-23
+  s_ecb3b43e603544::t_28378bf20778db 197-204
+  s_ecb3b43e603544::t_d988771e145142 298-299,505-507,567-597,618-620
+  s_ecb3b43e603544::t_50e01d04d7b577 312,360-392,394
+  s_ecb3b43e603544::t_3dcb70cd107804 301-304,393,621-622
+src/commands/flush_metrics_db.rs
+  s_ecb3b43e603544::t_73af306709910f 21
+scripts/offline-build/README.md
+  s_ecb3b43e603544::t_a52cb6f1be530c 34-44
+  s_ecb3b43e603544::t_82a7404850c88b 24-33
+  s_ecb3b43e603544::t_6e29ff1d9f7f45 17-21,23
+  s_ecb3b43e603544::t_7707fca5eae957 22
+tests/integration/config_cli_coverage.rs
+  s_ecb3b43e603544::t_ca003fc8173b68 8,10,13-15,306-310,314-358
+  s_ecb3b43e603544::t_9244759882aafd 311-313
+  s_ecb3b43e603544::t_f3d67e4f8fec0e 359-360
+scripts/offline-build/test-source-metadata.sh
+  s_ecb3b43e603544::t_41337e668d6ab8 115-122
+  s_ecb3b43e603544::t_82a7404850c88b 1-7,10-11,23-86,90-102,114,123
+  s_ecb3b43e603544::t_f7aecf16f8c468 8-9
+  s_ecb3b43e603544::t_ebe9240cf73022 12-22
+  s_ecb3b43e603544::t_34882c28752fe5 87-89,103-113
+scripts/offline-build/test-install-rollback.sh
+  s_ecb3b43e603544::t_865f02268a9a89 199-214,217-218
+  s_ecb3b43e603544::t_107d4665b4c52c 215-216
+  s_ecb3b43e603544::t_d7c657f7f3b2ac 142-143
+  s_ecb3b43e603544::t_5d9f6b63e4498d 172-176
+  s_ecb3b43e603544::t_eeed30b33664aa 189
+  s_ecb3b43e603544::t_6c2005962a5c5d 161
+  s_ecb3b43e603544::t_cd555a45dde13d 1-141,144-160,162-171,177-188,190-198,219
+src/metrics/types.rs
+  s_ecb3b43e603544::t_cc222054c0a17b 6,11,13,44,51-54,70,84,105,117,164,263,271,332
+  s_ecb3b43e603544::t_d829e416b41757 191-215,322-327
+scripts/offline-build/build-macos-arm64.sh
+  s_ecb3b43e603544::t_8aef565241f398 47,90
+install.ps1
+  s_ecb3b43e603544::t_4d02cc23e2306d 3,27-29
+  s_ecb3b43e603544::t_8c906274d755c6 436-442,444,446,448,458,462,464,466,476
+  s_ecb3b43e603544::t_034f007d4eee8f 427
+  s_ecb3b43e603544::t_62d5228a088471 430-432,755,757-775
+  s_ecb3b43e603544::t_9cefd9070390a9 410-416,418-426,428-429,433,435,443,445,447,449-457,459-461,463,465,467-475,477-521
+  s_ecb3b43e603544::t_45f6941bbc49e9 616-617
+  s_ecb3b43e603544::t_0af3e0e2cb1935 576-577,585-586,590-615,618-632,635,650-658,663-667
+  s_ecb3b43e603544::t_02284a772cdd92 434
+git-ai-ppt/insert_overall_architecture_slide.py
+  s_0eb4df06fb35f2::t_7e0646b90d7cc9 475
+  s_0eb4df06fb35f2::t_a3c34b27f88e12 272,284,287-288,294-295,330-332,334-349,458,461,463,465-466,470,476-479,481
+  s_0eb4df06fb35f2::t_c79943c470bef0 374,379,452
+  s_0eb4df06fb35f2::t_6bbdb29bc1505f 1-271,273-283,285-286,289-293,296-329,333,350-373,375-378,380-451,453-457,459-460,462,464,467-469,471-474,480,482-546
+src/mdm/utils.rs
+  s_ecb3b43e603544::t_001da8f392f2b7 128,191,194-204,206,213-216,220
+  s_ecb3b43e603544::t_4179ee60d4c3fc 326,330-332,337-338,354,356,381-382,384-395,415-417,419-432
+  s_ecb3b43e603544::t_6b9f231d026e51 333-336,418,1318,1323
+  s_ecb3b43e603544::t_b5f6c0ea2591be 1160,1316-1317,1319-1322,1324-1326
+  s_ecb3b43e603544::t_aad4aa153d4f75 367,369-380,383,396-404
+  s_ecb3b43e603544::t_761ed6e06ffe69 433,667-672,689,1152-1159,1315
+  s_ecb3b43e603544::t_d77b6a7dc6dea0 434,1161
+src/daemon/telemetry_handle.rs
+  s_ecb3b43e603544::t_cc222054c0a17b 307
+offline-dist/git-ai-offline-v1.6.16/install.sh
+  s_ecb3b43e603544::t_15bf0332a92573 260-305,310-311,316-324,329-337,342-398,402,426-457,461-462,465,469-478,481-482,484-492,499,502-504,510,515-524,526
+  s_ecb3b43e603544::t_44475941d1d61b 306-309,312-315,325-328,338-341
+  s_ecb3b43e603544::t_c5e17f80ce1e0f 493-494
+  s_ecb3b43e603544::t_218ddfba94e679 546-549,560-563,567-575,629-633
+  s_ecb3b43e603544::t_45f6941bbc49e9 459-460
+  s_ecb3b43e603544::t_d7e135593efdf6 458
+src/api/types.rs
+  s_ecb3b43e603544::t_28378bf20778db 78
+tests/integration/kilo.rs
+  s_ecb3b43e603544::t_47ccdc4f8cf9ae 217-239
+  s_ecb3b43e603544::t_be5af1aee47a2c 279,283
+  s_ecb3b43e603544::t_548a76fbe2639e 214,289,294,304,306,310-311
+src/daemon/rewrite_metrics.rs
+  s_ecb3b43e603544::t_cc222054c0a17b 941,977
+src/api/mod.rs
+  s_ecb3b43e603544::t_1739697a625cc7 9
+scripts/offline-build/build-vscode.sh
+  s_ecb3b43e603544::t_8aef565241f398 30,43
+src/commands/install_hooks.rs
+  s_ecb3b43e603544::t_a46f3344d27ebf 376-377,410
+src/api/client.rs
+  s_ecb3b43e603544::t_73af306709910f 151-159,173-174,188,194-208,246,259,269,279,288,297-299
+  s_ecb3b43e603544::t_d829e416b41757 427,460
+  s_ecb3b43e603544::t_072cbb17b3bef2 300-301
+src/daemon.rs
+  s_ecb3b43e603544::t_d7f0258bb11c81 328
+  s_ecb3b43e603544::t_07978529e69646 338
+  s_ecb3b43e603544::t_5704ea9e1b8e01 8098-8109
+scripts/offline-build/build-windows-x64.sh
+  s_ecb3b43e603544::t_8aef565241f398 36,79
+  s_ecb3b43e603544::t_6e29ff1d9f7f45 78
+.gitignore
+  s_ecb3b43e603544::t_e03b228364ad7c 3
+src/commands/whoami.rs
+  s_ecb3b43e603544::t_98f7cde812554b 227
+  s_ecb3b43e603544::t_30d509452bf887 1,315
+  s_ecb3b43e603544::t_aae15ea5ba84c2 26,40,64,224,345-353,388-396,421-429,459-467,475-495
+  s_ecb3b43e603544::t_b342c541939841 151
+  s_ecb3b43e603544::t_1739697a625cc7 223
+  s_ecb3b43e603544::t_cc95ef91c30d96 3,496
+src/commands/daemon.rs
+  s_ecb3b43e603544::t_8c99c3039e7f74 111,256-264,267-268,270,272-277,324,587,601,611,651,673,677,681-683,685-694,696,699,739,750,761
+  s_ecb3b43e603544::t_5704ea9e1b8e01 779-797
+src/commands/upgrade.rs
+  s_ecb3b43e603544::t_c5663383f1706c 1820,1825-1830
+src/utils.rs
+  s_ecb3b43e603544::t_592af098e9b273 297-305,308-311,313,327,332,334-341,347,349,354-361,524-534
+  s_ecb3b43e603544::t_655d7c87974944 291
+  s_ecb3b43e603544::t_1d309bcb935f47 535
+offline-dist/git-ai-offline-v1.6.16/install.ps1
+  s_ecb3b43e603544::t_8c906274d755c6 436-442,444,446,448,458,462,464,466,476
+  s_ecb3b43e603544::t_738e5af1de770b 576-577,585-586,590-615,618-632,635,650-658,663-667
+  s_ecb3b43e603544::t_440f6d45058c6a 3,27-29,410-416,418-433,435,443,445,447,449-457,459-461,463,465,467-475,477-521
+  s_ecb3b43e603544::t_4b864df8e29bc9 755,757-775
+  s_ecb3b43e603544::t_02284a772cdd92 434
+  s_ecb3b43e603544::t_45f6941bbc49e9 616-617
+git-ai-ppt/architecture-concepts/generate_architecture_concepts.js
+  s_0eb4df06fb35f2::t_01fb625e36fa0a 1-121,123,128-129,136,138-142,144-318
+  s_0eb4df06fb35f2::t_1e36eefb58e6d4 122,130,137
+  s_0eb4df06fb35f2::t_63ed8f7d9c1dd4 124-127,131-135,143
+offline-dist/git-ai-offline-v1.6.16/INSTALL.md
+  s_ecb3b43e603544::t_537f40c9ce35fd 213,215-218,220-221,224-228,231-232,235-239,242-246,249-250,253-255
+git-ai-ppt/.qa-candidate-2/text.md
+  s_13b35bb91a1193::t_885a29ed6b42be 1-1050
+git-ai-ppt/.qa-candidate-3/text.md
+  s_13b35bb91a1193::t_8d4bfb52fb9f5d 1-1050
+git-ai-ppt/.qa-candidate/text.md
+  s_13b35bb91a1193::t_7440e7001da0c5 1-1050
+git-ai-ppt/.qa-final/text.md
+  s_13b35bb91a1193::t_8f42c792817677 1-1050
+git-ai-ppt/.unpacked-analysis/[Content_Types].xml
+  s_13b35bb91a1193::t_fb163e97e6b6c5 1-84
+git-ai-ppt/.unpacked-analysis/_rels/.rels
+  s_13b35bb91a1193::t_74ea252608aa93 1-8
+git-ai-ppt/.unpacked-analysis/docProps/app.xml
+  s_13b35bb91a1193::t_2414e927d5b18b 1-86
+git-ai-ppt/.unpacked-analysis/docProps/core.xml
+  s_13b35bb91a1193::t_09090368cc15e4 1-9
+git-ai-ppt/.unpacked-analysis/docProps/custom.xml
+  s_13b35bb91a1193::t_08e4171d84ed86 1-9
+git-ai-ppt/.unpacked-analysis/ppt/_rels/presentation.xml.rels
+  s_13b35bb91a1193::t_c8bcab731b25d5 1-49
+git-ai-ppt/.unpacked-analysis/ppt/commentAuthors.xml
+  s_13b35bb91a1193::t_458f2c9112ba6b 1-4
+git-ai-ppt/.unpacked-analysis/ppt/handoutMasters/_rels/handoutMaster1.xml.rels
+  s_13b35bb91a1193::t_0614b0a29d95a0 1-4
+git-ai-ppt/.unpacked-analysis/ppt/handoutMasters/handoutMaster1.xml
+  s_13b35bb91a1193::t_861ccda45fe1b8 1-208
+git-ai-ppt/.unpacked-analysis/ppt/presProps.xml
+  s_13b35bb91a1193::t_a9362fee2dcd58 1-43
+git-ai-ppt/.unpacked-analysis/ppt/presentation.xml
+  s_13b35bb91a1193::t_fab698f1827bf4 1-215
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout1.xml.rels
+  s_13b35bb91a1193::t_b6b080d939be4f 1-5
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout10.xml.rels
+  s_13b35bb91a1193::t_4377bdee5f7352 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout11.xml.rels
+  s_13b35bb91a1193::t_837412588ab892 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout12.xml.rels
+  s_13b35bb91a1193::t_75e1c0e21f839a 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout13.xml.rels
+  s_13b35bb91a1193::t_52351ccb914071 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout14.xml.rels
+  s_13b35bb91a1193::t_552a70ff4e8cea 1-5
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout15.xml.rels
+  s_13b35bb91a1193::t_8a8b46d0d6b57a 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout16.xml.rels
+  s_13b35bb91a1193::t_fa464215983f1a 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout17.xml.rels
+  s_13b35bb91a1193::t_ee1e944f3f0575 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout18.xml.rels
+  s_13b35bb91a1193::t_becadace4b0d8c 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout19.xml.rels
+  s_13b35bb91a1193::t_fb2612b3acf854 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout2.xml.rels
+  s_13b35bb91a1193::t_a0f82a5916d210 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout20.xml.rels
+  s_13b35bb91a1193::t_76e4dc20788dc2 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout21.xml.rels
+  s_13b35bb91a1193::t_f92f5f60032f53 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout22.xml.rels
+  s_13b35bb91a1193::t_dae994fb91280e 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout23.xml.rels
+  s_13b35bb91a1193::t_a19e4c5483b1e5 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout24.xml.rels
+  s_13b35bb91a1193::t_f4db812abec319 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout25.xml.rels
+  s_13b35bb91a1193::t_f8a6fa5a38d507 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout3.xml.rels
+  s_13b35bb91a1193::t_fe329599fc1ed7 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout4.xml.rels
+  s_13b35bb91a1193::t_a88021524efa7c 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout5.xml.rels
+  s_13b35bb91a1193::t_0a4e9e7aa2a561 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout6.xml.rels
+  s_13b35bb91a1193::t_5100badee50102 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout7.xml.rels
+  s_13b35bb91a1193::t_c0fe9805cee06d 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout8.xml.rels
+  s_13b35bb91a1193::t_15981a91fd4d32 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/_rels/slideLayout9.xml.rels
+  s_13b35bb91a1193::t_2e29170e619707 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout1.xml
+  s_13b35bb91a1193::t_c7c308cd50e7c2 1-212
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout10.xml
+  s_13b35bb91a1193::t_b5aa9146571d57 1-174
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout11.xml
+  s_13b35bb91a1193::t_9d131c9a5a2384 1-177
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout12.xml
+  s_13b35bb91a1193::t_d84a44e7a4a339 1-99
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout13.xml
+  s_13b35bb91a1193::t_34bb4c3d26af92 1-23
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout14.xml
+  s_13b35bb91a1193::t_df9ffdc1278463 1-308
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout15.xml
+  s_13b35bb91a1193::t_14f8d25b99e9c3 1-174
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout16.xml
+  s_13b35bb91a1193::t_ebba30d9185a5f 1-173
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout17.xml
+  s_13b35bb91a1193::t_3b50b60ea26935 1-342
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout18.xml
+  s_13b35bb91a1193::t_54bdc6cee63847 1-552
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout19.xml
+  s_13b35bb91a1193::t_f9a159baa0cd7d 1-62
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout2.xml
+  s_13b35bb91a1193::t_17db456e61f2a5 1-174
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout20.xml
+  s_13b35bb91a1193::t_f9451483b4e7d7 1-23
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout21.xml
+  s_13b35bb91a1193::t_6f5883ac422c07 1-307
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout22.xml
+  s_13b35bb91a1193::t_0ca4be0db27cec 1-272
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout23.xml
+  s_13b35bb91a1193::t_8fa1f63b6c1bb0 1-174
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout24.xml
+  s_13b35bb91a1193::t_230d1344a6a165 1-177
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout25.xml
+  s_13b35bb91a1193::t_b73105ecd22d9d 1-99
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout3.xml
+  s_13b35bb91a1193::t_6e9370ba8f4d69 1-173
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout4.xml
+  s_13b35bb91a1193::t_b3da477ad28432 1-342
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout5.xml
+  s_13b35bb91a1193::t_37ec374aa23957 1-552
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout6.xml
+  s_13b35bb91a1193::t_0c2ff78651b712 1-62
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout7.xml
+  s_13b35bb91a1193::t_3d02973816b1a4 1-23
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout8.xml
+  s_13b35bb91a1193::t_e629bb958db62a 1-307
+git-ai-ppt/.unpacked-analysis/ppt/slideLayouts/slideLayout9.xml
+  s_13b35bb91a1193::t_2cefc3220b5f3c 1-272
+git-ai-ppt/.unpacked-analysis/ppt/slideMasters/_rels/slideMaster1.xml.rels
+  s_13b35bb91a1193::t_2628f0c06466ed 1-19
+git-ai-ppt/.unpacked-analysis/ppt/slideMasters/_rels/slideMaster2.xml.rels
+  s_13b35bb91a1193::t_b4687a2cbfa83c 1-18
+git-ai-ppt/.unpacked-analysis/ppt/slideMasters/slideMaster1.xml
+  s_13b35bb91a1193::t_77b75b870a569d 1-1197
+git-ai-ppt/.unpacked-analysis/ppt/slideMasters/slideMaster2.xml
+  s_13b35bb91a1193::t_302a6bfb195a0b 1-1196
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide1.xml.rels
+  s_13b35bb91a1193::t_77e6b14a1c3d88 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide10.xml.rels
+  s_13b35bb91a1193::t_7e8d320edefe51 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide11.xml.rels
+  s_13b35bb91a1193::t_b9a58a3ce9add2 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide12.xml.rels
+  s_13b35bb91a1193::t_8305de94e5a9ae 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide13.xml.rels
+  s_13b35bb91a1193::t_1eda66a1c974db 1-6
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide14.xml.rels
+  s_13b35bb91a1193::t_5b69722f6e3cb3 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide15.xml.rels
+  s_13b35bb91a1193::t_306c20caa64d04 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide16.xml.rels
+  s_13b35bb91a1193::t_f4b8c30d6dc46f 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide17.xml.rels
+  s_13b35bb91a1193::t_6e4ad7cf19bfaa 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide18.xml.rels
+  s_13b35bb91a1193::t_781e7862e285b5 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide19.xml.rels
+  s_13b35bb91a1193::t_9b676850cef344 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide2.xml.rels
+  s_13b35bb91a1193::t_f90534bf9f320e 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide20.xml.rels
+  s_13b35bb91a1193::t_71eed0818a4068 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide21.xml.rels
+  s_13b35bb91a1193::t_50c307ab7093f5 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide22.xml.rels
+  s_13b35bb91a1193::t_31f12271fe625a 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide23.xml.rels
+  s_13b35bb91a1193::t_e11af0e5b380d0 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide24.xml.rels
+  s_13b35bb91a1193::t_ce304d5df4e396 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide25.xml.rels
+  s_13b35bb91a1193::t_2f57b534688feb 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide26.xml.rels
+  s_13b35bb91a1193::t_5e74e24ee015e3 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide27.xml.rels
+  s_13b35bb91a1193::t_37a4b7ba01bb2e 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide28.xml.rels
+  s_13b35bb91a1193::t_7698112ca4890b 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide29.xml.rels
+  s_13b35bb91a1193::t_4a5622c7f4a58a 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide3.xml.rels
+  s_13b35bb91a1193::t_a68e1cad970d6c 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide30.xml.rels
+  s_13b35bb91a1193::t_d68dbe3a5a4a1d 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide31.xml.rels
+  s_13b35bb91a1193::t_9b887f60f52175 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide32.xml.rels
+  s_13b35bb91a1193::t_6c6fbe0cae458e 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide33.xml.rels
+  s_13b35bb91a1193::t_d9eb16815420e4 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide34.xml.rels
+  s_13b35bb91a1193::t_2394af6da7c46d 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide35.xml.rels
+  s_13b35bb91a1193::t_e50d8f262cae94 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide36.xml.rels
+  s_13b35bb91a1193::t_242b916e70c24a 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide37.xml.rels
+  s_13b35bb91a1193::t_6ca54b3a1183d9 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide4.xml.rels
+  s_13b35bb91a1193::t_72d144d5af6812 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide5.xml.rels
+  s_13b35bb91a1193::t_dc9d43dfb24e79 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide6.xml.rels
+  s_13b35bb91a1193::t_0c678415e2f656 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide7.xml.rels
+  s_13b35bb91a1193::t_80e5dceef42a56 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide8.xml.rels
+  s_13b35bb91a1193::t_49ae11d62d3ce7 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/_rels/slide9.xml.rels
+  s_13b35bb91a1193::t_61967f64f13da3 1-4
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide1.xml
+  s_13b35bb91a1193::t_5754b9277be21a 1-155
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide10.xml
+  s_13b35bb91a1193::t_be080466ebf0f1 1-493
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide11.xml
+  s_13b35bb91a1193::t_70a9fddda367a4 1-237
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide12.xml
+  s_13b35bb91a1193::t_f13d0f49a3147b 1-997
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide13.xml
+  s_13b35bb91a1193::t_13e58a9fab2890 1-274
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide14.xml
+  s_13b35bb91a1193::t_e7ebaa969b5b34 1-1113
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide15.xml
+  s_13b35bb91a1193::t_1b3eb99fdb49fd 1-841
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide16.xml
+  s_13b35bb91a1193::t_1691a936617a1e 1-2384
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide17.xml
+  s_13b35bb91a1193::t_86a431409a2547 1-1546
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide18.xml
+  s_13b35bb91a1193::t_7d5ecc915c78f0 1-237
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide19.xml
+  s_13b35bb91a1193::t_9ba16e53ce5adf 1-1385
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide2.xml
+  s_13b35bb91a1193::t_ad711d32851a86 1-915
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide20.xml
+  s_13b35bb91a1193::t_7b78fff6f26764 1-517
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide21.xml
+  s_13b35bb91a1193::t_7c3360e9842c34 1-1067
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide22.xml
+  s_13b35bb91a1193::t_ba4c864143a83e 1-1630
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide23.xml
+  s_13b35bb91a1193::t_f2312a1c65caab 1-984
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide24.xml
+  s_13b35bb91a1193::t_0c8273ec1d6f0d 1-1656
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide25.xml
+  s_13b35bb91a1193::t_e060c23d9e2f84 1-931
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide26.xml
+  s_13b35bb91a1193::t_dc59e8fe5ea855 1-1864
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide27.xml
+  s_13b35bb91a1193::t_dd62d6b8959876 1-1259
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide28.xml
+  s_13b35bb91a1193::t_ff32cca1ae3a23 1-1798
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide29.xml
+  s_13b35bb91a1193::t_81f311e482148e 1-1556
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide3.xml
+  s_13b35bb91a1193::t_21b1899d9c3361 1-237
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide30.xml
+  s_13b35bb91a1193::t_389fd00af0751e 1-2368
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide31.xml
+  s_13b35bb91a1193::t_e67a5850ff870c 1-2107
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide32.xml
+  s_13b35bb91a1193::t_cef3158a14a97d 1-1855
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide33.xml
+  s_13b35bb91a1193::t_7dbf1414c95e54 1-1503
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide34.xml
+  s_13b35bb91a1193::t_89cd65dcf4c342 1-1521
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide35.xml
+  s_13b35bb91a1193::t_6b02956215ff77 1-2191
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide36.xml
+  s_13b35bb91a1193::t_eb8c73f2ccb054 1-237
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide37.xml
+  s_13b35bb91a1193::t_77c7ff10349a05 1-897
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide4.xml
+  s_13b35bb91a1193::t_13eeb05e09e453 1-1630
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide5.xml
+  s_13b35bb91a1193::t_ebb99c7905d32e 1-774
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide6.xml
+  s_13b35bb91a1193::t_095e4d14ab4590 1-237
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide7.xml
+  s_13b35bb91a1193::t_f199915ef0eeee 1-1804
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide8.xml
+  s_13b35bb91a1193::t_e913bb200ea74c 1-1837
+git-ai-ppt/.unpacked-analysis/ppt/slides/slide9.xml
+  s_13b35bb91a1193::t_8fa28fab5f92d1 1-1378
+git-ai-ppt/.unpacked-analysis/ppt/tableStyles.xml
+  s_13b35bb91a1193::t_4e9686f857ea94 1-180
+git-ai-ppt/.unpacked-analysis/ppt/tags/tag1.xml
+  s_13b35bb91a1193::t_4d90830252d5da 1-4
+git-ai-ppt/.unpacked-analysis/ppt/theme/theme1.xml
+  s_13b35bb91a1193::t_615be09cbca068 1-721
+git-ai-ppt/.unpacked-analysis/ppt/theme/theme2.xml
+  s_13b35bb91a1193::t_e110159dbce65e 1-721
+git-ai-ppt/.unpacked-analysis/ppt/theme/theme3.xml
+  s_13b35bb91a1193::t_430a0834f1e969 1-286
+git-ai-ppt/.unpacked-analysis/ppt/viewProps.xml
+  s_13b35bb91a1193::t_407ded65e9b4ba 1-45
+git-ai-ppt/architecture-concepts/01-dual-swimlane.svg
+  s_0eb4df06fb35f2::t_8fcc06155b322c 1-16
+git-ai-ppt/architecture-concepts/02-lifecycle-state.svg
+  s_0eb4df06fb35f2::t_3a8289efb58708 1-16
+git-ai-ppt/architecture-concepts/03-layered-architecture.svg
+  s_0eb4df06fb35f2::t_b626b19fe85f62 1-16
+git-ai-ppt/architecture-concepts/04-target-commit-hub.svg
+  s_0eb4df06fb35f2::t_c48dc4762bbef2 1-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "71d68a17e7ce2b3e21dd54afb49b0252a97cf458",
+  "prompts": {},
+  "sessions": {
+    "s_0eb4df06fb35f2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa382-75af-78a2-8662-74381f73c2a7",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    },
+    "s_13b35bb91a1193": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8dc0-dfda-7963-a1f3-42dc806bcc47",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    },
+    "s_27b48388057dff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8904-945e-75a1-a239-184bab61d84f",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    },
+    "s_ecb3b43e603544": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f9b92-cbe4-7a03-ab89-1b5631d3305b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
