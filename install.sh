@@ -257,14 +257,149 @@ else
     DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}"
 fi
 
-# Install into the user's bin directory ~/.git-ai/bin
-INSTALL_DIR="$HOME/.git-ai/bin"
+# Install into the user's bin directory ~/.git-ai/bin. Binary and shim
+# publication is transactional: an upgrade keeps the previous paths until the
+# new binary has been validated, and a failed first install removes only paths
+# created by this installer (never ~/.git-ai data/configuration).
+INSTALL_ROOT="$HOME/.git-ai"
+INSTALL_DIR="${INSTALL_ROOT}/bin"
+FINAL_BINARY="${INSTALL_DIR}/git-ai"
+GIT_SHIM="${INSTALL_DIR}/git"
+LOCAL_ROOT="$HOME/.local"
+LOCAL_BIN_DIR="${LOCAL_ROOT}/bin"
+CLI_LINK="${LOCAL_BIN_DIR}/git-ai"
+TMP_FILE="${INSTALL_DIR}/git-ai.tmp.$$"
+BINARY_BACKUP="${FINAL_BINARY}.install-backup.$$"
+GIT_SHIM_BACKUP="${GIT_SHIM}.install-backup.$$"
+CLI_LINK_BACKUP="${CLI_LINK}.install-backup.$$"
 
-# Create directory if it doesn't exist
+INSTALL_ROOT_CREATED=false
+INSTALL_DIR_CREATED=false
+LOCAL_ROOT_CREATED=false
+LOCAL_BIN_DIR_CREATED=false
+BINARY_PRESERVED=false
+GIT_SHIM_PRESERVED=false
+CLI_LINK_PRESERVED=false
+BINARY_PUBLISHED=false
+GIT_SHIM_PUBLISHED=false
+CLI_LINK_PUBLISHED=false
+GIT_SHIM_WAS_PRESENT=false
+INSTALL_TRANSACTION_ACTIVE=false
+
+path_exists() {
+    [ -e "$1" ] || [ -L "$1" ]
+}
+
+rollback_install_transaction() {
+    local original_status="${1:-1}"
+    local restore_failed=false
+
+    trap - EXIT HUP INT TERM
+    set +e
+
+    if [ "$INSTALL_TRANSACTION_ACTIVE" != true ]; then
+        exit "$original_status"
+    fi
+
+    [ "$original_status" -ne 0 ] || original_status=1
+
+    if path_exists "$TMP_FILE" && ! rm -f "$TMP_FILE" 2>/dev/null; then
+        restore_failed=true
+        warn "Failed to remove staged binary: $TMP_FILE"
+    fi
+
+    if [ "$CLI_LINK_PUBLISHED" = true ]; then
+        if path_exists "$CLI_LINK" && ! rm -f "$CLI_LINK" 2>/dev/null; then
+            restore_failed=true
+            warn "Failed to remove failed CLI link: $CLI_LINK"
+        fi
+    fi
+    if [ "$CLI_LINK_PRESERVED" = true ]; then
+        if ! mv "$CLI_LINK_BACKUP" "$CLI_LINK"; then
+            restore_failed=true
+            warn "Failed to restore the previous CLI link; recover it from $CLI_LINK_BACKUP"
+        fi
+    fi
+
+    if [ "$GIT_SHIM_PUBLISHED" = true ]; then
+        if path_exists "$GIT_SHIM" && ! rm -f "$GIT_SHIM" 2>/dev/null; then
+            restore_failed=true
+            warn "Failed to remove failed git shim: $GIT_SHIM"
+        fi
+    fi
+    if [ "$GIT_SHIM_PRESERVED" = true ]; then
+        if ! mv "$GIT_SHIM_BACKUP" "$GIT_SHIM"; then
+            restore_failed=true
+            warn "Failed to restore the previous git shim; recover it from $GIT_SHIM_BACKUP"
+        fi
+    fi
+
+    if [ "$BINARY_PUBLISHED" = true ]; then
+        if path_exists "$FINAL_BINARY" && ! rm -f "$FINAL_BINARY" 2>/dev/null; then
+            restore_failed=true
+            warn "Failed to remove failed git-ai binary: $FINAL_BINARY"
+        fi
+    fi
+    if [ "$BINARY_PRESERVED" = true ]; then
+        if ! mv "$BINARY_BACKUP" "$FINAL_BINARY"; then
+            restore_failed=true
+            warn "Failed to restore the previous git-ai binary; recover it from $BINARY_BACKUP"
+        fi
+    fi
+
+    if [ "$LOCAL_BIN_DIR_CREATED" = true ]; then
+        rmdir "$LOCAL_BIN_DIR" 2>/dev/null || true
+    fi
+    if [ "$LOCAL_ROOT_CREATED" = true ]; then
+        rmdir "$LOCAL_ROOT" 2>/dev/null || true
+    fi
+    if [ "$INSTALL_DIR_CREATED" = true ]; then
+        rmdir "$INSTALL_DIR" 2>/dev/null || true
+    fi
+    if [ "$INSTALL_ROOT_CREATED" = true ]; then
+        rmdir "$INSTALL_ROOT" 2>/dev/null || true
+    fi
+
+    if [ "$restore_failed" = true ]; then
+        warn "Installation failed and at least one previous executable path needs manual recovery. Preserved data under $INSTALL_ROOT was not removed."
+    fi
+    exit "$original_status"
+}
+
+complete_install_transaction() {
+    INSTALL_TRANSACTION_ACTIVE=false
+    trap - EXIT HUP INT TERM
+
+    for backup in "$BINARY_BACKUP" "$GIT_SHIM_BACKUP" "$CLI_LINK_BACKUP"; do
+        if path_exists "$backup" && ! rm -f "$backup"; then
+            warn "Installed successfully, but could not remove obsolete backup: $backup"
+        fi
+    done
+    rm -f "$TMP_FILE" 2>/dev/null || true
+}
+
+inject_install_failure_if_requested() {
+    local step="$1"
+    if [ "${GIT_AI_INSTALL_TEST_FAIL_AT:-}" = "$step" ]; then
+        error "Injected installer failure at $step"
+    fi
+}
+
+if [ ! -d "$INSTALL_ROOT" ]; then
+    INSTALL_ROOT_CREATED=true
+fi
+if [ ! -d "$INSTALL_DIR" ]; then
+    INSTALL_DIR_CREATED=true
+fi
+INSTALL_TRANSACTION_ACTIVE=true
+trap 'rollback_install_transaction $?' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 mkdir -p "$INSTALL_DIR"
 
-# Download and install
-TMP_FILE="${INSTALL_DIR}/git-ai.tmp.$$"
+# Download and stage the candidate before touching the installed paths.
 if [ -n "${GIT_AI_LOCAL_BINARY:-}" ]; then
     echo "Using local git-ai binary (release: ${RELEASE_TAG})..."
     if [ ! -f "$GIT_AI_LOCAL_BINARY" ]; then
@@ -288,41 +423,107 @@ fi
 # Verify checksum if embedded (release builds only)
 verify_checksum "$TMP_FILE" "$BINARY_NAME"
 
-mv -f "$TMP_FILE" "${INSTALL_DIR}/git-ai"
+# Reject directories at managed executable paths. Moving one as a "backup"
+# would be surprising and cannot be restored safely with file-only cleanup.
+if [ -d "$FINAL_BINARY" ] && [ ! -L "$FINAL_BINARY" ]; then
+    error "Managed binary path is a directory: $FINAL_BINARY"
+fi
+if [ -d "$GIT_SHIM" ] && [ ! -L "$GIT_SHIM" ]; then
+    error "Managed git shim path is a directory: $GIT_SHIM"
+fi
+if [ -d "$CLI_LINK" ] && [ ! -L "$CLI_LINK" ]; then
+    error "Managed CLI link path is a directory: $CLI_LINK"
+fi
+for backup in "$BINARY_BACKUP" "$GIT_SHIM_BACKUP" "$CLI_LINK_BACKUP"; do
+    if path_exists "$backup"; then
+        error "Installer backup path already exists: $backup"
+    fi
+done
+
+# Preserve all existing executable entry points before publishing any new one,
+# so an error can restore a version-consistent set.
+if path_exists "$FINAL_BINARY"; then
+    mv "$FINAL_BINARY" "$BINARY_BACKUP"
+    BINARY_PRESERVED=true
+fi
+if path_exists "$GIT_SHIM"; then
+    GIT_SHIM_WAS_PRESENT=true
+    mv "$GIT_SHIM" "$GIT_SHIM_BACKUP"
+    GIT_SHIM_PRESERVED=true
+fi
+if path_exists "$CLI_LINK"; then
+    mv "$CLI_LINK" "$CLI_LINK_BACKUP"
+    CLI_LINK_PRESERVED=true
+fi
+
+inject_install_failure_if_requested after_backups_preserved
+
+mv "$TMP_FILE" "$FINAL_BINARY"
+BINARY_PUBLISHED=true
 
 # Make executable
-chmod +x "${INSTALL_DIR}/git-ai"
+chmod +x "$FINAL_BINARY"
 
 # Remove quarantine attribute on macOS
 if [ "$OS" = "macos" ]; then
-    xattr -d com.apple.quarantine "${INSTALL_DIR}/git-ai" 2>/dev/null || true
+    xattr -d com.apple.quarantine "$FINAL_BINARY" 2>/dev/null || true
 fi
 
+inject_install_failure_if_requested after_binary_publish
+
+# Existing wrapper users must see the same version as git-ai. A first install
+# does not create the legacy git shim.
+if [ "$GIT_SHIM_WAS_PRESENT" = true ]; then
+    ln -s "$FINAL_BINARY" "$GIT_SHIM"
+    GIT_SHIM_PUBLISHED=true
+fi
+
+inject_install_failure_if_requested after_shim_publish
+
 # Create ~/.local/bin/git-ai symlink for systems where ~/.local/bin is already on PATH
-LOCAL_BIN_DIR="$HOME/.local/bin"
-if mkdir -p "$LOCAL_BIN_DIR" 2>/dev/null && ln -sf "${INSTALL_DIR}/git-ai" "${LOCAL_BIN_DIR}/git-ai" 2>/dev/null; then
-    success "Created symlink at ${LOCAL_BIN_DIR}/git-ai"
+if [ ! -d "$LOCAL_ROOT" ]; then
+    LOCAL_ROOT_CREATED=true
+fi
+if [ ! -d "$LOCAL_BIN_DIR" ]; then
+    LOCAL_BIN_DIR_CREATED=true
+fi
+if mkdir -p "$LOCAL_BIN_DIR" 2>/dev/null && ln -s "$FINAL_BINARY" "$CLI_LINK" 2>/dev/null; then
+    CLI_LINK_PUBLISHED=true
+    success "Created symlink at $CLI_LINK"
+elif [ "$CLI_LINK_PRESERVED" = true ]; then
+    error "Failed to replace the existing ~/.local/bin/git-ai entry"
 else
     warn "Failed to create ~/.local/bin/git-ai symlink. This is non-fatal."
 fi
 
-success "Successfully installed git-ai into ${INSTALL_DIR}"
-success "You can now run 'git-ai' from your terminal"
+inject_install_failure_if_requested after_cli_link_publish
 
 # Print installed version
-INSTALLED_VERSION=$(${INSTALL_DIR}/git-ai --version 2>&1 || echo "unknown")
+if ! INSTALLED_VERSION=$("$FINAL_BINARY" --version 2>&1); then
+    error "Installed binary failed version validation: $INSTALLED_VERSION"
+fi
 echo "Installed git-ai ${INSTALLED_VERSION}"
 
 # Login user with install token if provided
 NEED_LOGIN=false
 if [ -n "${INSTALL_NONCE:-}" ] && [ -n "${API_BASE:-}" ]; then
-    if ! ${INSTALL_DIR}/git-ai exchange-nonce; then
+    if ! "$FINAL_BINARY" exchange-nonce; then
         NEED_LOGIN=true
     fi
 fi
 
+# Interactive authentication is a required step when nonce exchange failed;
+# perform it before non-transactional hook and shell-profile setup.
+if [ "$NEED_LOGIN" = true ]; then
+    echo ""
+    echo "Launching login..."
+    if ! "$FINAL_BINARY" login; then
+        error "Login failed"
+    fi
+fi
+
 echo "Setting up IDE/agent hooks..."
-if ! ${INSTALL_DIR}/git-ai install-hooks; then
+if ! "$FINAL_BINARY" install-hooks; then
     warn "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
 else
     success "Successfully set up IDE/agent hooks"
@@ -342,7 +543,10 @@ while IFS='|' read -r shell_name config_file; do
         # Create fish config directory if it doesn't exist (for fallback case)
         config_dir="$(dirname "$config_file")"
         if [ ! -d "$config_dir" ]; then
-            mkdir -p "$config_dir"
+            if ! mkdir -p "$config_dir"; then
+                warn "Failed to create shell configuration directory: $config_dir"
+                continue
+            fi
             CREATED_SHELL_PATHS="${CREATED_SHELL_PATHS}${config_dir}\n"
         fi
     else
@@ -353,14 +557,22 @@ while IFS='|' read -r shell_name config_file; do
     if [ ! -f "$config_file" ]; then
         CREATED_SHELL_PATHS="${CREATED_SHELL_PATHS}${config_file}\n"
     fi
-    touch "$config_file"
+    if ! touch "$config_file"; then
+        warn "Failed to create shell configuration: $config_file"
+        continue
+    fi
     
     # Append if not already present
     if ! grep -qsF "$INSTALL_DIR" "$config_file"; then
-        echo "" >> "$config_file"
-        echo "# Added by git-ai installer on $(date)" >> "$config_file"
-        echo "$path_cmd" >> "$config_file"
-        SHELLS_CONFIGURED="${SHELLS_CONFIGURED}${shell_name}|${config_file}\n"
+        if {
+            echo ""
+            echo "# Added by git-ai installer on $(date)"
+            echo "$path_cmd"
+        } >> "$config_file"; then
+            SHELLS_CONFIGURED="${SHELLS_CONFIGURED}${shell_name}|${config_file}\n"
+        else
+            warn "Failed to update shell configuration: $config_file"
+        fi
     else
         SHELLS_ALREADY_CONFIGURED="${SHELLS_ALREADY_CONFIGURED}${shell_name}|${config_file}\n"
     fi
@@ -414,12 +626,10 @@ if [ "$(id -u)" = "0" ] && [ -n "$INSTALL_USER" ]; then
     fi
 fi
 
+complete_install_transaction
+
+success "Successfully installed git-ai into ${INSTALL_DIR}"
+success "You can now run 'git-ai' from your terminal"
+
 echo ""
 echo -e "${YELLOW}Close and reopen your terminal and IDE sessions to use git-ai.${NC}"
-
-# If nonce exchange failed, run interactive login
-if [ "$NEED_LOGIN" = true ]; then
-    echo ""
-    echo "Launching login..."
-    ${INSTALL_DIR}/git-ai login
-fi

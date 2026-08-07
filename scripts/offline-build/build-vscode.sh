@@ -27,6 +27,7 @@ VSCODE_VERSION=$(vscode_version)
 VSIX_NAME="git-ai.git-ai-vscode-${VSCODE_VERSION}.vsix"
 VSIX_SOURCE="git-ai-vscode-${VSCODE_VERSION}.vsix"
 mkdir -p "${NPM_CACHE}" "${OUT_DIR}"
+begin_artifact_build "${OUT_DIR}/${VSIX_NAME}"
 
 info "Installing VS Code extension dependencies"
 if is_offline_build; then
@@ -39,3 +40,4 @@ info "Building ${VSIX_NAME}"
 (cd "${VSCODE_DIR}" && npm run lint && npm run package)
 require_file "${VSCODE_DIR}/${VSIX_SOURCE}"
 cp "${VSCODE_DIR}/${VSIX_SOURCE}" "${OUT_DIR}/${VSIX_NAME}"
+finish_artifact_build "${OUT_DIR}/${VSIX_NAME}"

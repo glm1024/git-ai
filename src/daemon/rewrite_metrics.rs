@@ -938,6 +938,7 @@ mod tests {
                 Ok(vec![MetricEvent {
                     timestamp: 1,
                     event_id: 8,
+                    instance_id: None,
                     values: Default::default(),
                     attrs: Default::default(),
                 }])
@@ -973,6 +974,7 @@ mod tests {
                 Ok(vec![MetricEvent {
                     timestamp: 1,
                     event_id: 8,
+                    instance_id: None,
                     values: Default::default(),
                     attrs: Default::default(),
                 }])

@@ -288,16 +288,29 @@ pub fn print_superuser_warning() {
 /// Holds an exclusive advisory lock (Unix) or exclusive-access file handle (Windows)
 /// for the lifetime of the struct. The lock is automatically released when dropped
 /// or when the process exits.
+#[derive(Debug)]
 pub struct LockFile {
     _file: std::fs::File,
 }
 
 impl LockFile {
+    /// Try to acquire an exclusive lock while preserving I/O failures.
+    ///
+    /// `Ok(None)` means another process currently holds the lock. Permission
+    /// errors, invalid paths, and other open/lock failures are returned as
+    /// `Err` so callers do not misreport them as ordinary contention.
+    pub fn try_acquire_result(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        Ok(try_lock_exclusive(path)?.map(|file| Self { _file: file }))
+    }
+
     /// Try to acquire an exclusive lock on the given path.
     /// Returns `Some(LockFile)` if successful, `None` if another process holds the lock.
+    ///
+    /// This compatibility wrapper also returns `None` for I/O errors. New
+    /// production callers should use [`Self::try_acquire_result`] when they
+    /// need to distinguish contention from an inaccessible lock path.
     pub fn try_acquire(path: &std::path::Path) -> Option<Self> {
-        let file = try_lock_exclusive(path)?;
-        Some(Self { _file: file })
+        Self::try_acquire_result(path).ok().flatten()
     }
 }
 
@@ -311,30 +324,41 @@ impl Drop for LockFile {
 
 #[cfg(unix)]
 #[allow(clippy::suspicious_open_options)]
-fn try_lock_exclusive(path: &std::path::Path) -> Option<std::fs::File> {
+fn try_lock_exclusive(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(path)
-        .ok()?;
+        .open(path)?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        return None;
+    if rc == 0 {
+        return Ok(Some(file));
     }
-    Some(file)
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(windows)]
 #[allow(clippy::suspicious_open_options)]
-fn try_lock_exclusive(path: &std::path::Path) -> Option<std::fs::File> {
+fn try_lock_exclusive(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::windows::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .share_mode(0)
         .open(path)
-        .ok()
+    {
+        Ok(file) => Ok(Some(file)),
+        // CreateFileW reports sharing/lock violations when another process has
+        // the share_mode(0) lock handle open. Other access failures (notably
+        // ERROR_ACCESS_DENIED) must be surfaced to the caller immediately.
+        Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Windows-specific flag to prevent console window creation
@@ -495,6 +519,18 @@ mod tests {
             lock.is_none(),
             "should return None when parent directory does not exist"
         );
+    }
+
+    #[test]
+    fn test_lockfile_result_distinguishes_invalid_path_from_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("not-a-directory");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let lock_path = not_a_directory.join("test.lock");
+
+        let error = LockFile::try_acquire_result(&lock_path)
+            .expect_err("invalid lock path must be an I/O error, not contention");
+        assert_ne!(error.kind(), std::io::ErrorKind::WouldBlock);
     }
 
     #[test]

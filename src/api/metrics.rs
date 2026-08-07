@@ -19,8 +19,8 @@ static LAST_METRICS_UPLOAD_STARTED_AT: OnceLock<Mutex<Option<Instant>>> = OnceLo
 ///
 /// Hosted metrics require authentication. An explicitly configured enterprise
 /// metrics URL is an opt-in local deployment and may accept anonymous uploads.
-pub fn metrics_upload_allowed(_api_base_url: &str, client: &ApiClient) -> bool {
-    crate::config::Config::fresh().has_dedicated_metrics_api_base_url()
+pub fn metrics_upload_allowed(client: &ApiClient) -> bool {
+    client.context().allows_anonymous_metrics_upload()
         || client.is_logged_in()
         || client.has_api_key()
 }
@@ -194,6 +194,14 @@ fn parse_metrics_upload_response(
     validate_metrics_upload_response(response, batch_size, expected_payload_sha256)
 }
 
+fn parse_metrics_upload_error_message(body: &str) -> String {
+    serde_json::from_str::<ApiErrorResponse>(body)
+        .ok()
+        .map(|response| response.error)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| "metrics upload request was rejected".to_string())
+}
+
 /// Upload metrics batch with retry logic.
 ///
 /// Returns Ok(response) on success (200 response, even with partial errors).
@@ -287,22 +295,13 @@ impl ApiClient {
             .map_err(|e| GitAiError::Generic(format!("Failed to read response body: {}", e)))?;
 
         match status_code {
-            200 => parse_metrics_upload_response(
-                body,
-                batch.events.len(),
-                &prepared.payload_sha256,
-            ),
-            _ => {
-                let message = serde_json::from_str::<ApiErrorResponse>(body)
-                    .ok()
-                    .map(|response| response.error)
-                    .filter(|message| !message.trim().is_empty())
-                    .unwrap_or_else(|| "metrics upload request was rejected".to_string());
-                Err(GitAiError::HttpStatusError {
-                    status: status_code,
-                    message,
-                })
+            200 => {
+                parse_metrics_upload_response(body, batch.events.len(), &prepared.payload_sha256)
             }
+            _ => Err(GitAiError::HttpStatusError {
+                status: status_code,
+                message: parse_metrics_upload_error_message(body),
+            }),
         }
     }
 }
@@ -310,6 +309,7 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::client::{ApiContext, MetricsEndpointMode};
     use sha2::{Digest, Sha256};
     use std::cell::{Cell, RefCell};
 
@@ -355,6 +355,41 @@ mod tests {
         };
         let successful = response.successful_indices(2);
         assert!(successful.is_empty());
+    }
+
+    #[test]
+    fn metrics_upload_permission_uses_the_constructed_context_mode() {
+        let client = |mode, auth_token: Option<&str>, api_key: Option<&str>| {
+            ApiClient::new(ApiContext {
+                base_url: "https://metrics.example.com".to_string(),
+                auth_token: auth_token.map(str::to_string),
+                api_key: api_key.map(str::to_string),
+                author_identity: None,
+                timeout_secs: Some(30),
+                metrics_endpoint_mode: mode,
+            })
+        };
+
+        assert!(metrics_upload_allowed(&client(
+            MetricsEndpointMode::DedicatedAnonymous,
+            None,
+            None,
+        )));
+        assert!(!metrics_upload_allowed(&client(
+            MetricsEndpointMode::Standard,
+            None,
+            None,
+        )));
+        assert!(metrics_upload_allowed(&client(
+            MetricsEndpointMode::Standard,
+            Some("token"),
+            None,
+        )));
+        assert!(metrics_upload_allowed(&client(
+            MetricsEndpointMode::Standard,
+            None,
+            Some("api-key"),
+        )));
     }
 
     #[test]
@@ -467,10 +502,9 @@ mod tests {
 
     #[test]
     fn metrics_acknowledgement_is_validated_before_error_indices() {
-        let wire_response: MetricsUploadWireResponse = serde_json::from_str(
-            r#"{"errors":[{"index":99,"error":"bad"}]}"#,
-        )
-        .expect("legacy response must deserialize");
+        let wire_response: MetricsUploadWireResponse =
+            serde_json::from_str(r#"{"errors":[{"index":99,"error":"bad"}]}"#)
+                .expect("legacy response must deserialize");
 
         let error = validate_metrics_upload_response(wire_response, 1, "expected-sha")
             .expect_err("missing acknowledgement must fail");
@@ -531,6 +565,37 @@ mod tests {
     }
 
     #[test]
+    fn every_metrics_acknowledgement_field_is_required() {
+        for (missing_field, expected_message) in [
+            ("accepted", "accepted=true"),
+            ("kind", "kind=git_ai_metrics"),
+            ("itemCount", "itemCount"),
+            ("payloadSha256", "payloadSha256"),
+        ] {
+            let mut response = serde_json::json!({
+                "accepted": true,
+                "kind": "git_ai_metrics",
+                "itemCount": 1,
+                "payloadSha256": "expected-sha",
+                "errors": []
+            });
+            response
+                .as_object_mut()
+                .expect("response is an object")
+                .remove(missing_field);
+            let response: MetricsUploadWireResponse =
+                serde_json::from_value(response).expect("missing ACK fields remain deserializable");
+
+            let error = validate_metrics_upload_response(response, 1, "expected-sha")
+                .expect_err("missing acknowledgement field must fail closed");
+            assert!(
+                error.to_string().contains(expected_message),
+                "unexpected error for missing {missing_field}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn metrics_upload_hash_binds_to_the_exact_serialized_request_body() {
         let batch = MetricsBatch::new(vec![]);
         let prepared = prepare_metrics_upload(&batch).expect("prepare metrics batch");
@@ -549,6 +614,22 @@ mod tests {
         assert!(
             error.to_string().contains("accepted=true"),
             "unexpected error: {error}"
+        );
+        assert!(
+            !metrics_upload_error_is_permanent(&error),
+            "protocol failures must retain local facts for retry"
+        );
+    }
+
+    #[test]
+    fn metrics_upload_error_accepts_backend_msg_and_legacy_error_fields() {
+        assert_eq!(
+            parse_metrics_upload_error_message(r#"{"code":429,"msg":"server busy"}"#),
+            "server busy"
+        );
+        assert_eq!(
+            parse_metrics_upload_error_message(r#"{"error":"legacy failure"}"#),
+            "legacy failure"
         );
     }
 }

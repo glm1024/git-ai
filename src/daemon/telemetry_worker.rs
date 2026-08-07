@@ -13,7 +13,7 @@ use crate::api::types::{
 };
 use crate::api::{ApiClient, ApiContext, CasObject, CasUploadRequest};
 use crate::authorship::authorship_log_serialization::GIT_AI_VERSION;
-use crate::config::{Config, get_or_create_distinct_id};
+use crate::config::{Config, REPORTING_PROFILE_VERSION_ATTRIBUTE, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::error::GitAiError;
 use crate::metrics::db::{METADATA_BACKFILL_BATCH_SIZE, MetricRecord, MetricsDatabase};
@@ -21,7 +21,7 @@ use crate::metrics::session_compaction::SessionObservation;
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
@@ -518,17 +518,7 @@ fn spawn_token_identity_rehydration() {
 
 fn rehydrate_unknown_token_identity() -> Result<usize, GitAiError> {
     let config = Config::fresh();
-    let reporting_attributes = config
-        .metrics_custom_attributes()
-        .iter()
-        .filter(|(key, _)| {
-            matches!(
-                key.as_str(),
-                "department_name" | "office_name" | "team_name" | "user_name" | "user_email"
-            )
-        })
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let reporting_attributes = reporting_identity_attributes(config.metrics_custom_attributes());
     let db = MetricsDatabase::global()?;
     let mut db_lock = db
         .lock()
@@ -536,6 +526,22 @@ fn rehydrate_unknown_token_identity() -> Result<usize, GitAiError> {
     db_lock
         .rehydrate_unknown_daily_token_identity(&reporting_attributes)
         .map(|ids| ids.len())
+}
+
+fn reporting_identity_attributes(
+    metrics_custom_attributes: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    metrics_custom_attributes
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() == REPORTING_PROFILE_VERSION_ATTRIBUTE
+                || matches!(
+                    key.as_str(),
+                    "department_name" | "office_name" | "team_name" | "user_name" | "user_email"
+                )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 fn backfill_metrics_event_metadata() -> Result<(), GitAiError> {
@@ -785,10 +791,9 @@ fn pending_count_or_unknown(label: &str, result: Result<usize, GitAiError>) -> u
 
 fn flush_metrics(events: &[MetricEvent]) {
     let context = ApiContext::for_metrics();
-    let api_base_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
-    let should_upload = metrics_upload_allowed(&api_base_url, &client);
+    let should_upload = metrics_upload_allowed(&client);
     METRICS_UPLOAD_AVAILABLE.store(should_upload, Ordering::Relaxed);
 
     let mut upload_failed = false;
@@ -818,10 +823,9 @@ fn flush_pending_metrics() {
     }
 
     let context = ApiContext::for_metrics();
-    let api_base_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
-    let should_upload = metrics_upload_allowed(&api_base_url, &client);
+    let should_upload = metrics_upload_allowed(&client);
     METRICS_UPLOAD_AVAILABLE.store(should_upload, Ordering::Relaxed);
     if !should_upload {
         return;
@@ -1681,6 +1685,36 @@ mod tests {
     }
 
     #[test]
+    fn token_identity_rehydration_keeps_profile_provenance_marker_only() {
+        let attributes = HashMap::from([
+            ("department_name".to_string(), "云计算研发部".to_string()),
+            ("office_name".to_string(), "研发四处".to_string()),
+            ("team_name".to_string(), "研发一组".to_string()),
+            ("user_name".to_string(), "Alice".to_string()),
+            ("user_email".to_string(), "alice@example.com".to_string()),
+            (
+                REPORTING_PROFILE_VERSION_ATTRIBUTE.to_string(),
+                "1".to_string(),
+            ),
+            ("email".to_string(), "alias@example.com".to_string()),
+            ("project_key".to_string(), "repo".to_string()),
+        ]);
+
+        let reporting = reporting_identity_attributes(&attributes);
+
+        assert_eq!(
+            reporting.get(REPORTING_PROFILE_VERSION_ATTRIBUTE),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            reporting.get("user_email"),
+            Some(&"alice@example.com".to_string())
+        );
+        assert!(!reporting.contains_key("email"));
+        assert!(!reporting.contains_key("project_key"));
+    }
+
+    #[test]
     fn empty_periodic_flush_preserves_pending_metrics_only_fast_path() {
         let mut buffer = TelemetryBuffer::new();
 
@@ -1745,6 +1779,7 @@ mod tests {
             events: vec![MetricEvent {
                 timestamp: now_ts(),
                 event_id: 1,
+                instance_id: None,
                 values: Default::default(),
                 attrs: Default::default(),
             }],

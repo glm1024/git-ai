@@ -3,14 +3,14 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Current API version for metrics wire format.
 pub const METRICS_API_VERSION: u8 = 1;
 
-/// Sparse position-encoded array (HashMap with string keys for positions).
+/// Sparse position-encoded array with deterministic wire ordering.
 /// Missing keys = not-set, explicit null = null, otherwise value.
-pub type SparseArray = HashMap<String, Value>;
+pub type SparseArray = BTreeMap<String, Value>;
 
 /// Event IDs for different metric types.
 #[repr(u16)]
@@ -41,13 +41,17 @@ pub trait EventValues: Sized {
 }
 
 /// Generic wrapper for any metric event.
-/// JSON keys: t=timestamp, e=event_id, v=values, a=attrs
+/// JSON keys: t=timestamp, e=event_id, i=stable event instance id, v=values, a=attrs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricEvent {
     #[serde(rename = "t")]
     pub timestamp: u32,
     #[serde(rename = "e")]
     pub event_id: u16,
+    /// Stable identity for this locally-created event across SQLite retries.
+    /// Legacy persisted events deserialize without an id and remain id-less.
+    #[serde(rename = "i", default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     #[serde(rename = "v")]
     pub values: SparseArray,
     #[serde(rename = "a")]
@@ -63,6 +67,7 @@ impl MetricEvent {
                 .unwrap_or_default()
                 .as_secs() as u32,
             event_id: V::event_id() as u16,
+            instance_id: Some(crate::uuid::generate_v4()),
             values: values.to_sparse(),
             attrs,
         }
@@ -76,6 +81,7 @@ impl MetricEvent {
                 .unwrap_or_default()
                 .as_secs() as u32,
             event_id: V::event_id() as u16,
+            instance_id: Some(crate::uuid::generate_v4()),
             values: values.into_sparse(),
             attrs,
         }
@@ -96,6 +102,7 @@ impl MetricEvent {
                     .as_secs() as u32
             }),
             event_id: V::event_id() as u16,
+            instance_id: Some(crate::uuid::generate_v4()),
             values: values.into_sparse(),
             attrs,
         }
@@ -107,6 +114,7 @@ impl MetricEvent {
         Self {
             timestamp,
             event_id: V::event_id() as u16,
+            instance_id: Some(crate::uuid::generate_v4()),
             values: values.to_sparse(),
             attrs,
         }
@@ -153,6 +161,7 @@ mod tests {
         let event = MetricEvent {
             timestamp: 1704067200,
             event_id: MetricEventId::Committed as u16,
+            instance_id: Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
             values,
             attrs,
         };
@@ -178,6 +187,31 @@ mod tests {
         assert_eq!(
             event.attrs.get("0"),
             Some(&Value::String("1.0.0".to_string()))
+        );
+        assert_eq!(event.instance_id, None);
+        assert!(
+            !serde_json::to_string(&event).unwrap().contains("\"i\""),
+            "legacy SQLite events must remain legacy events instead of gaining an upload-time id"
+        );
+    }
+
+    #[test]
+    fn metric_event_maps_serialize_deterministically_after_roundtrip() {
+        let event: MetricEvent = serde_json::from_str(
+            r#"{"t":1704067200,"e":4,"i":"123e4567-e89b-42d3-a456-426614174000","v":{"2":"two","10":"ten","1":"one"},"a":{"5":"branch","30":{"z":1,"a":2},"0":"version"}}"#,
+        )
+        .unwrap();
+
+        let first = serde_json::to_string(&event).unwrap();
+        let second = serde_json::to_string(
+            &serde_json::from_str::<MetricEvent>(&first).expect("reparse deterministic event"),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            r#"{"t":1704067200,"e":4,"i":"123e4567-e89b-42d3-a456-426614174000","v":{"1":"one","10":"ten","2":"two"},"a":{"0":"version","30":{"a":2,"z":1},"5":"branch"}}"#
         );
     }
 
@@ -226,6 +260,7 @@ mod tests {
         let event1 = MetricEvent {
             timestamp: 1704067200,
             event_id: 1,
+            instance_id: None,
             values: values.clone(),
             attrs: attrs.clone(),
         };
@@ -233,6 +268,7 @@ mod tests {
         let event2 = MetricEvent {
             timestamp: 1704067300,
             event_id: 2,
+            instance_id: None,
             values,
             attrs,
         };
@@ -283,11 +319,17 @@ mod tests {
         // Timestamp should be between before and after (within a few seconds)
         assert!(event.timestamp >= before);
         assert!(event.timestamp <= after + 1);
+        let instance_id = event
+            .instance_id
+            .as_deref()
+            .expect("new metrics must carry a stable event instance id");
+        assert_eq!(instance_id.len(), 36);
+        assert_eq!(instance_id.as_bytes()[14], b'4');
     }
 
     #[test]
     fn test_sparse_array_type() {
-        let mut arr: SparseArray = HashMap::new();
+        let mut arr = SparseArray::new();
         arr.insert("0".to_string(), Value::String("test".to_string()));
         arr.insert("1".to_string(), Value::Number(42.into()));
         arr.insert("2".to_string(), Value::Null);

@@ -218,6 +218,14 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Command
 }
 
 fn run_install_script(repo: &TestRepo, timeout: Duration) -> CommandResult {
+    run_install_script_with_failure(repo, timeout, None)
+}
+
+fn run_install_script_with_failure(
+    repo: &TestRepo,
+    timeout: Duration,
+    fail_at: Option<&str>,
+) -> CommandResult {
     let mut command = Command::new("powershell");
     command
         .arg("-NoProfile")
@@ -227,6 +235,9 @@ fn run_install_script(repo: &TestRepo, timeout: Duration) -> CommandResult {
         .arg(install_script_path())
         .current_dir(env!("CARGO_MANIFEST_DIR"));
     configure_install_env(&mut command, repo);
+    if let Some(step) = fail_at {
+        command.env("GIT_AI_INSTALL_TEST_FAIL_AT", step);
+    }
     run_command_with_timeout(&mut command, timeout)
 }
 
@@ -487,6 +498,88 @@ fn windows_install_script_refreshes_wrapper_for_existing_users() {
     assert!(
         installed_git_wrapper_path(&repo).exists(),
         "git.exe wrapper should be refreshed for existing users"
+    );
+}
+
+#[test]
+#[serial]
+fn windows_install_script_restores_binary_and_wrapper_after_upgrade_failure() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let old_binary = b"old git-ai executable bytes";
+    let old_wrapper = b"old git wrapper bytes";
+    let bin_dir = repo.test_home_path().join(".git-ai").join("bin");
+    fs::create_dir_all(&bin_dir).expect("failed to create install dir");
+    fs::write(installed_git_ai_path(&repo), old_binary).expect("failed to seed old binary");
+    fs::write(installed_git_wrapper_path(&repo), old_wrapper).expect("failed to seed old wrapper");
+
+    let install =
+        run_install_script_with_failure(&repo, Duration::from_secs(90), Some("after_shim_publish"));
+    assert!(
+        !install.status.success(),
+        "injected upgrade failure should fail\nstdout:\n{}\nstderr:\n{}",
+        install.stdout,
+        install.stderr
+    );
+    assert_eq!(
+        fs::read(installed_git_ai_path(&repo)).expect("old binary should be restored"),
+        old_binary
+    );
+    assert_eq!(
+        fs::read(installed_git_wrapper_path(&repo)).expect("old wrapper should be restored"),
+        old_wrapper
+    );
+    assert!(
+        fs::read_dir(&bin_dir)
+            .expect("failed to inspect install dir")
+            .all(|entry| !entry
+                .expect("failed to inspect install entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".install-backup.")),
+        "successful rollback should not leave executable backups"
+    );
+}
+
+#[test]
+#[serial]
+fn windows_install_script_failed_first_install_preserves_local_data() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let install_root = repo.test_home_path().join(".git-ai");
+    let outbox = install_root.join("outbox");
+    fs::create_dir_all(&outbox).expect("failed to create existing data directory");
+    fs::write(install_root.join("config.json"), b"existing config").expect("failed to seed config");
+    fs::write(
+        install_root.join("metrics.sqlite"),
+        b"existing sqlite facts",
+    )
+    .expect("failed to seed sqlite facts");
+    fs::write(outbox.join("pending.json"), b"existing pending facts")
+        .expect("failed to seed outbox facts");
+
+    let install = run_install_script_with_failure(
+        &repo,
+        Duration::from_secs(90),
+        Some("after_binary_publish"),
+    );
+    assert!(
+        !install.status.success(),
+        "injected first-install failure should fail\nstdout:\n{}\nstderr:\n{}",
+        install.stdout,
+        install.stderr
+    );
+    assert!(!installed_git_ai_path(&repo).exists());
+    assert!(!installed_git_wrapper_path(&repo).exists());
+    assert_eq!(
+        fs::read(install_root.join("config.json")).expect("config should remain"),
+        b"existing config"
+    );
+    assert_eq!(
+        fs::read(install_root.join("metrics.sqlite")).expect("SQLite facts should remain"),
+        b"existing sqlite facts"
+    );
+    assert_eq!(
+        fs::read(outbox.join("pending.json")).expect("outbox facts should remain"),
+        b"existing pending facts"
     );
 }
 

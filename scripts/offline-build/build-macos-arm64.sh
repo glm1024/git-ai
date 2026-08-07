@@ -44,6 +44,7 @@ TARGET_DIR="${BUILD_ROOT}/target/macos-arm64"
 SOURCE_BINARY="${TARGET_DIR}/${TARGET}/release/git-ai"
 
 mkdir -p "${OUT_DIR}" "${TARGET_DIR}"
+begin_artifact_build "${OUT_DIR}/${ARTIFACT}"
 
 if ! rustup toolchain list | awk -v toolchain="${TOOLCHAIN}" '$1 == toolchain || index($1, toolchain "-") == 1 { found = 1 } END { exit !found }'; then
     if is_offline_build; then
@@ -86,3 +87,4 @@ require_file "${SOURCE_BINARY}"
 strip "${SOURCE_BINARY}"
 cp "${SOURCE_BINARY}" "${OUT_DIR}/${ARTIFACT}"
 file "${OUT_DIR}/${ARTIFACT}"
+finish_artifact_build "${OUT_DIR}/${ARTIFACT}"

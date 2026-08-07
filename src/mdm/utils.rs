@@ -125,6 +125,7 @@ pub fn binary_exists(name: &str) -> bool {
 /// When the editor CLI (e.g. `code`, `cursor`) is in PATH, this wraps that simple command.
 /// When the CLI is not in PATH, this wraps a fallback that calls Electron with `cli.js` directly,
 /// mimicking what the shell script wrappers do.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorCliCommand {
     pub program: String,
     pub args_prefix: Vec<String>,
@@ -187,29 +188,36 @@ impl EditorCliCommand {
 /// Try to resolve the editor CLI command, first checking PATH, then falling back
 /// to finding the Electron binary and `cli.js` directly in known install locations.
 pub fn resolve_editor_cli(cli_name: &str) -> Option<EditorCliCommand> {
-    if binary_exists(cli_name) {
-        return Some(EditorCliCommand::from_path(cli_name));
-    }
-
-    find_editor_cli_js(cli_name)
+    resolve_editor_clis(cli_name).into_iter().next()
 }
 
-/// Search known installation directories for the Electron binary and cli.js
-fn find_editor_cli_js(cli_name: &str) -> Option<EditorCliCommand> {
-    let candidates = get_editor_cli_candidates(cli_name);
+/// Resolve every usable CLI instance for an editor. The PATH command is kept
+/// first for backwards compatibility, followed by all known application
+/// installs. Callers that need to inspect installed extensions must use this
+/// list rather than only the first command: Stable and Insiders can coexist and
+/// maintain different extension sets.
+pub fn resolve_editor_clis(cli_name: &str) -> Vec<EditorCliCommand> {
+    let mut resolved = Vec::new();
 
-    for (electron_path, cli_js_path) in candidates {
+    if binary_exists(cli_name) {
+        resolved.push(EditorCliCommand::from_path(cli_name));
+    }
+
+    for (electron_path, cli_js_path) in get_editor_cli_candidates(cli_name) {
         if electron_path.is_file() && cli_js_path.is_file() {
             tracing::debug!(
                 "{}: CLI not in PATH, using cli.js fallback at {}",
                 cli_name,
                 cli_js_path.display()
             );
-            return Some(EditorCliCommand::from_cli_js(&electron_path, &cli_js_path));
+            let command = EditorCliCommand::from_cli_js(&electron_path, &cli_js_path);
+            if !resolved.contains(&command) {
+                resolved.push(command);
+            }
         }
     }
 
-    None
+    resolved
 }
 
 /// Return candidate (electron_binary, cli_js) paths for a given editor
@@ -315,14 +323,19 @@ fn get_editor_cli_candidates(cli_name: &str) -> Vec<(PathBuf, PathBuf)> {
                 }
             }
         }
-        "code" => {
+        "code" | "code-insiders" => {
             #[cfg(target_os = "macos")]
             {
                 for apps_dir in [PathBuf::from("/Applications"), home.join("Applications")] {
-                    for app_name in [
-                        "Visual Studio Code.app",
-                        "Visual Studio Code - Insiders.app",
-                    ] {
+                    let app_names: &[&str] = if cli_name == "code-insiders" {
+                        &["Visual Studio Code - Insiders.app"]
+                    } else {
+                        &[
+                            "Visual Studio Code.app",
+                            "Visual Studio Code - Insiders.app",
+                        ]
+                    };
+                    for app_name in app_names {
                         let app = apps_dir.join(app_name);
                         candidates.push((
                             app.join("Contents").join("MacOS").join("Electron"),
@@ -338,15 +351,9 @@ fn get_editor_cli_candidates(cli_name: &str) -> Vec<(PathBuf, PathBuf)> {
 
             #[cfg(all(unix, not(target_os = "macos")))]
             {
-                for base in [
-                    PathBuf::from("/usr/share/code"),
-                    PathBuf::from("/usr/lib/code"),
-                    PathBuf::from("/opt/visual-studio-code"),
-                    PathBuf::from("/usr/share/code-insiders"),
-                    PathBuf::from("/snap/code/current/usr/share/code"),
-                ] {
+                for (base, executable_name) in linux_vscode_install_specs(cli_name) {
                     candidates.push((
-                        base.join("code"),
+                        base.join(executable_name),
                         base.join("resources")
                             .join("app")
                             .join("out")
@@ -357,16 +364,44 @@ fn get_editor_cli_candidates(cli_name: &str) -> Vec<(PathBuf, PathBuf)> {
 
             #[cfg(windows)]
             {
+                let mut install_roots = Vec::new();
                 if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
-                    for dir_name in ["Microsoft VS Code", "Microsoft VS Code Insiders"] {
-                        let base = PathBuf::from(&localappdata).join("Programs").join(dir_name);
-                        candidates.push((
-                            base.join("Code.exe"),
-                            base.join("resources")
-                                .join("app")
-                                .join("out")
-                                .join("cli.js"),
-                        ));
+                    install_roots.push(PathBuf::from(localappdata).join("Programs"));
+                }
+                for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+                    if let Ok(program_files) = std::env::var(variable) {
+                        let root = PathBuf::from(program_files);
+                        if !install_roots.contains(&root) {
+                            install_roots.push(root);
+                        }
+                    }
+                }
+
+                for root in install_roots {
+                    let installs: &[(&str, &[&str])] = if cli_name == "code-insiders" {
+                        &[(
+                            "Microsoft VS Code Insiders",
+                            &["Code - Insiders.exe", "Code.exe"],
+                        )]
+                    } else {
+                        &[
+                            ("Microsoft VS Code", &["Code.exe"]),
+                            (
+                                "Microsoft VS Code Insiders",
+                                &["Code - Insiders.exe", "Code.exe"],
+                            ),
+                        ]
+                    };
+                    for (dir_name, executable_names) in installs {
+                        let base = root.join(dir_name);
+                        let cli_js = base
+                            .join("resources")
+                            .join("app")
+                            .join("out")
+                            .join("cli.js");
+                        for executable_name in executable_names {
+                            candidates.push((base.join(executable_name), cli_js.clone()));
+                        }
                     }
                 }
             }
@@ -375,6 +410,26 @@ fn get_editor_cli_candidates(cli_name: &str) -> Vec<(PathBuf, PathBuf)> {
     }
 
     candidates
+}
+
+/// Known Linux VS Code installs and their Electron executable names. Keep the
+/// executable explicit per channel: the official Insiders package installs
+/// `code-insiders`, not `code`, under `/usr/share/code-insiders`.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn linux_vscode_install_specs(cli_name: &str) -> Vec<(PathBuf, &'static str)> {
+    let stable = [
+        (PathBuf::from("/usr/share/code"), "code"),
+        (PathBuf::from("/usr/lib/code"), "code"),
+        (PathBuf::from("/opt/visual-studio-code"), "code"),
+        (PathBuf::from("/snap/code/current/usr/share/code"), "code"),
+    ];
+    let insiders = [(PathBuf::from("/usr/share/code-insiders"), "code-insiders")];
+
+    match cli_name {
+        "code" => stable.into_iter().chain(insiders).collect(),
+        "code-insiders" => insiders.into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Check if running in GitHub Codespaces environment
@@ -609,6 +664,12 @@ pub fn settings_paths_for_products(product_names: &[&str]) -> Vec<PathBuf> {
     paths
 }
 
+fn extension_list_has_exact_id(stdout: &str, extension_id: &str) -> bool {
+    stdout
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(extension_id))
+}
+
 /// Check if a VS Code extension is installed
 pub fn is_vsc_editor_extension_installed(
     cli: &EditorCliCommand,
@@ -625,7 +686,7 @@ pub fn is_vsc_editor_extension_installed(
                     last_error_message = Some(String::from_utf8_lossy(&output.stderr).to_string());
                 } else {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    return Ok(stdout.contains(id_or_vsix));
+                    return Ok(extension_list_has_exact_id(&stdout, id_or_vsix));
                 }
             }
             Err(e) => {
@@ -1089,6 +1150,16 @@ mod tests {
     }
 
     #[test]
+    fn test_extension_list_requires_an_exact_case_insensitive_line() {
+        let output = "publisher.one\n  KiloCode.Kilo-Code  \nevil.kilocode.kilo-code-wrapper\n";
+        assert!(extension_list_has_exact_id(output, "kilocode.kilo-code"));
+        assert!(!extension_list_has_exact_id(
+            "evil.kilocode.kilo-code-wrapper\n",
+            "kilocode.kilo-code"
+        ));
+    }
+
+    #[test]
     fn test_editor_cli_command_from_cli_js() {
         let electron = PathBuf::from("/Applications/Cursor.app/Contents/MacOS/Cursor");
         let cli_js = PathBuf::from("/Applications/Cursor.app/Contents/Resources/app/out/cli.js");
@@ -1239,6 +1310,18 @@ mod tests {
         // Unknown editor should return empty
         let unknown_candidates = get_editor_cli_candidates("unknown");
         assert!(unknown_candidates.is_empty());
+    }
+
+    #[test]
+    fn test_linux_vscode_insiders_uses_channel_specific_executable() {
+        let all = linux_vscode_install_specs("code");
+        assert!(all.contains(&(PathBuf::from("/usr/share/code-insiders"), "code-insiders")));
+        assert!(!all.contains(&(PathBuf::from("/usr/share/code-insiders"), "code")));
+
+        assert_eq!(
+            linux_vscode_install_specs("code-insiders"),
+            vec![(PathBuf::from("/usr/share/code-insiders"), "code-insiders")]
+        );
     }
 
     #[test]

@@ -304,6 +304,7 @@ mod tests {
             events: vec![MetricEvent {
                 timestamp: 1,
                 event_id: 1,
+                instance_id: None,
                 values: Default::default(),
                 attrs: Default::default(),
             }],

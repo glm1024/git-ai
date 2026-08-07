@@ -1,5 +1,6 @@
 /target
 /build
+/offline-dist/.git-ai-package-*.staging.*/
 .DS_Store
 .task/
 .idea/
@@ -41,4 +42,3 @@ fuzz/corpus/
 # Worktrees
 .worktrees/
 .claude/worktrees/
-

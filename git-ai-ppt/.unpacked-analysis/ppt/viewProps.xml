@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<p:viewPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" lastView="sldThumbnailView">
+  <p:normalViewPr horzBarState="maximized">
+    <p:restoredLeft sz="6520" autoAdjust="0"/>
+    <p:restoredTop sz="88296" autoAdjust="0"/>
+  </p:normalViewPr>
+  <p:slideViewPr>
+    <p:cSldViewPr showGuides="1">
+      <p:cViewPr varScale="1">
+        <p:scale>
+          <a:sx n="128" d="100"/>
+          <a:sy n="128" d="100"/>
+        </p:scale>
+        <p:origin x="704" y="176"/>
+      </p:cViewPr>
+      <p:guideLst>
+        <p:guide orient="horz" pos="3264"/>
+        <p:guide orient="horz" pos="929"/>
+        <p:guide orient="horz" pos="2889"/>
+        <p:guide pos="1884"/>
+        <p:guide pos="2463"/>
+        <p:guide pos="3477"/>
+      </p:guideLst>
+    </p:cSldViewPr>
+  </p:slideViewPr>
+  <p:notesTextViewPr>
+    <p:cViewPr>
+      <p:scale>
+        <a:sx n="125" d="100"/>
+        <a:sy n="125" d="100"/>
+      </p:scale>
+      <p:origin x="0" y="0"/>
+    </p:cViewPr>
+  </p:notesTextViewPr>
+  <p:sorterViewPr>
+    <p:cViewPr>
+      <p:scale>
+        <a:sx n="66" d="100"/>
+        <a:sy n="66" d="100"/>
+      </p:scale>
+      <p:origin x="0" y="0"/>
+    </p:cViewPr>
+  </p:sorterViewPr>
+  <p:gridSpacing cx="72008" cy="72008"/>
+</p:viewPr>

@@ -33,6 +33,7 @@ XWIN_CACHE="${CACHE_ROOT}/xwin"
 MARKER_FILE="${XWIN_CACHE}/.git-ai-xwin-x64-ready"
 TARGET_DIR="/workspace/build/offline-build/work/${TARGET}"
 mkdir -p "${OUT_DIR}" "${CARGO_CACHE}" "${XWIN_CACHE}"
+begin_artifact_build "${OUT_DIR}/${ARTIFACT}"
 
 if [ ! -f "${MARKER_FILE}" ]; then
     if is_offline_build; then
@@ -74,3 +75,5 @@ docker run --rm \
     -v "${OUT_DIR}:/output" \
     "${WINDOWS_BUILDER_IMAGE}" \
     sh -c "set -eu; cargo xwin build --locked --release --target ${TARGET} --bin git-ai; cp \"${TARGET_DIR}/${TARGET}/release/git-ai.exe\" /output/${ARTIFACT}; file /output/${ARTIFACT}"
+
+finish_artifact_build "${OUT_DIR}/${ARTIFACT}"

@@ -8,7 +8,10 @@
 
 use crate::error::GitAiError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
-use crate::mdm::utils::{binary_exists, generate_diff, home_dir, write_atomic};
+use crate::mdm::utils::{
+    binary_exists, generate_diff, home_dir, is_vsc_editor_extension_installed, resolve_editor_clis,
+    write_atomic,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,10 +28,60 @@ const KILO_RUNTIME_FIELDS: &str = concat!(
     "          editor_name: process.env.KILO_EDITOR_NAME,\n",
     "          database_path: process.env.KILO_DB,\n",
 );
+const KILO_VSCODE_EXTENSION_ID: &str = "kilocode.kilo-code";
 
 pub struct KiloInstaller;
 
 impl KiloInstaller {
+    fn has_explicit_config_root() -> bool {
+        ["GIT_AI_KILO_CONFIG_HOME", "KILO_CONFIG_DIR"]
+            .iter()
+            .any(|name| {
+                std::env::var_os(name)
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false)
+            })
+    }
+
+    fn has_vscode_extension() -> Result<bool, GitAiError> {
+        let mut editor_clis = Vec::new();
+        for cli_name in ["code", "code-insiders"] {
+            for cli in resolve_editor_clis(cli_name) {
+                if !editor_clis.contains(&cli) {
+                    editor_clis.push(cli);
+                }
+            }
+        }
+
+        Self::combine_vscode_extension_checks(
+            editor_clis
+                .into_iter()
+                .map(|cli| is_vsc_editor_extension_installed(&cli, KILO_VSCODE_EXTENSION_ID)),
+        )
+    }
+
+    fn combine_vscode_extension_checks(
+        checks: impl IntoIterator<Item = Result<bool, GitAiError>>,
+    ) -> Result<bool, GitAiError> {
+        let mut errors = Vec::new();
+        for check in checks {
+            match check {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(GitAiError::Generic(format!(
+                "Unable to inspect every VS Code installation for the Kilo extension: {}",
+                errors.join("; ")
+            )));
+        }
+
+        Ok(false)
+    }
+
     fn config_root() -> PathBuf {
         std::env::var_os("GIT_AI_KILO_CONFIG_HOME")
             .filter(|value| !value.is_empty())
@@ -141,10 +194,21 @@ impl HookInstaller for KiloInstaller {
 
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
         let has_binary = binary_exists("kilo") || binary_exists("kilocode");
+        let has_explicit_config = Self::has_explicit_config_root();
         let has_global_config = Self::config_root().exists();
         let has_local_config = Path::new(".kilo").exists() || Path::new(".kilocode").exists();
+        let has_vscode_extension = !has_binary
+            && !has_explicit_config
+            && !has_global_config
+            && !has_local_config
+            && Self::has_vscode_extension()?;
 
-        if !has_binary && !has_global_config && !has_local_config {
+        if !has_binary
+            && !has_explicit_config
+            && !has_global_config
+            && !has_local_config
+            && !has_vscode_extension
+        {
             return Ok(HookCheckResult {
                 tool_installed: false,
                 hooks_installed: false,
@@ -243,9 +307,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let previous_home = std::env::var_os("HOME");
         let previous_profile = std::env::var_os("USERPROFILE");
+        let previous_git_ai_kilo_config = std::env::var_os("GIT_AI_KILO_CONFIG_HOME");
+        let previous_kilo_config = std::env::var_os("KILO_CONFIG_DIR");
+        let previous_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
         unsafe {
             std::env::set_var("HOME", temp.path());
             std::env::set_var("USERPROFILE", temp.path());
+            std::env::remove_var("GIT_AI_KILO_CONFIG_HOME");
+            std::env::remove_var("KILO_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
         }
         run(temp.path());
         unsafe {
@@ -257,7 +327,64 @@ mod tests {
                 Some(value) => std::env::set_var("USERPROFILE", value),
                 None => std::env::remove_var("USERPROFILE"),
             }
+            match previous_git_ai_kilo_config {
+                Some(value) => std::env::set_var("GIT_AI_KILO_CONFIG_HOME", value),
+                None => std::env::remove_var("GIT_AI_KILO_CONFIG_HOME"),
+            }
+            match previous_kilo_config {
+                Some(value) => std::env::set_var("KILO_CONFIG_DIR", value),
+                None => std::env::remove_var("KILO_CONFIG_DIR"),
+            }
+            match previous_xdg_config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
         }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_code_cli(path: &Path, extensions: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = \"--list-extensions\" ]; then\nprintf '%s\\n' '{}'\nexit 0\nfi\nexit 1\n",
+                extensions
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn with_fake_code_channel_extensions(
+        stable_extensions: &str,
+        insiders_extensions: Option<&str>,
+        run: impl FnOnce(),
+    ) {
+        let temp = TempDir::new().unwrap();
+        write_fake_code_cli(&temp.path().join("code"), stable_extensions);
+        if let Some(extensions) = insiders_extensions {
+            write_fake_code_cli(&temp.path().join("code-insiders"), extensions);
+        }
+
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", temp.path());
+        }
+        run();
+        unsafe {
+            match previous_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn with_fake_code_extensions(extensions: &str, run: impl FnOnce()) {
+        with_fake_code_channel_extensions(extensions, None, run);
     }
 
     #[test]
@@ -328,6 +455,69 @@ mod tests {
             assert!(result.tool_installed);
             assert!(!result.hooks_installed);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_kilo_vscode_extension_is_detected_before_first_kilo_launch() {
+        with_temp_home(|home| {
+            with_fake_code_extensions(KILO_VSCODE_EXTENSION_ID, || {
+                let installer = KiloInstaller;
+                let result = installer.check_hooks(&params()).unwrap();
+                assert!(result.tool_installed);
+                assert!(!result.hooks_installed);
+
+                installer.install_hooks(&params(), false).unwrap();
+                assert!(home.join(".config/kilo/plugin/git-ai.ts").exists());
+            });
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_unrelated_vscode_extension_does_not_enable_kilo_installer() {
+        with_temp_home(|_| {
+            with_fake_code_extensions("evil.kilocode.kilo-code-wrapper", || {
+                let result = KiloInstaller.check_hooks(&params()).unwrap();
+                assert!(!result.tool_installed);
+            });
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_kilo_extension_is_detected_in_insiders_when_stable_does_not_have_it() {
+        with_temp_home(|_| {
+            with_fake_code_channel_extensions(
+                "publisher.unrelated",
+                Some(KILO_VSCODE_EXTENSION_ID),
+                || {
+                    let result = KiloInstaller.check_hooks(&params()).unwrap();
+                    assert!(result.tool_installed);
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn test_extension_query_error_is_not_reduced_to_not_installed() {
+        let result = KiloInstaller::combine_vscode_extension_checks([
+            Ok(false),
+            Err(GitAiError::Generic("insiders query failed".to_string())),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_any_successful_extension_match_wins_over_other_query_errors() {
+        let result = KiloInstaller::combine_vscode_extension_checks([
+            Err(GitAiError::Generic("stable query failed".to_string())),
+            Ok(true),
+        ]);
+        assert!(result.unwrap());
     }
 
     #[test]

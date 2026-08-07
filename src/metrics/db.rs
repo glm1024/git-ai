@@ -5,6 +5,10 @@
 //! other delivered metrics remain available as local history. The server
 //! handles idempotency.
 
+use crate::config::{
+    REPORTING_PROFILE_RESERVED_ATTRIBUTE_KEYS, REPORTING_PROFILE_VERSION,
+    REPORTING_PROFILE_VERSION_ATTRIBUTE,
+};
 use crate::error::GitAiError;
 use crate::metrics::attrs::attr_pos;
 use crate::metrics::events::{
@@ -469,8 +473,10 @@ impl MetricsDatabase {
         }
         let deadline = Instant::now() + SCHEMA_MIGRATION_LOCK_WAIT;
         let _migration_lock = loop {
-            if let Some(lock) = LockFile::try_acquire(&lock_path) {
-                break lock;
+            match LockFile::try_acquire_result(&lock_path) {
+                Ok(Some(lock)) => break lock,
+                Ok(None) => {}
+                Err(error) => return Err(error.into()),
             }
             if Instant::now() >= deadline {
                 return Err(GitAiError::Generic(format!(
@@ -1307,9 +1313,7 @@ impl MetricsDatabase {
         &mut self,
         reporting_attributes: &HashMap<String, String>,
     ) -> Result<Vec<i64>, GitAiError> {
-        let configured_email = reporting_attributes
-            .get("user_email")
-            .and_then(|email| compact_valid_email(email));
+        let configured_email = configured_reporting_email(reporting_attributes);
 
         let tx = self.conn.transaction()?;
         let rows = {
@@ -3062,6 +3066,9 @@ fn apply_reporting_attributes(
     reporting_attributes: &HashMap<String, String>,
 ) -> Result<(), GitAiError> {
     let mut custom_attrs = compact_custom_attributes(attrs);
+    for key in REPORTING_PROFILE_RESERVED_ATTRIBUTE_KEYS {
+        custom_attrs.remove(*key);
+    }
     for key in [
         "department_name",
         "office_name",
@@ -3079,6 +3086,12 @@ fn apply_reporting_attributes(
             continue;
         };
         custom_attrs.insert(key.to_string(), Value::String(value));
+    }
+    if configured_reporting_email(reporting_attributes).is_some() {
+        custom_attrs.insert(
+            REPORTING_PROFILE_VERSION_ATTRIBUTE.to_string(),
+            Value::String(REPORTING_PROFILE_VERSION.to_string()),
+        );
     }
     attrs.insert(
         attr_pos::CUSTOM_ATTRIBUTES.to_string(),
@@ -3137,13 +3150,52 @@ fn compact_non_empty(value: &str) -> Option<&str> {
 
 fn compact_identity_email(attrs: &SparseArray) -> Option<String> {
     let custom_attrs = compact_custom_attributes(attrs);
-    first_compact_custom_attr(&custom_attrs, &["user_email", "userEmail", "email"])
-        .or_else(|| {
-            sparse_get_string(attrs, attr_pos::AUTHOR)
-                .flatten()
-                .and_then(|author| compact_author_email(&author))
-        })
+    let marker_is_valid_or_legacy_absent =
+        match custom_attrs.get(REPORTING_PROFILE_VERSION_ATTRIBUTE) {
+            None => true,
+            Some(Value::String(version)) => {
+                compact_non_empty(version) == Some(REPORTING_PROFILE_VERSION)
+            }
+            Some(_) => false,
+        };
+    if !marker_is_valid_or_legacy_absent
+        || ["department_name", "office_name", "user_name"]
+            .iter()
+            .any(|key| compact_profile_string(&custom_attrs, key).is_none())
+    {
+        return None;
+    }
+    compact_profile_string(&custom_attrs, "user_email")
         .and_then(|email| compact_valid_email(&email))
+}
+
+fn compact_profile_string(attrs: &Map<String, Value>, key: &str) -> Option<String> {
+    attrs
+        .get(key)?
+        .as_str()
+        .and_then(compact_non_empty)
+        .map(str::to_string)
+}
+
+fn configured_reporting_email(attributes: &HashMap<String, String>) -> Option<String> {
+    (attributes
+        .get(REPORTING_PROFILE_VERSION_ATTRIBUTE)
+        .map(String::as_str)
+        == Some(REPORTING_PROFILE_VERSION)
+        && ["department_name", "office_name", "user_name"]
+            .iter()
+            .all(|key| {
+                attributes
+                    .get(*key)
+                    .and_then(|value| compact_non_empty(value))
+                    .is_some()
+            }))
+    .then(|| {
+        attributes
+            .get("user_email")
+            .and_then(|email| compact_valid_email(email))
+    })
+    .flatten()
 }
 
 fn compact_valid_email(email: &str) -> Option<String> {
@@ -3155,13 +3207,6 @@ fn compact_valid_email(email: &str) -> Option<String> {
         && !domain.ends_with('.')
         && !domain.chars().any(char::is_whitespace))
     .then_some(email)
-}
-
-fn compact_author_email(author: &str) -> Option<String> {
-    let author = compact_non_empty(author)?;
-    let open = author.rfind('<')?;
-    let email = author.get(open + 1..)?.strip_suffix('>')?;
-    compact_non_empty(email).map(str::to_string)
 }
 
 fn recovery_event_key(
@@ -3436,6 +3481,24 @@ mod tests {
         (db, temp_dir)
     }
 
+    #[test]
+    fn schema_migration_lock_io_error_fails_immediately() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("lock-error-metrics.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+        let lock_path = PathBuf::from(format!("{}.migration.lock", db_path.display()));
+        std::fs::create_dir(&lock_path).unwrap();
+        let mut db = MetricsDatabase { conn };
+        let started_at = Instant::now();
+
+        let error = db
+            .initialize_schema()
+            .expect_err("migration lock I/O errors must not be retried as contention");
+
+        assert!(matches!(error, GitAiError::IoError(_)));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
     fn unix_now() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3661,7 +3724,11 @@ mod tests {
                 json!({
                     "project_key": "repo",
                     "ide": "codex",
+                    "department_name": "云计算研发部",
+                    "office_name": "研发四处",
+                    "user_name": "Alice",
                     "user_email": user_email,
+                    "git_ai_reporting_profile_version": REPORTING_PROFILE_VERSION,
                 })
                 .to_string(),
             ),
@@ -3676,6 +3743,10 @@ mod tests {
             ("team_name", "研发一组"),
             ("user_name", "Alice"),
             ("user_email", user_email),
+            (
+                REPORTING_PROFILE_VERSION_ATTRIBUTE,
+                REPORTING_PROFILE_VERSION,
+            ),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -3767,6 +3838,7 @@ mod tests {
         let event = MetricEvent {
             timestamp: seconds_ago(60),
             event_id: MetricEventId::SessionEvent as u16,
+            instance_id: None,
             values: [
                 (
                     "0".to_string(),
@@ -4306,6 +4378,65 @@ mod tests {
     }
 
     #[test]
+    fn test_git_author_email_stays_anonymous_until_reporting_profile_is_configured() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let mut observation = codex_cumulative_observation(first_ts, 100, 0, 0, false);
+        observation.attrs.insert(
+            attr_pos::AUTHOR.to_string(),
+            Value::String("Git Author <author@example.com>".to_string()),
+        );
+        observation.attrs.insert(
+            attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+            Value::String(
+                json!({
+                    "project_key": "repo",
+                    "ide": "codex",
+                    "email": "alias@example.com",
+                    "userEmail": "alias@example.com",
+                    "user_email": "forged@example.com",
+                    "git_ai_reporting_profile_version": REPORTING_PROFILE_VERSION,
+                    "organization_id": "stale-cloud-org",
+                    "team_name": "stale-team",
+                })
+                .to_string(),
+            ),
+        );
+
+        let original_id = db.insert_session_observations(&[observation]).unwrap()[0];
+        let original = pending_metric_events(&db)
+            .into_iter()
+            .find(|(id, _)| *id == original_id)
+            .unwrap()
+            .1;
+        assert_eq!(compact_identity_email(&original.attrs), None);
+
+        db.mark_records_delivered(&[original_id], unix_now())
+            .unwrap();
+        let refreshed = db
+            .rehydrate_unknown_daily_token_identity(&reporting_attributes("configured@example.com"))
+            .unwrap();
+        assert_eq!(refreshed.len(), 1);
+        let successor = pending_metric_events(&db)
+            .into_iter()
+            .find(|(id, _)| *id == refreshed[0])
+            .unwrap()
+            .1;
+        assert_eq!(
+            compact_identity_email(&successor.attrs).as_deref(),
+            Some("configured@example.com")
+        );
+        let successor_profile = compact_custom_attributes(&successor.attrs);
+        assert!(!successor_profile.contains_key("email"));
+        assert!(!successor_profile.contains_key("userEmail"));
+        assert!(!successor_profile.contains_key("organization_id"));
+        assert_eq!(
+            successor_profile.get("team_name").and_then(Value::as_str),
+            Some("研发一组")
+        );
+    }
+
+    #[test]
     fn test_daily_snapshot_rekeys_legacy_project_identity_with_exact_supersession() {
         let (mut db, _temp_dir) = create_test_db();
         let timestamp = seconds_ago(60);
@@ -4489,6 +4620,46 @@ mod tests {
                 ("alice@example.com".to_string(), 100),
                 ("bob@example.com".to_string(), 70),
             ]
+        );
+    }
+
+    #[test]
+    fn test_legacy_complete_profile_without_marker_is_not_reassigned_to_current_user() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        let mut legacy_user_a = codex_cumulative_observation(first_ts, 100, 0, 0, false);
+        legacy_user_a.attrs.insert(
+            attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+            Value::String(
+                json!({
+                    "project_key": "repo",
+                    "ide": "codex",
+                    "department_name": "云计算研发部",
+                    "office_name": "研发四处",
+                    "team_name": "研发一组",
+                    "user_name": "Alice",
+                    "user_email": "alice@example.com",
+                })
+                .to_string(),
+            ),
+        );
+
+        db.insert_session_observations(&[legacy_user_a]).unwrap();
+        assert!(
+            db.rehydrate_unknown_daily_token_identity(&reporting_attributes("bob@example.com"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let event = serde_json::from_str::<MetricEvent>(&pending_event_jsons(&db)[0]).unwrap();
+        assert_eq!(
+            compact_identity_email(&event.attrs).as_deref(),
+            Some("alice@example.com")
+        );
+        assert!(
+            !compact_custom_attributes(&event.attrs)
+                .contains_key(REPORTING_PROFILE_VERSION_ATTRIBUTE),
+            "legacy identity should remain byte-compatible rather than being rewritten as current profile"
         );
     }
 
@@ -4707,8 +4878,16 @@ mod tests {
         known_a.attrs.insert(
             attr_pos::CUSTOM_ATTRIBUTES.to_string(),
             Value::String(
-                r#"{"project_key":"project-a","ide":"vscode","user_email":"alice@example.com"}"#
-                    .to_string(),
+                json!({
+                    "project_key": "project-a",
+                    "ide": "vscode",
+                    "department_name": "云计算研发部",
+                    "office_name": "研发四处",
+                    "user_name": "Alice",
+                    "user_email": "alice@example.com",
+                    "git_ai_reporting_profile_version": REPORTING_PROFILE_VERSION,
+                })
+                .to_string(),
             ),
         );
         db.insert_session_observations(&[known_a]).unwrap();
@@ -4852,6 +5031,42 @@ mod tests {
             .unwrap();
         assert_eq!(attempts, (MAX_METRIC_UPLOAD_ATTEMPTS - 1) as i64);
         assert_eq!(db.dequeue_pending_batch(10).unwrap()[0].id, event_id);
+    }
+
+    #[test]
+    fn metric_event_instance_id_survives_sqlite_retry_roundtrip() {
+        let (mut db, _temp_dir) = create_test_db();
+        let event = MetricEvent::with_timestamp(
+            seconds_ago(30),
+            &crate::metrics::events::AgentUsageValues::new(),
+            SparseArray::new(),
+        );
+        let expected_instance_id = event
+            .instance_id
+            .clone()
+            .expect("new metric event instance id");
+        let event_json = serde_json::to_string(&event).unwrap();
+        let event_id = db.insert_events(&[event_json]).unwrap()[0];
+
+        let first_record = db.dequeue_pending_batch(1).unwrap().remove(0);
+        let first_event: MetricEvent = serde_json::from_str(&first_record.event_json).unwrap();
+        let first_wire = serde_json::to_string(&first_event).unwrap();
+        db.mark_records_deferred(&[event_id], "ACK lost after commit", 0)
+            .unwrap();
+
+        let second_record = db.dequeue_pending_batch(1).unwrap().remove(0);
+        let second_event: MetricEvent = serde_json::from_str(&second_record.event_json).unwrap();
+        let second_wire = serde_json::to_string(&second_event).unwrap();
+
+        assert_eq!(
+            first_event.instance_id.as_deref(),
+            Some(expected_instance_id.as_str())
+        );
+        assert_eq!(
+            second_event.instance_id.as_deref(),
+            Some(expected_instance_id.as_str())
+        );
+        assert_eq!(first_wire, second_wire);
     }
 
     #[test]

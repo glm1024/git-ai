@@ -1,7 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::test_utils::fixture_path;
 use chrono::{DateTime, Utc};
-use git_ai::authorship::authorship_log_serialization::generate_session_id;
 use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
 use git_ai::metrics::db::MetricsDatabase;
 use git_ai::streams::agent::get_agent;
@@ -212,10 +211,32 @@ fn test_kilo_e2e_checkpoint_and_commit_marks_ai_authorship() {
 
 #[test]
 #[serial_test::serial]
-fn test_kilo_checkpoint_metric_precedes_session_events_for_backend_context() {
+fn test_kilo_checkpoint_metric_precedes_token_snapshot_for_backend_context() {
     use crate::repos::test_repo::TestRepo;
 
-    with_kilo_storage(|_| {
+    with_kilo_storage(|storage| {
+        // The shared fixture intentionally uses fixed 2024 timestamps. Token
+        // compaction prunes facts outside its retention window, so refresh only
+        // this copied database to exercise the live Kilo ordering contract.
+        let conn = rusqlite::Connection::open(storage.join("kilo.db")).unwrap();
+        let now_millis = Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE message SET time_created = ?1, time_updated = ?1 WHERE id = 'msg-user-sql-001'",
+            [now_millis - 2_000],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE message SET time_created = ?1, time_updated = ?2 WHERE id = 'msg-assistant-sql-001'",
+            rusqlite::params![now_millis - 1_500, now_millis - 1_000],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE part SET time_created = ?1, time_updated = ?2 WHERE session_id = 'test-session-123'",
+            rusqlite::params![now_millis - 1_500, now_millis - 1_000],
+        )
+        .unwrap();
+        drop(conn);
+
         let metrics_dir = tempfile::tempdir().unwrap();
         let metrics_path = metrics_dir.path().join("metrics.db");
         MetricsDatabase::open_at_path(&metrics_path).unwrap();
@@ -249,29 +270,28 @@ fn test_kilo_checkpoint_metric_precedes_session_events_for_backend_context() {
                 .unwrap();
         }
 
-        let session_id = generate_session_id("test-session-123", "kilo");
         let deadline = Instant::now() + Duration::from_secs(10);
         let rows = loop {
             let conn = rusqlite::Connection::open(&metrics_path).unwrap();
             let mut statement = conn
                 .prepare(
                     "SELECT id, event_kind FROM metrics \
-                     WHERE session_id = ? AND event_kind IN (4, 5) ORDER BY id",
+                     WHERE event_kind IN (4, 9) ORDER BY id",
                 )
                 .unwrap();
             let rows = statement
-                .query_map([&session_id], |row| {
+                .query_map([], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                 })
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
-            if rows.iter().any(|(_, kind)| *kind == 4) && rows.iter().any(|(_, kind)| *kind == 5) {
+            if rows.iter().any(|(_, kind)| *kind == 4) && rows.iter().any(|(_, kind)| *kind == 9) {
                 break rows;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for Kilo checkpoint and session metrics: {rows:?}"
+                "timed out waiting for Kilo checkpoint and token snapshot metrics: {rows:?}"
             );
             std::thread::sleep(Duration::from_millis(50));
         };
@@ -281,14 +301,14 @@ fn test_kilo_checkpoint_metric_precedes_session_events_for_backend_context() {
             .find(|(_, kind)| *kind == 4)
             .map(|(id, _)| *id)
             .unwrap();
-        let first_session_id = rows
+        let first_token_snapshot_id = rows
             .iter()
-            .find(|(_, kind)| *kind == 5)
+            .find(|(_, kind)| *kind == 9)
             .map(|(id, _)| *id)
             .unwrap();
         assert!(
-            checkpoint_id < first_session_id,
-            "checkpoint context must be durable before Kilo session/token events: {rows:?}"
+            checkpoint_id < first_token_snapshot_id,
+            "checkpoint context must be durable before Kilo token snapshots: {rows:?}"
         );
     });
 }

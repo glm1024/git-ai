@@ -14,6 +14,34 @@ sh scripts/offline-build/build-jetbrains.sh
 sh scripts/offline-build/package-offline-dist.sh
 ```
 
+每个构建脚本都会在产物旁写入 `.build-metadata` 来源文件，记录源码 commit、
+构建时源码是否干净以及产物 SHA-256。`package-offline-dist.sh` 只接受由当前
+commit 的干净源码构建、且哈希仍匹配的全套产物；缺失来源文件、混用不同
+commit、从脏源码构建或构建后被替换的产物都会直接拒绝打包。源码更新后必须
+重新构建全部六个产物，不能只复用 `build/offline-build/artifacts/` 中的旧文件。
+来源文件会随产物一起进入最终离线包，便于发布后核验每个文件的构建来源。
+
+这是一道未签名的本地一致性门禁，用来避免误用旧产物、脏源码产物或混合
+commit 产物；它不是 SLSA/in-toto attestation，也不提供加密签名或供应链身份
+证明。
+
+只运行来源门禁的 POSIX `sh` 回归测试（不会构建或打包）：
+
+```sh
+sh scripts/offline-build/test-source-metadata.sh
+```
+
+只运行离线安装器的事务回滚与故障注入回归（不会构建、打包或安装到真实用户目录）：
+
+```sh
+sh scripts/offline-build/test-install-rollback.sh
+```
+
+该测试会在临时 `HOME` 中执行 Unix 安装模板和当前离线包脚本，覆盖旧二进制、
+已有 `git` shim、CLI 链接的成组升级/恢复以及首次失败保留配置、SQLite 和 outbox；
+Windows 脚本在没有 PowerShell 的平台只做事务结构静态门禁，正式分发前仍需在真实
+Windows x64 上执行安装失败与升级回滚测试。
+
 ## 构建完整包
 
 ```sh

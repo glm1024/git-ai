@@ -5,10 +5,14 @@
 //! These run the real binary against an isolated test HOME, so `config set`
 //! writes land in the sandboxed `~/.git-ai/config.json` rather than the user's.
 
-use crate::repos::test_repo::TestRepo;
+use crate::repos::test_repo::{TestRepo, get_binary_path};
 use git_ai::config::{AuthorConfig, FileConfig, NotesBackendConfig, ReportingProfile};
+use git_ai::utils::LockFile;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Parse the JSON emitted by `git-ai config <key>` into a serde value.
 fn get_json(repo: &TestRepo, key: &str) -> Value {
@@ -296,6 +300,61 @@ fn test_reporting_profile_stdin_update_is_atomic_and_normalized() {
     assert_eq!(
         get_json(&repo, "metrics_api_base_url"),
         Value::String("http://stats.example.com/prod-api".to_string())
+    );
+}
+
+#[test]
+fn test_config_cli_waits_for_cross_process_lock_and_reloads_latest_file() {
+    let repo = TestRepo::new();
+    let config_path = repo.test_home_path().join(".git-ai").join("config.json");
+    let lock_path = config_path.with_file_name("config.json.lock");
+    let held_lock = LockFile::try_acquire_result(&lock_path)
+        .expect("open config lock in test process")
+        .expect("hold config lock in test process");
+
+    let mut child_command = Command::new(get_binary_path());
+    child_command
+        .args(["config", "set", "api_key", "concurrent-test-key"])
+        .current_dir(repo.path())
+        .env("HOME", repo.test_home_path())
+        .env("GIT_AI_TEST_DB_PATH", repo.test_db_path())
+        .env("GITAI_TEST_DB_PATH", repo.test_db_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    child_command
+        .env("USERPROFILE", repo.test_home_path())
+        .env("HOMEDRIVE", "")
+        .env("HOMEPATH", "");
+
+    let mut child = child_command.spawn().expect("spawn config writer");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().expect("poll config writer").is_none(),
+        "config writer must not finish while another process holds config.json.lock"
+    );
+
+    // Simulate an external config manager that does not participate in the
+    // git-ai lock. The waiting CLI must read this latest state only after it
+    // acquires the lock, otherwise its whole-file commit would lose `quiet`.
+    let mut latest: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    latest["quiet"] = Value::Bool(true);
+    fs::write(&config_path, serde_json::to_vec_pretty(&latest).unwrap()).unwrap();
+    drop(held_lock);
+
+    let output = child.wait_with_output().expect("wait for config writer");
+    assert!(
+        output.status.success(),
+        "config writer failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let saved: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(saved["quiet"], Value::Bool(true));
+    assert_eq!(
+        saved["api_key"],
+        Value::String("concurrent-test-key".to_string())
     );
 }
 

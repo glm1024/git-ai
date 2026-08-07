@@ -26,6 +26,7 @@ JETBRAINS_VERSION=$(jetbrains_version)
 SOURCE_ZIP_NAME="Git AI-${JETBRAINS_VERSION}.zip"
 ZIP_NAME="Git_AI-${JETBRAINS_VERSION}.zip"
 mkdir -p "${OUT_DIR}" "${GRADLE_CACHE}"
+begin_artifact_build "${OUT_DIR}/${ZIP_NAME}"
 
 info "Building ${ZIP_NAME}"
 if is_offline_build; then
@@ -36,3 +37,4 @@ fi
 
 require_file "${JETBRAINS_DIR}/build/distributions/${SOURCE_ZIP_NAME}"
 cp "${JETBRAINS_DIR}/build/distributions/${SOURCE_ZIP_NAME}" "${OUT_DIR}/${ZIP_NAME}"
+finish_artifact_build "${OUT_DIR}/${ZIP_NAME}"

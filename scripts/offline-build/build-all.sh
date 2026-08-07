@@ -3,6 +3,7 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+. "${SCRIPT_DIR}/common.sh"
 
 if [ "${1:-}" = "--help" ]; then
     cat <<'EOF'
@@ -16,6 +17,8 @@ Use the individual scripts in this directory to rebuild only one artifact.
 EOF
     exit 0
 fi
+
+require_clean_release_source
 
 for build_script in \
     build-macos-arm64.sh \

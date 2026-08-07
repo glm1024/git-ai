@@ -325,6 +325,7 @@ struct TestCompletionLogEntry {
     error: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct DaemonLock {
     _lock: LockFile,
 }
@@ -334,7 +335,7 @@ impl DaemonLock {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let lock = LockFile::try_acquire(path).ok_or_else(|| {
+        let lock = LockFile::try_acquire_result(path)?.ok_or_else(|| {
             GitAiError::Generic(
                 "git-ai background service is already running (lock held)".to_string(),
             )
@@ -8092,6 +8093,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn daemon_lock_propagates_non_contention_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("daemon.lock");
+        fs::create_dir(&lock_path).unwrap();
+
+        let error = DaemonLock::acquire(&lock_path)
+            .expect_err("a directory cannot be opened as the daemon lock file");
+
+        assert!(matches!(error, GitAiError::IoError(_)));
     }
 
     fn sample_checkpoint_request() -> ControlRequest {

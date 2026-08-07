@@ -1,0 +1,517 @@
+<?xml version="1.0" encoding="utf-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr>
+        <p:cNvPr id="1" name=""/>
+        <p:cNvGrpSpPr/>
+        <p:nvPr/>
+      </p:nvGrpSpPr>
+      <p:grpSpPr>
+        <a:xfrm>
+          <a:off x="0" y="0"/>
+          <a:ext cx="0" cy="0"/>
+          <a:chOff x="0" y="0"/>
+          <a:chExt cx="0" cy="0"/>
+        </a:xfrm>
+      </p:grpSpPr>
+      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="2" name="页面标题"/>
+          <p:cNvSpPr txBox="1"/>
+          <p:nvPr/>
+        </p:nvSpPr>
+        <p:spPr>
+          <a:xfrm>
+            <a:off x="329184" y="155448"/>
+            <a:ext cx="9829800" cy="502920"/>
+          </a:xfrm>
+          <a:prstGeom prst="rect">
+            <a:avLst/>
+          </a:prstGeom>
+          <a:noFill/>
+        </p:spPr>
+        <p:txBody>
+          <a:bodyPr wrap="square" lIns="27432" tIns="27432" rIns="27432" bIns="27432" anchor="ctr">
+            <a:spAutoFit/>
+          </a:bodyPr>
+          <a:lstStyle/>
+          <a:p>
+            <a:pPr algn="l">
+              <a:lnSpc>
+                <a:spcPct val="118000"/>
+              </a:lnSpc>
+              <a:spcAft>
+                <a:spcPts val="0"/>
+              </a:spcAft>
+            </a:pPr>
+            <a:r>
+              <a:rPr sz="2800" b="1">
+                <a:solidFill>
+                  <a:srgbClr val="18345D"/>
+                </a:solidFill>
+                <a:latin typeface="Microsoft YaHei"/>
+              </a:rPr>
+              <a:t>为了适配 Git AI，后台新增了哪些能力</a:t>
+            </a:r>
+          </a:p>
+        </p:txBody>
+      </p:sp>
+      <p:graphicFrame>
+        <p:nvGraphicFramePr>
+          <p:cNvPr id="3" name="Table 2"/>
+          <p:cNvGraphicFramePr>
+            <a:graphicFrameLocks noGrp="1"/>
+          </p:cNvGraphicFramePr>
+          <p:nvPr/>
+        </p:nvGraphicFramePr>
+        <p:xfrm>
+          <a:off x="530352" y="1234440"/>
+          <a:ext cx="10789920" cy="4498848"/>
+        </p:xfrm>
+        <a:graphic>
+          <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">
+            <a:tbl>
+              <a:tblPr firstRow="1" bandRow="1">
+                <a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId>
+              </a:tblPr>
+              <a:tblGrid>
+                <a:gridCol w="1965960">
+                  <a:extLst>
+                    <a:ext uri="{9D8B030D-6E8A-4147-A177-3AD203B41FA5}">
+                      <a16:colId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="20000"/>
+                    </a:ext>
+                  </a:extLst>
+                </a:gridCol>
+                <a:gridCol w="8823960">
+                  <a:extLst>
+                    <a:ext uri="{9D8B030D-6E8A-4147-A177-3AD203B41FA5}">
+                      <a16:colId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="20001"/>
+                    </a:ext>
+                  </a:extLst>
+                </a:gridCol>
+              </a:tblGrid>
+              <a:tr h="642692">
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l"/>
+                      <a:r>
+                        <a:rPr sz="1300" b="1">
+                          <a:solidFill>
+                            <a:srgbClr val="FFFFFF"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>能力域</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="0068B5"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l"/>
+                      <a:r>
+                        <a:rPr sz="1300" b="1">
+                          <a:solidFill>
+                            <a:srgbClr val="FFFFFF"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>后台适配内容</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="0068B5"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:extLst>
+                  <a:ext uri="{0D108BD9-81ED-4DB2-BD59-A6C34878D82A}">
+                    <a16:rowId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="10000"/>
+                  </a:ext>
+                </a:extLst>
+              </a:tr>
+              <a:tr h="642692">
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>协议与入库</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="FFFFFF"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>代码事件继续按事件键幂等并支持失败重放；Token 日累计快照校验后直接写正式日事实。</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="FFFFFF"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:extLst>
+                  <a:ext uri="{0D108BD9-81ED-4DB2-BD59-A6C34878D82A}">
+                    <a16:rowId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="10001"/>
+                  </a:ext>
+                </a:extLst>
+              </a:tr>
+              <a:tr h="642692">
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>事件投影</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="F5FAFD"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>checkpoint 转接受事实；commit / rewrite 转候选与确认；会话原文不上传，Token 仅投影内容无关的日累计事实。</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="F5FAFD"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:extLst>
+                  <a:ext uri="{0D108BD9-81ED-4DB2-BD59-A6C34878D82A}">
+                    <a16:rowId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="10002"/>
+                  </a:ext>
+                </a:extLst>
+              </a:tr>
+              <a:tr h="642692">
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>统计归因</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="FFFFFF"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>目标分支最终 commit 确认真实入库；行级去重；生命周期替换；日汇总可由规范账本重建。</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="FFFFFF"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:extLst>
+                  <a:ext uri="{0D108BD9-81ED-4DB2-BD59-A6C34878D82A}">
+                    <a16:rowId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="10003"/>
+                  </a:ext>
+                </a:extLst>
+              </a:tr>
+              <a:tr h="642692">
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>现行产品口径</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="F5FAFD"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>Git AI 生成行数按接受行数展示，接受率固定为 100%；入库确认仍以目标仓库事实为准。</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="F5FAFD"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:extLst>
+                  <a:ext uri="{0D108BD9-81ED-4DB2-BD59-A6C34878D82A}">
+                    <a16:rowId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="10004"/>
+                  </a:ext>
+                </a:extLst>
+              </a:tr>
+              <a:tr h="642692">
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>管理端页面</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="FFFFFF"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>左侧拆分&#x201C;Git AI 明细&#x201D;和&#x201C;Kilo 提交明细&#x201D;；支持用户、模块、事件、状态与 commit 定位。</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="FFFFFF"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:extLst>
+                  <a:ext uri="{0D108BD9-81ED-4DB2-BD59-A6C34878D82A}">
+                    <a16:rowId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="10005"/>
+                  </a:ext>
+                </a:extLst>
+              </a:tr>
+              <a:tr h="642696">
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:pPr algn="l">
+                        <a:lnSpc>
+                          <a:spcPct val="118000"/>
+                        </a:lnSpc>
+                      </a:pPr>
+                      <a:r>
+                        <a:rPr sz="1220" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="1F1F1F"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>运维治理</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="F5FAFD"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:tc>
+                  <a:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                      <a:r>
+                        <a:rPr sz="1200" b="0">
+                          <a:solidFill>
+                            <a:srgbClr val="111111"/>
+                          </a:solidFill>
+                          <a:latin typeface="Microsoft YaHei"/>
+                        </a:rPr>
+                        <a:t>成功投影 / replay 后清除原始 payload；代码审计仅留 30 天 commit + 内容哈希；Token 正常路径不生成 payload、批次与请求账本。</a:t>
+                      </a:r>
+                    </a:p>
+                  </a:txBody>
+                  <a:tcPr marL="82296" marR="82296" marT="36576" marB="36576" anchor="ctr">
+                    <a:solidFill>
+                      <a:srgbClr val="F5FAFD"/>
+                    </a:solidFill>
+                  </a:tcPr>
+                </a:tc>
+                <a:extLst>
+                  <a:ext uri="{0D108BD9-81ED-4DB2-BD59-A6C34878D82A}">
+                    <a16:rowId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="10006"/>
+                  </a:ext>
+                </a:extLst>
+              </a:tr>
+            </a:tbl>
+          </a:graphicData>
+        </a:graphic>
+      </p:graphicFrame>
+    </p:spTree>
+  </p:cSld>
+  <p:clrMapOvr>
+    <a:masterClrMapping/>
+  </p:clrMapOvr>
+</p:sld>

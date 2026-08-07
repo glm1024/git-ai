@@ -16,10 +16,9 @@ const MAX_BATCH_SIZE: usize = 1000;
 /// Handle the flush-metrics-db command
 pub fn handle_flush_metrics_db(_args: &[String]) {
     let context = ApiContext::for_metrics();
-    let api_base_url = context.base_url.clone();
     let client = ApiClient::new(context);
 
-    if !metrics_upload_allowed(&api_base_url, &client) {
+    if !metrics_upload_allowed(&client) {
         eprintln!("flush-metrics-db: skipping (requires an API key or login)");
         return;
     }

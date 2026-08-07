@@ -2,6 +2,8 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -13,6 +15,7 @@ use url::Url;
 use crate::feature_flags::FeatureFlags;
 use crate::git::repository::Repository;
 use crate::mdm::utils::home_dir;
+use crate::utils::LockFile;
 
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::RwLock;
@@ -28,6 +31,8 @@ const KNOWN_METRICS_ENDPOINT_PATHS: [&str; 4] = [
     "/api/v1/ingest/ai-code-stats",
     "/api/v1/ingest/ai-token-usage",
 ];
+const CONFIG_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const CONFIG_WRITE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Which backend to use for storing authorship notes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -92,6 +97,28 @@ impl AuthorConfig {
 /// This deliberately stays separate from `custom_attributes`: the latter is
 /// also persisted into authorship Git Notes, while organization and corporate
 /// contact information must only travel with metrics delivery.
+pub(crate) const REPORTING_PROFILE_VERSION_ATTRIBUTE: &str = "git_ai_reporting_profile_version";
+pub(crate) const REPORTING_PROFILE_VERSION: &str = "1";
+pub(crate) const REPORTING_PROFILE_RESERVED_ATTRIBUTE_KEYS: &[&str] = &[
+    "department_name",
+    "departmentName",
+    "office_name",
+    "officeName",
+    "team_name",
+    "teamName",
+    "user_name",
+    "userName",
+    "display_name",
+    "user_email",
+    "userEmail",
+    "email",
+    "organization_id",
+    "organizationId",
+    "organization_name",
+    "organizationName",
+    REPORTING_PROFILE_VERSION_ATTRIBUTE,
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ReportingProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +153,12 @@ impl ReportingProfile {
     }
 
     pub fn apply_to_metrics_attributes(&self, attributes: &mut HashMap<String, String>) {
+        for key in REPORTING_PROFILE_RESERVED_ATTRIBUTE_KEYS {
+            attributes.remove(*key);
+        }
+        if !self.is_complete_for_metrics() {
+            return;
+        }
         for (key, value) in [
             ("department_name", self.department_name.as_deref()),
             ("office_name", self.office_name.as_deref()),
@@ -139,6 +172,26 @@ impl ReportingProfile {
                 attributes.remove(key);
             }
         }
+        attributes.insert(
+            REPORTING_PROFILE_VERSION_ATTRIBUTE.to_string(),
+            REPORTING_PROFILE_VERSION.to_string(),
+        );
+    }
+
+    fn is_complete_for_metrics(&self) -> bool {
+        let Some(email) = self.user_email.as_deref() else {
+            return false;
+        };
+        self.department_name.is_some()
+            && self.office_name.is_some()
+            && self.user_name.is_some()
+            && email.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty()
+                    && !local.chars().any(char::is_whitespace)
+                    && domain.contains('.')
+                    && !domain.ends_with('.')
+                    && !domain.chars().any(char::is_whitespace)
+            })
     }
 }
 
@@ -1703,31 +1756,220 @@ pub fn load_file_config_public() -> Result<FileConfig, String> {
     let path =
         config_file_path().ok_or_else(|| "Could not determine config file path".to_string())?;
 
+    load_file_config_from_path(&path)
+}
+
+fn load_file_config_from_path(path: &Path) -> Result<FileConfig, String> {
     if !path.exists() {
-        // Return empty config if file doesn't exist
         return Ok(FileConfig::default());
     }
 
-    let data = fs::read(&path).map_err(|e| format!("Failed to read config file: {}", e))?;
+    let data = fs::read(path).map_err(|e| format!("Failed to read config file: {}", e))?;
 
     parse_file_config_bytes(&data).map_err(|e| format!("Failed to parse config file: {}", e))
 }
 
-/// Save the file config
-pub fn save_file_config(config: &FileConfig) -> Result<(), String> {
+/// Locked read-modify-write guard for the shared config file.
+///
+/// The lock is acquired before the file is read, so callers cannot overwrite
+/// fields committed by another CLI or IDE process between their read and write.
+/// Use [`commit`](Self::commit) after mutating the dereferenced [`FileConfig`].
+#[must_use = "hold the guard until the config mutation has been committed"]
+pub struct FileConfigWriteGuard {
+    config: FileConfig,
+    path: PathBuf,
+    _lock: LockFile,
+}
+
+impl FileConfigWriteGuard {
+    pub fn commit(&self) -> Result<(), String> {
+        write_file_config_atomically(&self.path, &self.config)
+    }
+}
+
+impl Deref for FileConfigWriteGuard {
+    type Target = FileConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl DerefMut for FileConfigWriteGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.config
+    }
+}
+
+/// Acquire the cross-process config lock and then read the latest file state.
+pub fn lock_file_config_for_update() -> Result<FileConfigWriteGuard, String> {
     let path =
         config_file_path().ok_or_else(|| "Could not determine config file path".to_string())?;
+    lock_file_config_for_update_at(path)
+}
 
-    // Ensure the directory exists
+fn lock_file_config_for_update_at(path: PathBuf) -> Result<FileConfigWriteGuard, String> {
+    ensure_config_parent(&path)?;
+    let lock_path = config_lock_path(&path);
+    let lock = acquire_config_write_lock(&lock_path)?;
+    let config = load_file_config_from_path(&path)?;
+    Ok(FileConfigWriteGuard {
+        config,
+        path,
+        _lock: lock,
+    })
+}
+
+fn config_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    path.with_file_name(format!("{file_name}.lock"))
+}
+
+fn acquire_config_write_lock(lock_path: &Path) -> Result<LockFile, String> {
+    let started_at = Instant::now();
+    loop {
+        match LockFile::try_acquire_result(lock_path) {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to open config write lock {}: {}",
+                    lock_path.display(),
+                    error
+                ));
+            }
+        }
+        if started_at.elapsed() >= CONFIG_WRITE_LOCK_TIMEOUT {
+            return Err(format!(
+                "Timed out waiting for config write lock: {}",
+                lock_path.display()
+            ));
+        }
+        std::thread::sleep(CONFIG_WRITE_LOCK_RETRY_INTERVAL);
+    }
+}
+
+fn ensure_config_parent(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
     }
+    Ok(())
+}
 
-    let json = serde_json::to_string_pretty(config)
+fn atomic_write_target(path: &Path) -> Result<PathBuf, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path.to_path_buf()),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect config file {}: {}",
+                path.display(),
+                error
+            ));
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(path.to_path_buf());
+    }
+
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let target = fs::read_link(path).map_err(|error| {
+        format!(
+            "Failed to resolve config symlink {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    Ok(if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+    })
+}
+
+fn write_file_config_atomically(path: &Path, config: &FileConfig) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    let target_path = atomic_write_target(path)?;
+    ensure_config_parent(&target_path)?;
+    let parent = target_path.parent().ok_or_else(|| {
+        format!(
+            "Config file has no parent directory: {}",
+            target_path.display()
+        )
+    })?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".git-ai-config-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| format!("Failed to create temporary config file: {}", e))?;
+    temp.write_all(&json)
+        .map_err(|e| format!("Failed to write temporary config file: {}", e))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|e| format!("Failed to sync temporary config file: {}", e))?;
+    let persisted = temp.persist(&target_path).map_err(|e| {
+        format!(
+            "Failed to atomically replace config file {}: {}",
+            target_path.display(),
+            e.error
+        )
+    })?;
+    // Sync the handle after the rename as well. This is redundant for file
+    // contents on Unix, but it also gives Windows a post-MoveFileEx flush of
+    // the now-persisted file instead of relying only on the temporary name.
+    persisted.sync_all().map_err(|e| {
+        format!(
+            "Config file {} was replaced but could not be synced: {}",
+            target_path.display(),
+            e
+        )
+    })?;
+    sync_config_parent_directory(parent, &target_path)?;
+    Ok(())
+}
 
-    fs::write(&path, json).map_err(|e| format!("Failed to write config file: {}", e))
+#[cfg(unix)]
+fn sync_config_parent_directory(parent: &Path, target_path: &Path) -> Result<(), String> {
+    // fsync the containing directory so the atomic rename itself is durable,
+    // not only the bytes that were written to the temporary file.
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| {
+            format!(
+                "Config file {} was replaced but its directory could not be synced: {}",
+                target_path.display(),
+                e
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_config_parent_directory(_parent: &Path, _target_path: &Path) -> Result<(), String> {
+    // NamedTempFile::persist uses MoveFileExW with replacement semantics on
+    // Windows. The persisted file handle was flushed above; std does not offer
+    // a portable directory handle that can be synced here.
+    Ok(())
+}
+
+/// Replace the entire file config under the cross-process lock.
+///
+/// This intentionally preserves the historical whole-file replacement API.
+/// Callers performing a read-modify-write must not pair
+/// [`load_file_config_public`] with this function: use
+/// [`lock_file_config_for_update`] so the read also occurs inside the lock.
+pub fn save_file_config(config: &FileConfig) -> Result<(), String> {
+    let path =
+        config_file_path().ok_or_else(|| "Could not determine config file path".to_string())?;
+    ensure_config_parent(&path)?;
+    let _lock = acquire_config_write_lock(&config_lock_path(&path))?;
+    write_file_config_atomically(&path, config)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -1953,11 +2195,15 @@ mod tests {
             attributes.get("user_email"),
             Some(&"guolimin.lc@inspur.com".to_string())
         );
+        assert_eq!(
+            attributes.get(REPORTING_PROFILE_VERSION_ATTRIBUTE),
+            Some(&REPORTING_PROFILE_VERSION.to_string())
+        );
         assert_eq!(attributes.get("environment"), Some(&"pilot".to_string()));
     }
 
     #[test]
-    fn reporting_profile_omits_blank_and_absent_fields_from_metrics_attributes() {
+    fn incomplete_reporting_profile_cannot_leak_identity_aliases_into_metrics() {
         let profile = ReportingProfile {
             department_name: Some("研发部".to_string()),
             office_name: Some("研发一处".to_string()),
@@ -1966,18 +2212,32 @@ mod tests {
             user_email: None,
         }
         .normalized();
-        let mut attributes = HashMap::new();
+        let mut attributes = HashMap::from([
+            ("department_name".to_string(), "伪造部门".to_string()),
+            ("office_name".to_string(), "伪造处室".to_string()),
+            ("team_name".to_string(), "伪造团队".to_string()),
+            ("user_name".to_string(), "伪造用户".to_string()),
+            ("user_email".to_string(), "forged@example.com".to_string()),
+            ("email".to_string(), "alias@example.com".to_string()),
+            ("userEmail".to_string(), "alias@example.com".to_string()),
+            ("organization_id".to_string(), "untrusted-org".to_string()),
+            (
+                REPORTING_PROFILE_VERSION_ATTRIBUTE.to_string(),
+                REPORTING_PROFILE_VERSION.to_string(),
+            ),
+        ]);
 
         profile.apply_to_metrics_attributes(&mut attributes);
 
-        assert_eq!(
-            attributes.get("department_name"),
-            Some(&"研发部".to_string())
-        );
-        assert_eq!(attributes.get("office_name"), Some(&"研发一处".to_string()));
+        assert!(!attributes.contains_key("department_name"));
+        assert!(!attributes.contains_key("office_name"));
         assert!(!attributes.contains_key("team_name"));
         assert!(!attributes.contains_key("user_name"));
         assert!(!attributes.contains_key("user_email"));
+        assert!(!attributes.contains_key("email"));
+        assert!(!attributes.contains_key("userEmail"));
+        assert!(!attributes.contains_key("organization_id"));
+        assert!(!attributes.contains_key(REPORTING_PROFILE_VERSION_ATTRIBUTE));
     }
 
     fn create_test_config(
@@ -2059,6 +2319,179 @@ mod tests {
 
         assert_eq!(first.len, second.len);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn config_update_guard_reloads_after_waiting_for_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        write_file_config_atomically(&path, &FileConfig::default()).unwrap();
+
+        let (first_locked_tx, first_locked_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_path = path.clone();
+        let first = std::thread::spawn(move || {
+            let mut config = lock_file_config_for_update_at(first_path).unwrap();
+            config.api_base_url = Some("https://api.example.com".to_string());
+            first_locked_tx.send(()).unwrap();
+            release_first_rx.recv().unwrap();
+            config.commit().unwrap();
+        });
+
+        first_locked_rx.recv().unwrap();
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let second_path = path.clone();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            let mut config = lock_file_config_for_update_at(second_path).unwrap();
+            config.metrics_api_base_url = Some("https://metrics.example.com".to_string());
+            config.commit().unwrap();
+        });
+        second_started_rx.recv().unwrap();
+        release_first_tx.send(()).unwrap();
+
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let config = load_file_config_from_path(&path).unwrap();
+        assert_eq!(
+            config.api_base_url.as_deref(),
+            Some("https://api.example.com")
+        );
+        assert_eq!(
+            config.metrics_api_base_url.as_deref(),
+            Some("https://metrics.example.com")
+        );
+    }
+
+    #[test]
+    fn config_write_lock_reports_io_errors_without_waiting_for_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("not-a-directory");
+        fs::write(&not_a_directory, b"file").unwrap();
+        let lock_path = not_a_directory.join("config.json.lock");
+        let started_at = Instant::now();
+
+        let error = acquire_config_write_lock(&lock_path)
+            .expect_err("invalid lock path must fail immediately");
+
+        assert!(error.contains("Failed to open config write lock"));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_commit_atomically_replaces_the_previous_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        write_file_config_atomically(
+            &path,
+            &FileConfig {
+                api_base_url: Some("https://old.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let old_file = fs::File::open(&path).unwrap();
+        let old_inode = old_file.metadata().unwrap().ino();
+
+        write_file_config_atomically(
+            &path,
+            &FileConfig {
+                api_base_url: Some("https://new.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let new_inode = fs::metadata(&path).unwrap().ino();
+        assert_ne!(old_inode, new_inode);
+        assert_eq!(
+            load_file_config_from_path(&path)
+                .unwrap()
+                .api_base_url
+                .as_deref(),
+            Some("https://new.example.com")
+        );
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".git-ai-config-"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_commit_preserves_a_managed_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("managed-config.json");
+        let link = dir.path().join("config.json");
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_file_config_atomically(
+            &link,
+            &FileConfig {
+                api_base_url: Some("https://managed.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            load_file_config_from_path(&target)
+                .unwrap()
+                .api_base_url
+                .as_deref(),
+            Some("https://managed.example.com")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_commit_preserves_a_relative_managed_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed_dir = dir.path().join("managed");
+        fs::create_dir_all(&managed_dir).unwrap();
+        let target = managed_dir.join("config.json");
+        let link = dir.path().join("config.json");
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(Path::new("managed/config.json"), &link).unwrap();
+
+        write_file_config_atomically(
+            &link,
+            &FileConfig {
+                api_base_url: Some("https://relative-managed.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            load_file_config_from_path(&target)
+                .unwrap()
+                .api_base_url
+                .as_deref(),
+            Some("https://relative-managed.example.com")
+        );
     }
 
     #[test]

@@ -1817,11 +1817,17 @@ mod tests {
             "disable_auto_updates": auto_updates_disabled
         })
         .to_string();
+        let previous_patch = std::env::var_os("GIT_AI_TEST_CONFIG_PATCH");
         unsafe { std::env::set_var("GIT_AI_TEST_CONFIG_PATCH", &patch) };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
-        unsafe { std::env::remove_var("GIT_AI_TEST_CONFIG_PATCH") };
+        unsafe {
+            match previous_patch {
+                Some(value) => std::env::set_var("GIT_AI_TEST_CONFIG_PATCH", value),
+                None => std::env::remove_var("GIT_AI_TEST_CONFIG_PATCH"),
+            }
+        };
         clear_test_cache_dir();
 
         if let Err(e) = result {

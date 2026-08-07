@@ -30,6 +30,7 @@ OUT_DIR="${ARTIFACT_ROOT}/linux"
 CARGO_CACHE="${CACHE_ROOT}/cargo-${TARGET}"
 TARGET_DIR="/workspace/build/offline-build/work/${TARGET}"
 mkdir -p "${OUT_DIR}" "${CARGO_CACHE}"
+begin_artifact_build "${OUT_DIR}/${ARTIFACT}"
 
 info "Building ${ARTIFACT}"
 docker run --rm \
@@ -47,3 +48,5 @@ docker run --rm \
     -v "${OUT_DIR}:/output" \
     "${LINUX_BUILDER_IMAGE}" \
     sh -c "set -eu; cargo build --locked --release --target ${TARGET} --bin git-ai; strip \"${TARGET_DIR}/${TARGET}/release/git-ai\"; cp \"${TARGET_DIR}/${TARGET}/release/git-ai\" /output/${ARTIFACT}; chmod 755 /output/${ARTIFACT}; file /output/${ARTIFACT}; /output/${ARTIFACT} --version"
+
+finish_artifact_build "${OUT_DIR}/${ARTIFACT}"

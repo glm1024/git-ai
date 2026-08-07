@@ -210,33 +210,49 @@ git ai blame path/to/changed-file
 
 注意：只安装 CLI 后，命令行统计仍可用；没有安装对应 IDE 插件时，不应以编辑器内没有行级展示作为 CLI 安装失败的判断依据。
 
-## 回滚
+## 升级与版本回滚
 
-先关闭 Codex、Agent 和 IDE，再移除 hook：
+重新运行离线包中的安装脚本即可升级 CLI。安装脚本会先保留当前
+`git-ai` 二进制和已有 `git` shim，只有新二进制、shim 与必要登录步骤全部成功后
+才清理临时备份；中途失败会自动恢复同一套旧版本。首次安装失败时，只清理本次
+创建的二进制入口，不删除 `$HOME/.git-ai` / `$HOME\.git-ai` 中已有的数据和配置。
+
+如果已经成功升级、之后需要回到旧版本，先关闭 Codex、Agent 和 IDE，再使用
+**目标旧版本对应的完整离线包**重新运行安装脚本。例如回滚到旧版 Linux x64：
 
 ```bash
-git ai uninstall-hooks
+cd /path/to/old-git-ai-offline-package
+chmod +x install.sh linux/git-ai-linux-x64
+GIT_AI_LOCAL_BINARY="$PWD/linux/git-ai-linux-x64" bash ./install.sh
+git ai --version
+git ai install-hooks --verbose
 ```
 
-Linux 删除本地安装：
-
-```bash
-rm -rf "$HOME/.git-ai"
-```
-
-Windows PowerShell 删除本地安装：
+macOS 使用旧离线包中的对应 `macos/git-ai-macos-arm64` 文件，命令形式相同。
+Windows x64 使用目标旧版本离线包执行：
 
 ```powershell
+cd C:\path\to\old-git-ai-offline-package
+$env:GIT_AI_LOCAL_BINARY = (Resolve-Path .\windows\git-ai-windows-x64.exe).Path
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+git ai --version
+git ai install-hooks --verbose
+```
+
+版本回滚只替换 CLI 二进制和已有 shim，保留登录、上报配置、SQLite 本地事实、
+待上传 outbox 和其他用户数据。若自动恢复本身受文件权限或占用影响，安装脚本会
+打印保留下来的精确备份路径；先保留该文件并按提示恢复，不要继续覆盖安装。
+
+不要用以下命令做“版本回滚”：
+
+```text
+rm -rf "$HOME/.git-ai"
 Remove-Item -Recurse -Force "$HOME\.git-ai"
 ```
 
-如果 shell 配置或用户 PATH 中有安装脚本追加的 Git AI 路径，可以手工删除：
-
-```text
-# Added by git-ai installer ...
-```
-
-IDE 插件需要分别在 VS Code/Cursor 的 Extensions 面板或 JetBrains 的 Plugins 页面卸载。
+它们会连同配置、SQLite 和待上传数据一起删除，属于清除本地数据，不是版本回滚。
+VS Code/Cursor 与 JetBrains 插件有各自版本；需要回滚插件时，另行安装目标旧版本
+VSIX/ZIP，不要删除 CLI 数据目录。
 
 ## 常见问题
 

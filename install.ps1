@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$script:InstallTransactionActive = $false
 
 function Start-DaemonIfRequested {
     if ($env:GIT_AI_RESTART_DAEMON_AFTER_INSTALL -ne '1') {
@@ -23,6 +24,9 @@ function Write-ErrorAndExit {
     param(
         [Parameter(Mandatory = $true)][string]$Message
     )
+    if ($script:InstallTransactionActive) {
+        throw [System.InvalidOperationException]::new($Message)
+    }
     Write-Host "Error: $Message" -ForegroundColor Red
     Start-DaemonIfRequested
     exit 1
@@ -403,12 +407,118 @@ if ($isElevated -and $env:GIT_AI_ALLOW_SUPERUSER -ne '1') {
     $env:GIT_AI_ALLOW_SUPERUSER = '1'
 }
 
-# Install directory: %USERPROFILE%\.git-ai\bin
-$installDir = Join-Path $HOME ".git-ai\bin"
-New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-
-Write-Host ("Downloading git-ai (release: {0})..." -f $releaseTag)
+# Install directory: %USERPROFILE%\.git-ai\bin. Executable publication is
+# transactional; configuration, SQLite files, and outbox data are never used
+# as rollback targets.
+$installRoot = Join-Path $HOME '.git-ai'
+$installDir = Join-Path $installRoot 'bin'
+$finalExe = Join-Path $installDir 'git-ai.exe'
+$gitShim = Join-Path $installDir 'git.exe'
 $tmpFile = Join-Path $installDir "git-ai.tmp.$PID.exe"
+$binaryBackup = "$finalExe.install-backup.$PID"
+$gitShimBackup = "$gitShim.install-backup.$PID"
+
+$script:InstallRootCreated = -not (Test-Path -LiteralPath $installRoot)
+$script:InstallDirCreated = -not (Test-Path -LiteralPath $installDir)
+$script:BinaryPreserved = $false
+$script:GitShimPreserved = $false
+$script:BinaryPublishAttempted = $false
+$script:GitShimPublishAttempted = $false
+$script:GitShimWasPresent = Test-Path -LiteralPath $gitShim
+
+function Restore-InstallTransaction {
+    if (-not $script:InstallTransactionActive) {
+        return @()
+    }
+    $script:InstallTransactionActive = $false
+    $restoreFailures = New-Object 'System.Collections.Generic.List[string]'
+
+    if (Test-Path -LiteralPath $tmpFile) {
+        try {
+            Remove-Item -LiteralPath $tmpFile -Force -ErrorAction Stop
+        } catch {
+            [void]$restoreFailures.Add("could not remove staged binary at $tmpFile")
+        }
+    }
+
+    if (($script:GitShimPublishAttempted -or (-not $script:GitShimWasPresent)) -and (Test-Path -LiteralPath $gitShim)) {
+        try {
+            Remove-Item -LiteralPath $gitShim -Force -ErrorAction Stop
+        } catch {
+            [void]$restoreFailures.Add("could not remove failed git shim at $gitShim")
+        }
+    }
+    if ($script:GitShimPreserved) {
+        try {
+            if (Test-Path -LiteralPath $gitShim) {
+                Remove-Item -LiteralPath $gitShim -Force -ErrorAction Stop
+            }
+            Move-Item -LiteralPath $gitShimBackup -Destination $gitShim -ErrorAction Stop
+        } catch {
+            [void]$restoreFailures.Add("recover the previous git shim from $gitShimBackup")
+        }
+    }
+
+    if ($script:BinaryPublishAttempted -and (Test-Path -LiteralPath $finalExe)) {
+        try {
+            Remove-Item -LiteralPath $finalExe -Force -ErrorAction Stop
+        } catch {
+            [void]$restoreFailures.Add("could not remove failed binary at $finalExe")
+        }
+    }
+    if ($script:BinaryPreserved) {
+        try {
+            if (Test-Path -LiteralPath $finalExe) {
+                Remove-Item -LiteralPath $finalExe -Force -ErrorAction Stop
+            }
+            Move-Item -LiteralPath $binaryBackup -Destination $finalExe -ErrorAction Stop
+        } catch {
+            [void]$restoreFailures.Add("recover the previous git-ai binary from $binaryBackup")
+        }
+    }
+
+    if ($script:InstallDirCreated) {
+        try {
+            Remove-Item -LiteralPath $installDir -ErrorAction Stop
+        } catch { }
+    }
+    if ($script:InstallRootCreated) {
+        try {
+            Remove-Item -LiteralPath $installRoot -ErrorAction Stop
+        } catch { }
+    }
+
+    return $restoreFailures
+}
+
+function Complete-InstallTransaction {
+    $script:InstallTransactionActive = $false
+    foreach ($backup in @($binaryBackup, $gitShimBackup)) {
+        if (Test-Path -LiteralPath $backup) {
+            try {
+                Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+            } catch {
+                Write-Warning "Installed successfully, but could not remove obsolete backup: $backup"
+            }
+        }
+    }
+    Remove-Item -LiteralPath $tmpFile -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-InstallFailureIfRequested {
+    param(
+        [Parameter(Mandatory = $true)][string]$Step
+    )
+    if ($env:GIT_AI_INSTALL_TEST_FAIL_AT -eq $Step) {
+        throw [System.InvalidOperationException]::new("Injected installer failure at $Step")
+    }
+}
+
+$script:InstallTransactionActive = $true
+try {
+    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+    Write-Host ("Downloading git-ai (release: {0})..." -f $releaseTag)
 
 function Try-Download {
     param(
@@ -463,9 +573,8 @@ try {
 # Verify checksum if embedded (release builds only)
 Verify-Checksum -File $tmpFile -BinaryName $downloadedBinaryName
 
-$finalExe = Join-Path $installDir 'git-ai.exe'
-
-# Wait for git-ai.exe to be available if it exists and is in use
+# Wait for every existing executable to become available before moving any of
+# them. This avoids stopping halfway with a mixed binary/shim version.
 if (Test-Path -LiteralPath $finalExe) {
     if (-not (Wait-ForFileAvailable -Path $finalExe -InstallDir $installDir -MaxWaitSeconds 300 -RetryIntervalSeconds 5)) {
         Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
@@ -473,18 +582,57 @@ if (Test-Path -LiteralPath $finalExe) {
     }
 }
 
-Move-Item -Force -Path $tmpFile -Destination $finalExe
-try { Unblock-File -Path $finalExe -ErrorAction SilentlyContinue } catch { }
-
-# Refresh git.exe for existing wrapper users (it's a copy, not a symlink on Windows)
-$gitShim = Join-Path $installDir 'git.exe'
-if (Test-Path -LiteralPath $gitShim) {
+$script:GitShimWasPresent = Test-Path -LiteralPath $gitShim
+if ($script:GitShimWasPresent) {
     if (-not (Wait-ForFileAvailable -Path $gitShim -InstallDir $installDir -MaxWaitSeconds 300 -RetryIntervalSeconds 5)) {
         Write-ErrorAndExit "Timeout waiting for $gitShim to be available. Please close any running git processes and try again."
     }
-    Copy-Item -Force -Path $finalExe -Destination $gitShim
+}
+
+foreach ($managedPath in @($finalExe, $gitShim)) {
+    if (Test-Path -LiteralPath $managedPath) {
+        $managedItem = Get-Item -LiteralPath $managedPath -Force
+        if ($managedItem.PSIsContainer) {
+            Write-ErrorAndExit "Managed executable path is a directory: $managedPath"
+        }
+    }
+}
+foreach ($backup in @($binaryBackup, $gitShimBackup)) {
+    if (Test-Path -LiteralPath $backup) {
+        Write-ErrorAndExit "Installer backup path already exists: $backup"
+    }
+}
+
+# Preserve both old entry points before publishing the candidate.
+if (Test-Path -LiteralPath $finalExe) {
+    Move-Item -LiteralPath $finalExe -Destination $binaryBackup -ErrorAction Stop
+    $script:BinaryPreserved = $true
+}
+if ($script:GitShimWasPresent) {
+    Move-Item -LiteralPath $gitShim -Destination $gitShimBackup -ErrorAction Stop
+    $script:GitShimPreserved = $true
+}
+
+Invoke-InstallFailureIfRequested -Step 'after_backups_preserved'
+
+$script:BinaryPublishAttempted = $true
+Move-Item -LiteralPath $tmpFile -Destination $finalExe -ErrorAction Stop
+try { Unblock-File -Path $finalExe -ErrorAction SilentlyContinue } catch { }
+
+& $finalExe --version | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    Write-ErrorAndExit 'Installed binary failed version validation'
+}
+Invoke-InstallFailureIfRequested -Step 'after_binary_publish'
+
+# Refresh git.exe only for existing wrapper users (it is a copy, not a
+# symlink, on Windows). A first install must not invent this legacy shim.
+if ($script:GitShimWasPresent) {
+    $script:GitShimPublishAttempted = $true
+    Copy-Item -LiteralPath $finalExe -Destination $gitShim -ErrorAction Stop
     try { Unblock-File -Path $gitShim -ErrorAction SilentlyContinue } catch { }
 }
+Invoke-InstallFailureIfRequested -Step 'after_shim_publish'
 
 # Login user with install token if provided
 $needLogin = $false
@@ -499,17 +647,27 @@ if ($env:INSTALL_NONCE -and $env:API_BASE) {
     }
 }
 
+if ($needLogin) {
+    Write-Host ''
+    Write-Host 'Launching login...'
+    & $finalExe login | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-ErrorAndExit 'Login failed'
+    }
+}
+
 # Install hooks
 Write-Host 'Setting up IDE/agent hooks...'
 try {
     & $finalExe install-hooks | Out-Host
-    Write-Success 'Successfully set up IDE/agent hooks'
+    if ($LASTEXITCODE -eq 0) {
+        Write-Success 'Successfully set up IDE/agent hooks'
+    } else {
+        Write-Warning "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
+    }
 } catch {
     Write-Warning "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
 }
-
-# Best-effort restart only for daemon-initiated self-updates.
-Start-DaemonIfRequested
 
 $skipPathUpdate = $env:GIT_AI_SKIP_PATH_UPDATE -eq '1'
 if ($skipPathUpdate) {
@@ -527,9 +685,6 @@ if ($pathUpdate.UserStatus -eq 'Updated') {
 } elseif ($pathUpdate.UserStatus -eq 'Error') {
     Write-Host 'Failed to update the user PATH.' -ForegroundColor Red
 }
-
-Write-Success "Successfully installed git-ai into $installDir"
-Write-Success "You can now run 'git-ai' from your terminal"
 
 # Configure Git Bash shell profiles so git-ai takes precedence over /mingw64/bin/git
 # Git Bash (MSYS2/MinGW) prepends its own directories to PATH, which shadows
@@ -597,11 +752,25 @@ if ($gitBashConfigured) {
     Write-Success "Git Bash already configured ($targetBashConfig)"
 }
 
-Write-Host 'Close and reopen your terminal and IDE sessions to use git-ai.' -ForegroundColor Yellow
+Complete-InstallTransaction
 
-# If nonce exchange failed, run interactive login
-if ($needLogin) {
-    Write-Host ''
-    Write-Host 'Launching login...'
-    & $finalExe login
+# Best-effort restart only after the executable transaction is committed.
+Start-DaemonIfRequested
+
+Write-Success "Successfully installed git-ai into $installDir"
+Write-Success "You can now run 'git-ai' from your terminal"
+Write-Host 'Close and reopen your terminal and IDE sessions to use git-ai.' -ForegroundColor Yellow
+} catch {
+    $failureMessage = $_.Exception.Message
+    $restoreFailures = @(Restore-InstallTransaction)
+    Write-Host "Error: $failureMessage" -ForegroundColor Red
+    if ($restoreFailures.Count -gt 0) {
+        Write-Host 'The previous executable set could not be restored completely:' -ForegroundColor Red
+        foreach ($restoreFailure in $restoreFailures) {
+            Write-Host "  - $restoreFailure" -ForegroundColor Red
+        }
+        Write-Host "Configuration, SQLite, and outbox data under $installRoot were not removed." -ForegroundColor Yellow
+    }
+    Start-DaemonIfRequested
+    exit 1
 }

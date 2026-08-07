@@ -148,6 +148,15 @@ fn encode_for_header(value: &str) -> String {
     encoded
 }
 
+/// How this context selected its metrics endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsEndpointMode {
+    /// Hosted/default API endpoint; metrics require normal API credentials.
+    Standard,
+    /// Explicit enterprise metrics endpoint; credentials are deliberately omitted.
+    DedicatedAnonymous,
+}
+
 /// API client context with optional authentication
 #[derive(Clone)]
 pub struct ApiContext {
@@ -161,6 +170,8 @@ pub struct ApiContext {
     pub author_identity: Option<String>,
     /// Request timeout in seconds
     pub timeout_secs: Option<u64>,
+    /// Frozen endpoint mode captured with the rest of this context's configuration.
+    pub metrics_endpoint_mode: MetricsEndpointMode,
 }
 
 impl std::fmt::Debug for ApiContext {
@@ -174,15 +185,27 @@ impl std::fmt::Debug for ApiContext {
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("author_identity", &self.author_identity)
             .field("timeout_secs", &self.timeout_secs)
+            .field("metrics_endpoint_mode", &self.metrics_endpoint_mode)
             .finish()
     }
 }
 
 impl ApiContext {
-    /// Get the default API base URL from config
-    /// Uses Config::fresh() to support runtime config updates (daemon mode)
-    fn default_base_url() -> String {
-        config::Config::fresh().api_base_url().to_string()
+    fn standard_from_config(
+        cfg: &config::Config,
+        base_url: Option<String>,
+        auth_token: Option<String>,
+    ) -> Self {
+        let api_key = cfg.api_key().map(str::to_string);
+        let author_identity = api_key.as_ref().and_then(|_| resolve_git_identity());
+        Self {
+            base_url: base_url.unwrap_or_else(|| cfg.api_base_url().to_string()),
+            auth_token,
+            api_key,
+            author_identity,
+            timeout_secs: Some(30),
+            metrics_endpoint_mode: MetricsEndpointMode::Standard,
+        }
     }
 
     /// Create a GET request with common headers (User-Agent, X-Distinct-ID)
@@ -220,19 +243,7 @@ impl ApiContext {
     /// Uses Config::fresh() to support runtime config updates (daemon mode)
     pub fn new(base_url: Option<String>) -> Self {
         let cfg = config::Config::fresh();
-        let api_key = cfg.api_key().map(|s| s.to_string());
-        let author_identity = if api_key.is_some() {
-            resolve_git_identity()
-        } else {
-            None
-        };
-        Self {
-            base_url: base_url.unwrap_or_else(Self::default_base_url),
-            auth_token: try_load_auth_token(),
-            api_key,
-            author_identity,
-            timeout_secs: Some(30),
-        }
+        Self::standard_from_config(&cfg, base_url, try_load_auth_token())
     }
 
     /// Create the context used exclusively for metrics delivery.
@@ -245,7 +256,7 @@ impl ApiContext {
         if cfg.has_dedicated_metrics_api_base_url() {
             return Self::anonymous_metrics(cfg.metrics_base_url().to_string());
         }
-        Self::new(None)
+        Self::standard_from_config(&cfg, None, try_load_auth_token())
     }
 
     fn anonymous_metrics(base_url: String) -> Self {
@@ -255,6 +266,7 @@ impl ApiContext {
             api_key: None,
             author_identity: None,
             timeout_secs: Some(30),
+            metrics_endpoint_mode: MetricsEndpointMode::DedicatedAnonymous,
         }
     }
 
@@ -264,19 +276,7 @@ impl ApiContext {
     #[allow(dead_code)]
     pub fn without_auth(base_url: Option<String>) -> Self {
         let cfg = config::Config::fresh();
-        let api_key = cfg.api_key().map(|s| s.to_string());
-        let author_identity = if api_key.is_some() {
-            resolve_git_identity()
-        } else {
-            None
-        };
-        Self {
-            base_url: base_url.unwrap_or_else(Self::default_base_url),
-            auth_token: None,
-            api_key,
-            author_identity,
-            timeout_secs: Some(30),
-        }
+        Self::standard_from_config(&cfg, base_url, None)
     }
 
     /// Create a new API context with authentication
@@ -285,25 +285,18 @@ impl ApiContext {
     #[allow(dead_code)]
     pub fn with_auth(base_url: Option<String>, auth_token: String) -> Self {
         let cfg = config::Config::fresh();
-        let api_key = cfg.api_key().map(|s| s.to_string());
-        let author_identity = if api_key.is_some() {
-            resolve_git_identity()
-        } else {
-            None
-        };
-        Self {
-            base_url: base_url.unwrap_or_else(Self::default_base_url),
-            auth_token: Some(auth_token),
-            api_key,
-            author_identity,
-            timeout_secs: Some(30),
-        }
+        Self::standard_from_config(&cfg, base_url, Some(auth_token))
     }
 
     /// Set a custom timeout
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = Some(timeout_secs);
         self
+    }
+
+    /// Whether this exact context opted into an anonymous dedicated metrics endpoint.
+    pub fn allows_anonymous_metrics_upload(&self) -> bool {
+        self.metrics_endpoint_mode == MetricsEndpointMode::DedicatedAnonymous
     }
 
     /// Build the full URL for an endpoint.
@@ -431,6 +424,7 @@ mod tests {
         let ctx = ApiContext::without_auth(Some("https://example.com".to_string()));
         assert!(ctx.auth_token.is_none());
         assert_eq!(ctx.base_url, "https://example.com");
+        assert!(!ctx.allows_anonymous_metrics_upload());
     }
 
     #[test]
@@ -463,6 +457,7 @@ mod tests {
         assert!(ctx.auth_token.is_none());
         assert!(ctx.api_key.is_none());
         assert!(ctx.author_identity.is_none());
+        assert!(ctx.allows_anonymous_metrics_upload());
     }
 
     // ============= ApiClient Tests =============

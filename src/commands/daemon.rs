@@ -108,7 +108,7 @@ fn ensure_daemon_running_attached(timeout: Duration) -> Result<DaemonConfig, Str
 
     remove_stale_daemon_files(&config);
 
-    if daemon_startup_is_blocked(&config) {
+    if daemon_startup_is_blocked(&config)? {
         return Err(format!(
             "daemon startup blocked: lock held at {}",
             config.lock_path.display()
@@ -253,19 +253,28 @@ pub(crate) fn ensure_daemon_running(
     }
 }
 
-fn daemon_startup_is_blocked(config: &DaemonConfig) -> bool {
-    if let Some(parent) = config.lock_path.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return false;
+fn daemon_startup_is_blocked(config: &DaemonConfig) -> Result<bool, String> {
+    if let Some(parent) = config.lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create daemon lock directory {}: {}",
+                parent.display(),
+                error
+            )
+        })?;
     }
 
-    match LockFile::try_acquire(&config.lock_path) {
-        Some(lock) => {
+    match LockFile::try_acquire_result(&config.lock_path) {
+        Ok(Some(lock)) => {
             drop(lock);
-            false
+            Ok(false)
         }
-        None => true,
+        Ok(None) => Ok(true),
+        Err(error) => Err(format!(
+            "failed to open daemon lock {}: {}",
+            config.lock_path.display(),
+            error
+        )),
     }
 }
 
@@ -312,7 +321,7 @@ fn start_daemon_detached_with_config(
 
     remove_stale_daemon_files(&config);
 
-    if daemon_startup_is_blocked(&config) {
+    if daemon_startup_is_blocked(&config)? {
         return Err(format!(
             "daemon startup blocked: lock held at {}",
             config.lock_path.display()
@@ -575,7 +584,7 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 fn handle_shutdown(args: &[String]) -> Result<(), String> {
     let config = daemon_config_from_env_or_default_paths()?;
     if has_flag(args, "--hard") {
-        if !daemon_is_up(&config) && !daemon_startup_is_blocked(&config) {
+        if !daemon_is_up(&config) && !daemon_startup_is_blocked(&config)? {
             return Err("background service is not running".to_string());
         }
         hard_kill_daemon(&config)
@@ -589,7 +598,7 @@ fn handle_restart(args: &[String]) -> Result<(), String> {
     let hard = has_flag(args, "--hard");
 
     // Only attempt shutdown if daemon appears to be running.
-    let was_running = daemon_is_up(&config) || daemon_startup_is_blocked(&config);
+    let was_running = daemon_is_up(&config) || daemon_startup_is_blocked(&config)?;
     if was_running {
         // Read the PID before shutdown so we can verify the process actually dies.
         let old_pid = read_daemon_pid(&config).ok();
@@ -599,7 +608,7 @@ fn handle_restart(args: &[String]) -> Result<(), String> {
         } else {
             // Attempt soft shutdown; escalate to hard kill on timeout.
             let _ = send_control_request(&config.control_socket_path, &ControlRequest::Shutdown);
-            if !wait_for_daemon_dead(&config, GRACEFUL_SHUTDOWN_TIMEOUT) {
+            if !wait_for_daemon_dead(&config, GRACEFUL_SHUTDOWN_TIMEOUT)? {
                 eprintln!("graceful shutdown timed out, force-killing daemon");
                 hard_kill_daemon(&config)?;
             }
@@ -639,7 +648,7 @@ fn hard_kill_daemon(config: &DaemonConfig) -> Result<(), String> {
         return Err(format!("kill -9 {} failed: {}", pid, err));
     }
     // Wait briefly for the OS to reap the process and release the lock.
-    let _ = wait_for_daemon_dead(config, Duration::from_secs(2));
+    let _ = wait_for_daemon_dead(config, Duration::from_secs(2))?;
     Ok(())
 }
 
@@ -661,25 +670,33 @@ fn hard_kill_daemon(config: &DaemonConfig) -> Result<(), String> {
             ));
         }
     }
-    let _ = wait_for_daemon_dead(config, Duration::from_secs(2));
+    let _ = wait_for_daemon_dead(config, Duration::from_secs(2))?;
     Ok(())
 }
 
-fn wait_for_daemon_dead(config: &DaemonConfig, timeout: Duration) -> bool {
+fn wait_for_daemon_dead(config: &DaemonConfig, timeout: Duration) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
     loop {
         let sockets_down = !daemon_is_up(config);
-        let lock_free = LockFile::try_acquire(&config.lock_path)
-            .map(|l| {
-                drop(l);
+        let lock_free = match LockFile::try_acquire_result(&config.lock_path) {
+            Ok(Some(lock)) => {
+                drop(lock);
                 true
-            })
-            .unwrap_or(false);
+            }
+            Ok(None) => false,
+            Err(error) => {
+                return Err(format!(
+                    "failed to open daemon lock {}: {}",
+                    config.lock_path.display(),
+                    error
+                ));
+            }
+        };
         if sockets_down && lock_free {
-            return true;
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            return false;
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -719,7 +736,7 @@ fn wait_for_process_exit(_pid: u32, _timeout: Duration) {
 /// before proceeding.
 pub(crate) fn stop_daemon(config: &DaemonConfig, timeout: Duration) -> Result<(), String> {
     // Nothing to do if daemon isn't running.
-    if !daemon_is_up(config) && !daemon_startup_is_blocked(config) {
+    if !daemon_is_up(config) && !daemon_startup_is_blocked(config)? {
         return Ok(());
     }
 
@@ -730,7 +747,7 @@ pub(crate) fn stop_daemon(config: &DaemonConfig, timeout: Duration) -> Result<()
         let _ = send_control_request(&config.control_socket_path, &ControlRequest::Shutdown);
     }
 
-    if wait_for_daemon_dead(config, timeout) {
+    if wait_for_daemon_dead(config, timeout)? {
         return Ok(());
     }
 
@@ -741,7 +758,7 @@ pub(crate) fn stop_daemon(config: &DaemonConfig, timeout: Duration) -> Result<()
 /// Shut down the running daemon and start a fresh one. Escalates to hard kill
 /// if the soft shutdown doesn't complete within GRACEFUL_SHUTDOWN_TIMEOUT.
 pub(crate) fn restart_daemon(config: &DaemonConfig) -> Result<(), String> {
-    let was_running = daemon_is_up(config) || daemon_startup_is_blocked(config);
+    let was_running = daemon_is_up(config) || daemon_startup_is_blocked(config)?;
     if was_running {
         stop_daemon(config, GRACEFUL_SHUTDOWN_TIMEOUT)?;
     }
@@ -757,6 +774,25 @@ fn parse_repo_arg(args: &[String]) -> Option<String> {
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_startup_lock_io_error_is_not_reported_as_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DaemonConfig::from_home(dir.path());
+        std::fs::create_dir_all(&config.lock_path).unwrap();
+        let started_at = Instant::now();
+
+        let error = daemon_startup_is_blocked(&config)
+            .expect_err("a lock-path directory must be reported as an I/O error");
+
+        assert!(error.contains("failed to open daemon lock"));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {

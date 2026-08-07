@@ -373,7 +373,8 @@ fn persist_install_config(binary_path: &Path, dry_run: bool) -> Result<bool, Git
         return Ok(false);
     }
 
-    let mut file_config = crate::config::load_file_config_public().map_err(GitAiError::Generic)?;
+    let mut file_config =
+        crate::config::lock_file_config_for_update().map_err(GitAiError::Generic)?;
     let mut changed = false;
 
     if let Some(ref api_base) = api_base
@@ -406,7 +407,7 @@ fn persist_install_config(binary_path: &Path, dry_run: bool) -> Result<bool, Git
         return Ok(false);
     }
 
-    crate::config::save_file_config(&file_config).map_err(GitAiError::Generic)?;
+    file_config.commit().map_err(GitAiError::Generic)?;
     Ok(true)
 }
 

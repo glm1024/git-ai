@@ -1,6 +1,6 @@
-use crate::api::{ApiClient, ApiContext, metrics_upload_allowed};
+use crate::api::{ApiClient, ApiContext};
 use crate::auth::state::AuthStatus;
-use crate::auth::{AuthState, collect_auth_status, format_unix_timestamp};
+use crate::auth::{collect_auth_status, format_unix_timestamp, AuthState};
 use crate::config;
 use crate::metrics::db::{MetricsDatabase, MetricsStatus};
 use std::fmt::Write as _;
@@ -23,6 +23,7 @@ pub fn handle_whoami(args: &[String]) {
     // Use Config::fresh() to support runtime config updates (daemon mode).
     let config = config::Config::fresh();
     let api_base_url = config.api_base_url().to_string();
+    let metrics_api_base_url = config.metrics_api_base_url().map(str::to_string);
     let telemetry_oss_disabled = config.is_telemetry_oss_disabled();
     let auth = collect_auth_status();
     let api_ctx = ApiContext::new(None);
@@ -36,6 +37,7 @@ pub fn handle_whoami(args: &[String]) {
             &auth,
             &api_ctx,
             &api_client,
+            metrics_api_base_url.as_deref(),
             metrics_status.as_ref().map_err(String::as_str),
             telemetry_oss_disabled,
         )
@@ -59,6 +61,7 @@ fn render_whoami(
     auth: &AuthStatus,
     api_ctx: &ApiContext,
     api_client: &ApiClient,
+    metrics_api_base_url: Option<&str>,
     metrics_status: Result<&MetricsStatus, &str>,
     telemetry_oss_disabled: bool,
 ) -> String {
@@ -145,7 +148,7 @@ fn render_whoami(
     writeln!(
         out,
         "  Metrics delivery: {}",
-        metrics_delivery_status(api_base_url, api_client)
+        metrics_delivery_status(api_client, metrics_api_base_url)
     )
     .unwrap();
     writeln!(
@@ -217,11 +220,11 @@ fn login_status(auth: &AuthStatus, api_client: &ApiClient) -> String {
     }
 }
 
-fn metrics_delivery_status(api_base_url: &str, api_client: &ApiClient) -> String {
-    if let Some(metrics_url) = config::Config::fresh().metrics_api_base_url() {
+fn metrics_delivery_status(api_client: &ApiClient, metrics_api_base_url: Option<&str>) -> String {
+    if let Some(metrics_url) = metrics_api_base_url {
         return format!("on (enterprise reporting: {})", metrics_url);
     }
-    if !metrics_upload_allowed(api_base_url, api_client) {
+    if !api_client.is_logged_in() && !api_client.has_api_key() {
         return "off (requires an API key or login)".to_string();
     }
 
@@ -309,6 +312,7 @@ mod tests {
             api_key: api_key.map(str::to_string),
             author_identity: author_identity.map(str::to_string),
             timeout_secs: Some(30),
+            metrics_endpoint_mode: crate::api::MetricsEndpointMode::Standard,
         }
     }
 
@@ -338,7 +342,15 @@ mod tests {
         let client = ApiClient::new(ctx.clone());
         let metrics = metrics_status();
 
-        let output = render_whoami(&ctx.base_url, &auth, &ctx, &client, Ok(&metrics), false);
+        let output = render_whoami(
+            &ctx.base_url,
+            &auth,
+            &ctx,
+            &client,
+            None,
+            Ok(&metrics),
+            false,
+        );
 
         assert!(output.contains("API access: connected via API key"));
         assert!(output.contains("API key: configured (gita...7890)"));
@@ -373,7 +385,15 @@ mod tests {
         let client = ApiClient::new(ctx.clone());
         let metrics = metrics_status();
 
-        let output = render_whoami(&ctx.base_url, &auth, &ctx, &client, Ok(&metrics), true);
+        let output = render_whoami(
+            &ctx.base_url,
+            &auth,
+            &ctx,
+            &client,
+            None,
+            Ok(&metrics),
+            true,
+        );
 
         assert!(output.contains("API access: connected via login"));
         assert!(output.contains("API key: unset"));
@@ -398,7 +418,15 @@ mod tests {
         let client = ApiClient::new(ctx.clone());
         let metrics = metrics_status();
 
-        let output = render_whoami(&ctx.base_url, &auth, &ctx, &client, Ok(&metrics), false);
+        let output = render_whoami(
+            &ctx.base_url,
+            &auth,
+            &ctx,
+            &client,
+            None,
+            Ok(&metrics),
+            false,
+        );
 
         assert!(output.contains("API key: unset"));
         assert!(output.contains("Login: not logged in"));
@@ -428,12 +456,42 @@ mod tests {
         let client = ApiClient::new(ctx.clone());
         let metrics = metrics_status();
 
-        let output = render_whoami(&ctx.base_url, &auth, &ctx, &client, Ok(&metrics), false);
+        let output = render_whoami(
+            &ctx.base_url,
+            &auth,
+            &ctx,
+            &client,
+            None,
+            Ok(&metrics),
+            false,
+        );
 
         assert!(output.contains(
             "API access: not connected (login credentials found, but no usable access token)"
         ));
         assert!(output.contains("Login: logged in"));
         assert!(output.contains("Metrics delivery: off (requires an API key or login)"));
+    }
+
+    #[test]
+    fn render_whoami_uses_the_captured_enterprise_metrics_endpoint() {
+        let auth = auth_status(AuthState::LoggedOut);
+        let ctx = api_context(crate::config::DEFAULT_API_BASE_URL, None, None, None);
+        let client = ApiClient::new(ctx.clone());
+        let metrics = metrics_status();
+
+        let output = render_whoami(
+            &ctx.base_url,
+            &auth,
+            &ctx,
+            &client,
+            Some("https://stats.example.com/prod-api"),
+            Ok(&metrics),
+            false,
+        );
+
+        assert!(output.contains(
+            "Metrics delivery: on (enterprise reporting: https://stats.example.com/prod-api)"
+        ));
     }
 }
