@@ -315,6 +315,9 @@ mod tests {
         assert!(content.contains("session_id"));
         assert!(content.contains("PreToolUse"));
         assert!(content.contains("PostToolUse"));
+        assert!(content.contains("failClosedHook"));
+        assert!(!content.contains("swallowHookErrors"));
+        assert!(content.contains("throw failure"));
     }
 
     #[test]
@@ -323,7 +326,7 @@ mod tests {
             .find("await runCheckpoint(hookInput)")
             .expect("pre checkpoint call");
         let track_pending_call = OPENCODE_PLUGIN_CONTENT
-            .find("pendingCalls.set(callID")
+            .find("pendingCalls.set(callKey")
             .expect("pending call insertion");
 
         assert!(
@@ -342,8 +345,88 @@ mod tests {
         assert!(content.contains(r#"const GIT_AI_BIN = "/usr/local/bin/git-ai""#));
         // Checkpoint execution uses spawn(), which works in OpenCode CLI and Desktop.
         assert!(content.contains("spawn(GIT_AI_BIN"));
-        assert!(content.contains(r#""checkpoint", "opencode", "--hook-input", "stdin""#));
+        assert!(
+            content.contains(
+                r#""checkpoint", "opencode", "--strict-errors", "--hook-input", "stdin""#
+            )
+        );
         assert!(!content.contains("Bun.$"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_reconstructs_post_after_plugin_restart() {
+        let post_hook = OPENCODE_PLUGIN_CONTENT
+            .find("\"tool.execute.after\"")
+            .expect("post hook");
+        let post_content = &OPENCODE_PLUGIN_CONTENT[post_hook..];
+        let post_checkpoint = post_content
+            .find("await runCheckpoint(hookInput)")
+            .expect("post checkpoint call");
+        let delete_pending = post_content
+            .rfind("pendingCalls.delete(callKey)")
+            .expect("pending call deletion");
+
+        assert!(
+            post_checkpoint < delete_pending,
+            "same-process correlation must only be deleted after the strict CLI returns an ACK"
+        );
+        assert!(post_content.contains("const postToolInput = input.args ?? callInfo?.toolInput"));
+        assert!(post_content.contains("const candidateFilePaths = callInfo"));
+        assert!(post_content.contains("? callInfo.filePaths"));
+        assert!(!post_content.contains("new Set([...callInfo.filePaths, ...extractedFilePaths])"));
+        assert!(post_content.contains("await resolveGitFileScope(candidateFilePaths)"));
+        assert!(!post_content.contains("has no acknowledged pre-tool call"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_scopes_reused_call_ids_by_session() {
+        assert!(OPENCODE_PLUGIN_CONTENT.contains(
+            "pendingCallKey = (sessionID: string, callID: string): string => JSON.stringify([sessionID, callID])"
+        ));
+        assert!(
+            OPENCODE_PLUGIN_CONTENT.contains("const callKey = pendingCallKey(sessionID, callID)")
+        );
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("pendingCalls.set(callKey"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("pendingCalls.get(callKey)"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("pendingCalls.delete(callKey)"));
+        assert!(
+            OPENCODE_PLUGIN_CONTENT
+                .contains("pendingCalls.has(callKey) || nonGitCalls.has(callKey)")
+        );
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("callInfo.toolName !== toolName"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_keeps_explicit_non_git_edits_out_of_scope() {
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("await resolveGitFileScope(filePaths)"));
+        assert!(
+            OPENCODE_PLUGIN_CONTENT.contains("const nonGitToolName = nonGitCalls.get(callKey)")
+        );
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("nonGitCalls.delete(callKey)"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_does_not_fallback_from_non_git_bash_cwd() {
+        assert!(OPENCODE_PLUGIN_CONTENT.contains(": await findGitRepo(toolCwd)"));
+        assert!(!OPENCODE_PLUGIN_CONTENT.contains("findGitRepoOnce(defaultCwd)"));
+        assert!(!OPENCODE_PLUGIN_CONTENT.contains("findGitRepoOnce(process.cwd())"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_fails_closed_on_repository_inspection_errors() {
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("isMissingPathError"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("invalid Git metadata pointer"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("failed to inspect Git metadata"));
+    }
+
+    #[test]
+    fn test_opencode_plugin_scopes_mixed_edits_to_every_git_repository() {
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("resolveGitFileScope"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("git_ai_file_paths"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("repoDirs"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("missingRepos"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("unexpectedRepos"));
+        assert!(OPENCODE_PLUGIN_CONTENT.contains("lost the acknowledged repository scope"));
     }
 
     #[test]

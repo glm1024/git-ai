@@ -328,7 +328,7 @@ fn test_bash_recovery_uses_commit_time_file_timestamps_when_processing_is_delaye
 }
 
 #[test]
-fn test_codex_parent_cwd_bash_attempt_recovers_attribution() {
+fn test_codex_parent_cwd_bash_attempt_stays_unknown_without_path_evidence() {
     let (_bash_db_dir, bash_db_path) = isolated_bash_history_db_path();
     let env = [("GIT_AI_TEST_BASH_CHECKPOINT_DB_PATH", bash_db_path.as_str())];
     let repo = TestRepo::new_with_daemon_env(&env);
@@ -382,10 +382,10 @@ fn test_codex_parent_cwd_bash_attempt_recovers_attribution() {
         .expect("commit should succeed");
 
     let mut file = repo.filename("src/parent-cwd.txt");
-    file.assert_committed_lines(lines!["x".ai()]);
+    file.assert_committed_lines(lines!["x".unattributed_human()]);
     assert!(
-        !commit.authorship_log.metadata.sessions.is_empty(),
-        "parent-cwd bash attempt should create recovered AI attribution"
+        commit.authorship_log.metadata.sessions.is_empty(),
+        "parent-cwd time correlation alone must not create AI attribution"
     );
 
     let db = BashHistoryDatabase::open_at_path(std::path::Path::new(&bash_db_path)).unwrap();
@@ -569,7 +569,7 @@ fn test_bash_history_recovers_untracked_lines_when_post_snapshot_fails() {
 }
 
 #[test]
-fn test_bash_history_recovers_when_bash_checkpoint_was_recorded_elsewhere() {
+fn test_bash_history_does_not_recover_across_repos_without_path_evidence() {
     let (_bash_db_dir, bash_db_path) = isolated_bash_history_db_path();
     let env = [("GIT_AI_TEST_BASH_CHECKPOINT_DB_PATH", bash_db_path.as_str())];
     let source_repo = TestRepo::new_with_daemon_env(&env);
@@ -628,7 +628,10 @@ fn test_bash_history_recovers_when_bash_checkpoint_was_recorded_elsewhere() {
     target_repo
         .stage_all_and_commit("Recover cross-repo bash attribution")
         .unwrap();
-    target.assert_committed_lines(lines!["base".unattributed_human(), "from elsewhere".ai()]);
+    target.assert_committed_lines(lines![
+        "base".unattributed_human(),
+        "from elsewhere".unattributed_human(),
+    ]);
 }
 
 #[test]

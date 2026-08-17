@@ -29,6 +29,8 @@ VSCODE_VERSION=$(vscode_version)
 JETBRAINS_VERSION=$(jetbrains_version)
 OFFLINE_VERSION=${GIT_AI_OFFLINE_VERSION:-"${CLI_VERSION}"}
 require_safe_release_version "${OFFLINE_VERSION}"
+[ "${OFFLINE_VERSION}" = "${CLI_VERSION}" ] \
+    || fail "Offline bundle version ${OFFLINE_VERSION} must exactly match CLI version ${CLI_VERSION}"
 DIST_NAME="git-ai-offline-v${OFFLINE_VERSION}"
 DIST_DIR="${REPO_ROOT}/offline-dist/${DIST_NAME}"
 STAGING_DIR="${REPO_ROOT}/offline-dist/.git-ai-package-${DIST_NAME}.staging.$$"
@@ -151,29 +153,54 @@ awk -v repo="internal/git-ai-offline" -v version="v${OFFLINE_VERSION}" -v checks
     { print }
 ' "${REPO_ROOT}/install.ps1" > "${STAGING_DIR}/install.ps1"
 
-INSTALL_TEMPLATE=${GIT_AI_INSTALL_TEMPLATE:-}
-if [ -z "${INSTALL_TEMPLATE}" ] && [ -f "${DIST_DIR}/INSTALL.md" ]; then
-    INSTALL_TEMPLATE="${DIST_DIR}/INSTALL.md"
-fi
-if [ -z "${INSTALL_TEMPLATE}" ]; then
-    INSTALL_TEMPLATE=$(
-        find "${REPO_ROOT}/offline-dist" -mindepth 2 -maxdepth 2 -type f -name INSTALL.md -print 2>/dev/null \
-            | LC_ALL=C sort \
-            | tail -n 1
-    ) || true
-fi
+INSTALL_TEMPLATE=${GIT_AI_INSTALL_TEMPLATE:-"${SCRIPT_DIR}/INSTALL.template.md"}
 if [ -z "${INSTALL_TEMPLATE}" ] || [ ! -f "${INSTALL_TEMPLATE}" ]; then
-    fail "INSTALL.md template not found under offline-dist/. Set GIT_AI_INSTALL_TEMPLATE or keep a previous offline bundle."
+    fail "INSTALL.md template not found: ${INSTALL_TEMPLATE}"
 fi
+for token in __OFFLINE_VERSION__ __VSCODE_VSIX__ __JETBRAINS_ZIP__; do
+    grep -Fq "${token}" "${INSTALL_TEMPLATE}" \
+        || fail "INSTALL.md template is missing required token: ${token}"
+done
 
-awk -v version="v${OFFLINE_VERSION}" -v vsix="${VSCODE_VSIX}" -v jetbrains="${JETBRAINS_ZIP}" '
+awk -v version="${OFFLINE_VERSION}" -v vsix="${VSCODE_VSIX}" -v jetbrains="${JETBRAINS_ZIP}" '
     {
-        gsub(/v[0-9][0-9.]*/, version)
-        gsub(/git-ai\.git-ai-vscode-[0-9.]+\.vsix/, vsix)
-        gsub(/Git_AI-[0-9.]+\.zip/, jetbrains)
+        gsub(/__OFFLINE_VERSION__/, version)
+        gsub(/__VSCODE_VSIX__/, vsix)
+        gsub(/__JETBRAINS_ZIP__/, jetbrains)
         print
     }
 ' "${INSTALL_TEMPLATE}" > "${STAGING_DIR}/INSTALL.md"
+if grep -Eq '__[A-Z0-9_]+__' "${STAGING_DIR}/INSTALL.md"; then
+    fail "Rendered INSTALL.md contains unresolved template tokens"
+fi
+
+METRICS_SCHEMA_VERSION=$(
+    awk 'match($0, /SCHEMA_VERSION: usize = [0-9]+;/) {
+        value = substr($0, RSTART, RLENGTH)
+        sub(/^.* = /, "", value)
+        sub(/;$/, "", value)
+        print value
+        exit
+    }' "${REPO_ROOT}/src/metrics/db.rs"
+)
+case "${METRICS_SCHEMA_VERSION}" in
+    ''|*[!0-9]*) fail "Could not determine metrics SQLite schema version" ;;
+esac
+
+{
+    printf 'bundle_format=2\n'
+    printf 'source_commit=%s\n' "${PACKAGE_SOURCE_COMMIT}"
+    printf 'source_dirty=false\n'
+    printf 'artifact_source_gate=verified-local-v1\n'
+    printf 'cli_version=%s\n' "${CLI_VERSION}"
+    printf 'vscode_version=%s\n' "${VSCODE_VERSION}"
+    printf 'jetbrains_version=%s\n' "${JETBRAINS_VERSION}"
+    printf 'metrics_schema_version=%s\n' "${METRICS_SCHEMA_VERSION}"
+    printf 'schema_compatibility=forward-only\n'
+    PACKAGED_AT_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf 'built_at_utc=%s\n' "${PACKAGED_AT_UTC}"
+    printf 'packaged_at_utc=%s\n' "${PACKAGED_AT_UTC}"
+} > "${STAGING_DIR}/BUILD-METADATA.txt"
 
 RAW_SHA256SUMS="${STAGING_DIR}/.SHA256SUMS.raw"
 (
@@ -192,22 +219,18 @@ RAW_SHA256SUMS="${STAGING_DIR}/.SHA256SUMS.raw"
         "jetbrains/${JETBRAINS_ZIP}" \
         "jetbrains/${JETBRAINS_ZIP}.build-metadata" \
         install.sh \
-        install.ps1
+        install.ps1 \
+        INSTALL.md \
+        BUILD-METADATA.txt
 ) > "${RAW_SHA256SUMS}"
 LC_ALL=C sort "${RAW_SHA256SUMS}" > "${STAGING_DIR}/SHA256SUMS"
 rm -f "${RAW_SHA256SUMS}"
 
-{
-    printf 'source_commit=%s\n' "${PACKAGE_SOURCE_COMMIT}"
-    printf 'source_dirty=false\n'
-    printf 'artifact_source_gate=verified-local-v1\n'
-    printf 'cli_version=%s\n' "${CLI_VERSION}"
-    printf 'vscode_version=%s\n' "${VSCODE_VERSION}"
-    printf 'jetbrains_version=%s\n' "${JETBRAINS_VERSION}"
-    PACKAGED_AT_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    printf 'built_at_utc=%s\n' "${PACKAGED_AT_UTC}"
-    printf 'packaged_at_utc=%s\n' "${PACKAGED_AT_UTC}"
-} > "${STAGING_DIR}/BUILD-METADATA.txt"
+# Validate the newly rendered installers, not a historical offline bundle.
+# The test harness copies them to an isolated HOME and uses a local fake binary;
+# it never executes the packaged production binaries.
+GIT_AI_PACKAGED_DIST_UNDER_TEST="${STAGING_DIR}" \
+    sh "${SCRIPT_DIR}/test-install-rollback.sh"
 
 require_unchanged_release_source "${PACKAGE_SOURCE_COMMIT}"
 

@@ -8,7 +8,8 @@ use crate::git::cli_parser::{
 };
 use crate::git::find_repository_in_path;
 use crate::git::repo_state::{
-    common_dir_for_worktree, git_dir_for_worktree, worktree_root_for_path,
+    common_dir_for_worktree, git_dir_for_worktree, read_head_state_for_worktree,
+    worktree_root_for_path,
 };
 use crate::git::repository::{
     Repository, discover_repository_in_path_no_git_exec, exec_git, exec_git_stdin,
@@ -160,6 +161,32 @@ struct AwaitResult {
     timed_out: bool,
     metrics_remaining: usize,
     notes_remaining: usize,
+    #[serde(default)]
+    blocked_checkpoints: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blocked_checkpoint_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase_error: Option<String>,
+}
+
+fn record_await_phase_error(result: &mut AwaitResult, phase: &str, error: impl std::fmt::Display) {
+    let message = format!("{phase}: {error}");
+    match &mut result.phase_error {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&message);
+        }
+        None => result.phase_error = Some(message),
+    }
+}
+
+fn await_result_is_done(result: &AwaitResult, has_pending_daemon_work: bool) -> bool {
+    !result.timed_out
+        && result.phase_error.is_none()
+        && result.metrics_remaining == 0
+        && result.notes_remaining == 0
+        && result.blocked_checkpoints == 0
+        && !has_pending_daemon_work
 }
 
 struct DaemonProcessActiveGuard;
@@ -858,7 +885,11 @@ fn rfc3339_to_unix_nanos(value: &str) -> Option<u128> {
         .and_then(|timestamp| u128::try_from(timestamp.timestamp_nanos_opt()?).ok())
 }
 
-fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), GitAiError> {
+fn apply_checkpoint_side_effect(request: CheckpointRequest) -> Result<(), GitAiError> {
+    apply_checkpoint_side_effect_unlocked(request)
+}
+
+fn apply_checkpoint_side_effect_unlocked(mut request: CheckpointRequest) -> Result<(), GitAiError> {
     if request.files.is_empty() {
         return Ok(());
     }
@@ -889,7 +920,7 @@ fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), Gi
         crate::metrics::record(values, attrs)?;
     }
 
-    let resolved = resolve_checkpoint_request(&repo, &mut request)?;
+    let resolved = resolve_checkpoint_request(&repo, &mut request, None)?;
     let Some(resolved) = resolved else {
         return Ok(());
     };
@@ -906,6 +937,7 @@ fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), Gi
 fn resolve_checkpoint_request(
     repo: &crate::git::repository::Repository,
     request: &mut CheckpointRequest,
+    observed_at_ms: Option<u64>,
 ) -> Result<Option<crate::daemon::checkpoint::ResolvedCheckpointExecution>, GitAiError> {
     use crate::authorship::ignore::{
         build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
@@ -983,10 +1015,12 @@ fn resolve_checkpoint_request(
         return Ok(None);
     }
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    let ts = observed_at_ms.map(u128::from).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    });
 
     Ok(Some(
         crate::daemon::checkpoint::ResolvedCheckpointExecution {
@@ -996,6 +1030,429 @@ fn resolve_checkpoint_request(
             dirty_files,
         },
     ))
+}
+
+pub(crate) fn process_claimed_durable_checkpoint_job(
+    job: &crate::metrics::deferred_checkpoint_jobs::ClaimedDeferredCheckpointJob,
+    validate_recovery_base: bool,
+) -> Result<(), GitAiError> {
+    process_claimed_durable_checkpoint_job_with_finalize(job, validate_recovery_base, |job| {
+        crate::metrics::deferred_checkpoint_jobs::complete_global(
+            job,
+            durable_checkpoint_now_secs(),
+        )
+    })
+}
+
+fn process_claimed_durable_checkpoint_job_with_finalize<Finalize>(
+    job: &crate::metrics::deferred_checkpoint_jobs::ClaimedDeferredCheckpointJob,
+    validate_recovery_base: bool,
+    mut finalize: Finalize,
+) -> Result<(), GitAiError>
+where
+    Finalize: FnMut(
+        &crate::metrics::deferred_checkpoint_jobs::ClaimedDeferredCheckpointJob,
+    ) -> Result<bool, GitAiError>,
+{
+    use crate::commands::checkpoint_agent::orchestrator::BaseCommit;
+    use crate::daemon::checkpoint::{
+        FrozenCheckpointMetricsContext, PreparedCheckpointApplication,
+    };
+
+    let mut request: CheckpointRequest = serde_json::from_str(&job.request_json).map_err(|error| {
+        GitAiError::EvidenceError(format!(
+            "durable checkpoint {} has corrupt frozen request JSON: {}; back up the repository and reset its checkpoint baseline manually",
+            job.job_key, error
+        ))
+    })?;
+    if crate::metrics::deferred_checkpoint_jobs::job_key_from_trace_id(&request.trace_id)
+        != Some(job.job_key.as_str())
+    {
+        return Err(checkpoint_recovery_evidence_error(
+            job,
+            "the frozen request has a mismatched stable trace id",
+        ));
+    }
+    let context: FrozenCheckpointMetricsContext = serde_json::from_str(&job.metrics_context_json)
+        .map_err(|error| {
+        checkpoint_recovery_evidence_error(
+            job,
+            format!("the frozen metrics context is corrupt: {error}"),
+        )
+    })?;
+
+    let prepared = match (
+        job.prepared_checkpoint_json.as_deref(),
+        job.prepared_metric_events_json.as_deref(),
+    ) {
+        (Some(application_json), Some(metric_events_json)) => {
+            Some(parse_and_validate_frozen_prepared_checkpoint(
+                job,
+                &request,
+                application_json,
+                metric_events_json,
+            )?)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(checkpoint_recovery_evidence_error(
+                job,
+                "the frozen prepared checkpoint and metric payload are only partially present",
+            ));
+        }
+    };
+
+    if job.working_log_applied {
+        // Once the repository-side publication is durably acknowledged, HEAD,
+        // worktree paths, and even the repository itself are no longer inputs
+        // to recovery. Re-validate only the frozen payload, then atomically
+        // publish its already-prepared metric outbox and mark the row done.
+        if prepared.is_none() {
+            return Err(checkpoint_recovery_evidence_error(
+                job,
+                "working-log publication is recorded but the frozen prepared payload is missing",
+            ));
+        }
+        if !finalize(job)? {
+            return Err(GitAiError::Generic(format!(
+                "durable checkpoint {} lost its completion lease",
+                job.job_key
+            )));
+        }
+        return Ok(());
+    }
+
+    let repo = discover_repository_in_path_no_git_exec(Path::new(&job.repository_workdir))
+        .map_err(|error| {
+            if validate_recovery_base {
+                checkpoint_recovery_evidence_error(
+                    job,
+                    format!(
+                        "the frozen repository path {} can no longer be resolved: {error}",
+                        job.repository_workdir
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+    let actual_repo_identity =
+        crate::metrics::deferred_checkpoint_jobs::repository_identity(repo.common_dir());
+    if actual_repo_identity != job.repo_identity {
+        return Err(checkpoint_recovery_evidence_error(
+            job,
+            "the repository identity no longer matches the frozen request",
+        ));
+    }
+    for file in &request.files {
+        let file_repo =
+            discover_repository_in_path_no_git_exec(&file.repo_work_dir).map_err(|error| {
+                if validate_recovery_base {
+                    checkpoint_recovery_evidence_error(
+                        job,
+                        format!(
+                            "a frozen file repository path {} can no longer be resolved: {error}",
+                            file.repo_work_dir.display()
+                        ),
+                    )
+                } else {
+                    error
+                }
+            })?;
+        if crate::metrics::deferred_checkpoint_jobs::repository_identity(file_repo.common_dir())
+            != job.repo_identity
+        {
+            return Err(checkpoint_recovery_evidence_error(
+                job,
+                "the frozen request now resolves across multiple repositories",
+            ));
+        }
+    }
+    if validate_recovery_base {
+        validate_durable_checkpoint_recovery_base(job, &request)?;
+    }
+
+    let prepared = match prepared {
+        Some(application) => application,
+        None => {
+            let resolved =
+                resolve_checkpoint_request(&repo, &mut request, Some(job.observed_at_ms))?;
+            let (application, metric_events) = if let Some(resolved) = resolved {
+                crate::daemon::checkpoint::prepare_resolved_checkpoint_from_daemon(
+                    &repo,
+                    &context.author,
+                    request.checkpoint_kind,
+                    request.clone(),
+                    resolved,
+                    Some(&context),
+                )?
+            } else {
+                let base_commit = request
+                    .files
+                    .first()
+                    .map(|file| match &file.base_commit {
+                        BaseCommit::Sha(sha) => sha.clone(),
+                        BaseCommit::Initial => "initial".to_string(),
+                    })
+                    .unwrap_or_else(|| "initial".to_string());
+                (
+                    PreparedCheckpointApplication {
+                        base_commit,
+                        checkpoint: None,
+                    },
+                    Vec::new(),
+                )
+            };
+            let application_json = serde_json::to_string(&application)?;
+            let agent_usage = durable_agent_usage_candidate(&request, &context, job.observed_at_ms);
+            if !crate::metrics::deferred_checkpoint_jobs::persist_prepared_global(
+                job,
+                &application_json,
+                &metric_events,
+                agent_usage.as_ref(),
+                durable_checkpoint_now_secs(),
+            )? {
+                return Err(GitAiError::Generic(format!(
+                    "durable checkpoint {} lost its preparation lease",
+                    job.job_key
+                )));
+            }
+            application
+        }
+    };
+
+    // Fence repository publication with a fresh lease. A recovery actor may
+    // only reclaim this row after the renewed lease expires; an owner that has
+    // already lost its token must stop before touching the working log.
+    if !crate::metrics::deferred_checkpoint_jobs::renew_processing_lease_global(
+        job,
+        durable_checkpoint_now_secs(),
+    )? {
+        return Err(GitAiError::Generic(format!(
+            "durable checkpoint {} lost its processing lease before working-log publication",
+            job.job_key
+        )));
+    }
+    crate::daemon::checkpoint::apply_prepared_checkpoint_from_daemon(&repo, &prepared)?;
+    if !crate::metrics::deferred_checkpoint_jobs::mark_working_log_applied_global(
+        job,
+        durable_checkpoint_now_secs(),
+    )? {
+        return Err(GitAiError::Generic(format!(
+            "durable checkpoint {} lost its working-log lease",
+            job.job_key
+        )));
+    }
+    if !finalize(job)? {
+        return Err(GitAiError::Generic(format!(
+            "durable checkpoint {} lost its completion lease",
+            job.job_key
+        )));
+    }
+    Ok(())
+}
+
+fn parse_and_validate_frozen_prepared_checkpoint(
+    job: &crate::metrics::deferred_checkpoint_jobs::ClaimedDeferredCheckpointJob,
+    request: &CheckpointRequest,
+    application_json: &str,
+    metric_events_json: &str,
+) -> Result<crate::daemon::checkpoint::PreparedCheckpointApplication, GitAiError> {
+    use crate::commands::checkpoint_agent::orchestrator::BaseCommit;
+
+    let application: crate::daemon::checkpoint::PreparedCheckpointApplication =
+        serde_json::from_str(application_json).map_err(|error| {
+            checkpoint_recovery_evidence_error(
+                job,
+                format!("the prepared checkpoint evidence is corrupt: {error}"),
+            )
+        })?;
+    let encoded_events: Vec<String> =
+        serde_json::from_str(metric_events_json).map_err(|error| {
+            checkpoint_recovery_evidence_error(
+                job,
+                format!("the prepared metric evidence is corrupt: {error}"),
+            )
+        })?;
+    for encoded in encoded_events {
+        serde_json::from_str::<crate::metrics::MetricEvent>(&encoded).map_err(|error| {
+            checkpoint_recovery_evidence_error(
+                job,
+                format!("a prepared metric event is corrupt: {error}"),
+            )
+        })?;
+    }
+
+    let Some(first_file) = request.files.first() else {
+        return Err(checkpoint_recovery_evidence_error(
+            job,
+            "the frozen request has no file/base evidence",
+        ));
+    };
+    let expected_base = match &first_file.base_commit {
+        BaseCommit::Initial => "initial",
+        BaseCommit::Sha(sha) => sha.as_str(),
+    };
+    for file in &request.files {
+        let file_base = match &file.base_commit {
+            BaseCommit::Initial => "initial",
+            BaseCommit::Sha(sha) => sha.as_str(),
+        };
+        if !file_base.eq_ignore_ascii_case(expected_base) {
+            return Err(checkpoint_recovery_evidence_error(
+                job,
+                "the frozen request contains inconsistent file base commits",
+            ));
+        }
+    }
+    if !application.base_commit.eq_ignore_ascii_case(expected_base) {
+        return Err(checkpoint_recovery_evidence_error(
+            job,
+            "the prepared checkpoint base does not match the frozen request",
+        ));
+    }
+    if let Some(checkpoint) = &application.checkpoint {
+        if checkpoint.trace_id.as_deref() != Some(request.trace_id.as_str()) {
+            return Err(checkpoint_recovery_evidence_error(
+                job,
+                "the prepared checkpoint trace id does not match the frozen request",
+            ));
+        }
+        if checkpoint.entries.iter().any(|entry| {
+            entry.blob_sha.len() != 64
+                || !entry
+                    .blob_sha
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        }) {
+            return Err(checkpoint_recovery_evidence_error(
+                job,
+                "the prepared checkpoint contains an invalid content-addressed blob reference",
+            ));
+        }
+    }
+    Ok(application)
+}
+
+fn checkpoint_recovery_evidence_error(
+    job: &crate::metrics::deferred_checkpoint_jobs::ClaimedDeferredCheckpointJob,
+    reason: impl std::fmt::Display,
+) -> GitAiError {
+    GitAiError::EvidenceError(format!(
+        "durable checkpoint {} cannot be replayed safely because {}; original evidence is preserved. Stop the background service, then run `git-ai repair checkpoint-baseline --job-key {}` to preview the evidence backup and FIFO reset",
+        job.job_key, reason, job.job_key
+    ))
+}
+
+fn validate_durable_checkpoint_recovery_base(
+    job: &crate::metrics::deferred_checkpoint_jobs::ClaimedDeferredCheckpointJob,
+    request: &CheckpointRequest,
+) -> Result<(), GitAiError> {
+    use crate::commands::checkpoint_agent::orchestrator::BaseCommit;
+
+    let mut expected_by_worktree: BTreeMap<String, &BaseCommit> = BTreeMap::new();
+    for file in &request.files {
+        let worktree = worktree_root_for_path(&file.repo_work_dir)
+            .unwrap_or_else(|| file.repo_work_dir.clone());
+        let worktree_key = worktree
+            .canonicalize()
+            .unwrap_or(worktree)
+            .to_string_lossy()
+            .to_string();
+        if let Some(existing) = expected_by_worktree.get(&worktree_key) {
+            let same = match (*existing, &file.base_commit) {
+                (BaseCommit::Initial, BaseCommit::Initial) => true,
+                (BaseCommit::Sha(left), BaseCommit::Sha(right)) => left.eq_ignore_ascii_case(right),
+                _ => false,
+            };
+            if !same {
+                return Err(checkpoint_recovery_evidence_error(
+                    job,
+                    format!(
+                        "the frozen request contains conflicting base commits for worktree {worktree_key}"
+                    ),
+                ));
+            }
+        } else {
+            expected_by_worktree.insert(worktree_key, &file.base_commit);
+        }
+    }
+
+    for (worktree, expected) in expected_by_worktree {
+        let head_state = read_head_state_for_worktree(Path::new(&worktree)).ok_or_else(|| {
+            checkpoint_recovery_evidence_error(
+                job,
+                format!("the current HEAD for worktree {worktree} cannot be verified"),
+            )
+        })?;
+        let matches = match (expected, head_state.head.as_deref()) {
+            (BaseCommit::Initial, None) => true,
+            (BaseCommit::Sha(expected), Some(current)) => expected.eq_ignore_ascii_case(current),
+            _ => false,
+        };
+        if !matches {
+            let expected = match expected {
+                BaseCommit::Initial => "INITIAL".to_string(),
+                BaseCommit::Sha(sha) => sha.clone(),
+            };
+            let current = head_state.head.unwrap_or_else(|| "INITIAL".to_string());
+            return Err(checkpoint_recovery_evidence_error(
+                job,
+                format!(
+                    "the frozen base commit {expected} does not match current HEAD {current} for worktree {worktree}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn durable_checkpoint_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn durable_agent_usage_candidate(
+    request: &CheckpointRequest,
+    context: &crate::daemon::checkpoint::FrozenCheckpointMetricsContext,
+    observed_at_ms: u64,
+) -> Option<crate::metrics::deferred_checkpoint_jobs::AgentUsageCandidate> {
+    use crate::metrics::PosEncoded;
+
+    let agent = request
+        .checkpoint_kind
+        .is_ai()
+        .then(|| request.agent_id.as_ref())
+        .flatten()?;
+    let attrs = crate::daemon::checkpoint::build_agent_usage_attrs_from_frozen(context, agent);
+    let event = crate::metrics::MetricEvent::from_values_with_timestamp(
+        crate::metrics::AgentUsageValues::new(),
+        attrs.to_sparse(),
+        Some((observed_at_ms / 1000).min(u64::from(u32::MAX)) as u32),
+    );
+    Some(
+        crate::metrics::deferred_checkpoint_jobs::AgentUsageCandidate {
+            prompt_id: crate::authorship::authorship_log_serialization::generate_short_hash(
+                &agent.id,
+                &agent.tool,
+            ),
+            min_interval_secs: crate::daemon::checkpoint::AGENT_USAGE_MIN_INTERVAL_SECS,
+            observed_at_secs: observed_at_ms / 1000,
+            event,
+        },
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn durable_agent_usage_candidate(
+    _request: &CheckpointRequest,
+    _context: &crate::daemon::checkpoint::FrozenCheckpointMetricsContext,
+    _observed_at_ms: u64,
+) -> Option<crate::metrics::deferred_checkpoint_jobs::AgentUsageCandidate> {
+    None
 }
 
 fn compute_watermarks_from_stat(
@@ -1211,7 +1668,7 @@ fn remove_working_log_attributions_for_pathspecs(
 ) -> Result<(), GitAiError> {
     let working_log = repository.storage.working_log_for_base_commit(head)?;
 
-    let initial = working_log.read_initial_attributions();
+    let initial = working_log.read_initial_attributions()?;
     if !initial.files.is_empty() {
         let filtered_files = initial
             .files
@@ -2449,7 +2906,18 @@ enum FamilySequencerEntry {
         request: Box<CheckpointRequest>,
         respond_to: Option<oneshot::Sender<Result<u64, GitAiError>>>,
     },
+    DeferredCheckpointRecovery {
+        request: crate::metrics::deferred_checkpoint_jobs::DeferredCheckpointRecoveryRequest,
+        preflight_evidence_error: Option<String>,
+        respond_to: oneshot::Sender<Result<u64, GitAiError>>,
+    },
     Canceled,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DeferredCheckpointRecoverySummary {
+    completed: usize,
+    failed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2558,6 +3026,9 @@ pub struct ActorDaemonCoordinator {
         Mutex<HashMap<String, VecDeque<RecentReplayPrerequisite>>>,
     side_effect_errors_by_family: Mutex<HashMap<String, BTreeMap<u64, String>>>,
     side_effect_exec_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    checkpoint_recovery_owner: String,
+    checkpoint_recovery_pass_lock: AsyncMutex<()>,
+    scheduled_checkpoint_recovery_jobs: Mutex<HashSet<String>>,
     bash_sessions: Mutex<crate::daemon::bash_sessions::BashSessionState>,
     test_completion_log_dir: Option<PathBuf>,
     test_completion_log_lock: Mutex<()>,
@@ -2642,6 +3113,9 @@ impl ActorDaemonCoordinator {
             recent_replay_prerequisites_by_family: Mutex::new(HashMap::new()),
             side_effect_errors_by_family: Mutex::new(HashMap::new()),
             side_effect_exec_locks: Mutex::new(HashMap::new()),
+            checkpoint_recovery_owner: crate::uuid::generate_v4(),
+            checkpoint_recovery_pass_lock: AsyncMutex::new(()),
+            scheduled_checkpoint_recovery_jobs: Mutex::new(HashSet::new()),
             bash_sessions: Mutex::new(crate::daemon::bash_sessions::BashSessionState::new()),
             test_completion_log_dir: std::env::var("GIT_AI_TEST_DB_PATH")
                 .ok()
@@ -3563,8 +4037,14 @@ impl ActorDaemonCoordinator {
     }
 
     fn has_open_trace_roots_that_may_mutate_refs(&self) -> bool {
-        let Ok(ingress) = self.trace_ingress_state.lock() else {
-            return false;
+        let ingress = match self.trace_ingress_state.lock() {
+            Ok(ingress) => ingress,
+            Err(_) => {
+                tracing::error!(
+                    "trace ingress state lock is poisoned; treating daemon work as pending"
+                );
+                return true;
+            }
         };
         ingress.root_open_connections.iter().any(|(root, count)| {
             *count > 0
@@ -4091,6 +4571,193 @@ impl ActorDaemonCoordinator {
             .await
     }
 
+    async fn append_deferred_checkpoint_recovery_to_family_sequencer(
+        &self,
+        family: &str,
+        request: crate::metrics::deferred_checkpoint_jobs::DeferredCheckpointRecoveryRequest,
+        preflight_evidence_error: Option<String>,
+        respond_to: oneshot::Sender<Result<u64, GitAiError>>,
+    ) -> Result<(), GitAiError> {
+        // Recovery observes the same causal trace fence as a live checkpoint.
+        self.wait_for_trace_ingest_processed_through().await;
+
+        let exec_lock = self.side_effect_exec_lock(family)?;
+        let _guard = exec_lock.lock().await;
+        {
+            let mut sequencers = self.family_sequencers_by_family.lock().map_err(|_| {
+                GitAiError::Generic("family sequencer map lock poisoned".to_string())
+            })?;
+            let state =
+                sequencers
+                    .entry(family.to_string())
+                    .or_insert_with(|| FamilySequencerState {
+                        next_ordinal: 1,
+                        entries: BTreeMap::new(),
+                    });
+            let order = FamilySequencerOrder {
+                started_at_ns: now_unix_nanos(),
+                ordinal: state.next_ordinal,
+            };
+            state.next_ordinal = state.next_ordinal.saturating_add(1);
+            state.entries.insert(
+                order,
+                FamilySequencerEntry::DeferredCheckpointRecovery {
+                    request,
+                    preflight_evidence_error,
+                    respond_to,
+                },
+            );
+        }
+        self.drain_ready_family_sequencer_entries_locked(family)
+            .await
+    }
+
+    fn mark_checkpoint_recovery_scheduled(&self, job_key: &str) -> Result<bool, GitAiError> {
+        let mut scheduled = self
+            .scheduled_checkpoint_recovery_jobs
+            .lock()
+            .map_err(|_| {
+                GitAiError::Generic("checkpoint recovery schedule lock poisoned".to_string())
+            })?;
+        Ok(scheduled.insert(job_key.to_string()))
+    }
+
+    fn clear_checkpoint_recovery_scheduled(&self, job_key: &str) {
+        if let Ok(mut scheduled) = self.scheduled_checkpoint_recovery_jobs.lock() {
+            scheduled.remove(job_key);
+        }
+    }
+
+    async fn recover_deferred_checkpoint_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<DeferredCheckpointRecoverySummary, GitAiError> {
+        const RECOVERY_SCAN_BATCH: usize = 64;
+
+        if limit == 0 {
+            return Ok(DeferredCheckpointRecoverySummary::default());
+        }
+        let _pass_guard = self.checkpoint_recovery_pass_lock.lock().await;
+        crate::metrics::deferred_checkpoint_jobs::compact_done_jobs();
+
+        let mut summary = DeferredCheckpointRecoverySummary::default();
+        let mut attempted = 0usize;
+        while attempted < limit {
+            let remaining = limit.saturating_sub(attempted);
+            let due = crate::metrics::deferred_checkpoint_jobs::due_recovery_requests(
+                remaining.min(RECOVERY_SCAN_BATCH),
+                &self.checkpoint_recovery_owner,
+            )?;
+            if due.is_empty() {
+                break;
+            }
+
+            let mut made_progress = false;
+            for recovery in due {
+                if attempted >= limit {
+                    continue;
+                }
+                let (family, preflight_evidence_error) = if recovery.working_log_applied {
+                    // Repository publication is already durable. Recovery now owns
+                    // only the SQLite outbox+done transaction, so repository/HEAD
+                    // discovery is neither necessary nor safe as a completion gate.
+                    (
+                        format!("applied-checkpoint-recovery:{}", recovery.repo_identity),
+                        None,
+                    )
+                } else {
+                    let recovery_path = Path::new(&recovery.repository_workdir);
+                    let route = discover_repository_in_path_no_git_exec(recovery_path).and_then(
+                        |repo| {
+                            let actual_identity =
+                                crate::metrics::deferred_checkpoint_jobs::repository_identity(
+                                    repo.common_dir(),
+                                );
+                            if actual_identity != recovery.repo_identity {
+                                return Err(GitAiError::EvidenceError(format!(
+                                    "the repository identity at {} no longer matches the frozen recovery request",
+                                    recovery.repository_workdir
+                                )));
+                            }
+                            self.backend.resolve_family(recovery_path)
+                        },
+                    );
+                    match route {
+                        Ok(family) => (family.0, None),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                job_key = %recovery.job_key,
+                                "durable checkpoint recovery repository evidence cannot be resolved"
+                            );
+                            (
+                                format!("blocked-checkpoint-recovery:{}", recovery.repo_identity),
+                                Some(format!(
+                                    "the frozen repository path {} cannot be resolved and verified during recovery: {error}",
+                                    recovery.repository_workdir
+                                )),
+                            )
+                        }
+                    }
+                };
+                if !self.mark_checkpoint_recovery_scheduled(&recovery.job_key)? {
+                    continue;
+                }
+
+                let job_key = recovery.job_key.clone();
+                let (respond_to, response) = oneshot::channel();
+                if let Err(error) = self
+                    .append_deferred_checkpoint_recovery_to_family_sequencer(
+                        &family,
+                        recovery,
+                        preflight_evidence_error,
+                        respond_to,
+                    )
+                    .await
+                {
+                    self.clear_checkpoint_recovery_scheduled(&job_key);
+                    return Err(error);
+                }
+
+                attempted = attempted.saturating_add(1);
+                made_progress = true;
+                match response.await {
+                    Ok(Ok(_)) => summary.completed = summary.completed.saturating_add(1),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, %job_key, "durable checkpoint recovery failed");
+                        summary.failed = summary.failed.saturating_add(1);
+                    }
+                    Err(_) => {
+                        return Err(GitAiError::Generic(format!(
+                            "durable checkpoint recovery response channel closed for {job_key}"
+                        )));
+                    }
+                }
+            }
+            if !made_progress {
+                break;
+            }
+        }
+        Ok(summary)
+    }
+
+    fn start_deferred_checkpoint_recovery_worker(self: &Arc<Self>) {
+        const RECOVERY_INTERVAL: Duration = Duration::from_secs(3);
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(RECOVERY_INTERVAL) => {
+                        if let Err(error) = coordinator.recover_deferred_checkpoint_jobs(1).await {
+                            tracing::warn!(%error, "periodic durable checkpoint recovery failed");
+                        }
+                    }
+                    _ = coordinator.wait_for_shutdown() => break,
+                }
+            }
+        });
+    }
+
     async fn drain_ready_family_sequencer_entries_locked(
         &self,
         family: &str,
@@ -4303,19 +4970,38 @@ impl ActorDaemonCoordinator {
                     let should_log_completion = true; // Always log for test sync
                     tracing::info!(kind = %checkpoint_kind_str, repo = %repo_wd, "checkpoint start");
                     let checkpoint_start = std::time::Instant::now();
+                    let durable_job_key =
+                        crate::metrics::deferred_checkpoint_jobs::job_key_from_trace_id(
+                            &request.trace_id,
+                        )
+                        .map(ToString::to_string);
                     let checkpoint_request = {
                         let future = async {
                             if !repo_wd.is_empty() {
                                 let ack =
                                     self.coordinator.apply_checkpoint(Path::new(&repo_wd)).await;
                                 match ack {
-                                    Ok(ack) => {
-                                        apply_checkpoint_side_effect(*request).map(|_| ack.seq)
-                                    }
+                                    Ok(ack) => match durable_job_key.as_deref() {
+                                        Some(job_key) => crate::metrics::deferred_checkpoint_jobs::process_specific_job(
+                                            job_key,
+                                            crate::metrics::deferred_checkpoint_jobs::DeferredCheckpointJobExecution::Live {
+                                                admission_owner: &self.checkpoint_recovery_owner,
+                                            },
+                                        ).map(|_| ack.seq),
+                                        None => apply_checkpoint_side_effect(*request).map(|_| ack.seq),
+                                    },
                                     Err(error) => Err(error),
                                 }
                             } else {
-                                apply_checkpoint_side_effect(*request).map(|_| 0)
+                                match durable_job_key.as_deref() {
+                                    Some(job_key) => crate::metrics::deferred_checkpoint_jobs::process_specific_job(
+                                        job_key,
+                                        crate::metrics::deferred_checkpoint_jobs::DeferredCheckpointJobExecution::Live {
+                                            admission_owner: &self.checkpoint_recovery_owner,
+                                        },
+                                    ).map(|_| 0),
+                                    None => apply_checkpoint_side_effect(*request).map(|_| 0),
+                                }
                             }
                         };
                         let caught = std::panic::AssertUnwindSafe(future);
@@ -4348,6 +5034,20 @@ impl ActorDaemonCoordinator {
                         }
                     };
                     let checkpoint_duration_ms = checkpoint_start.elapsed().as_millis();
+                    if result.is_err()
+                        && let Some(job_key) = durable_job_key.as_deref()
+                        && let Err(error) =
+                            crate::metrics::deferred_checkpoint_jobs::release_admission_owner(
+                                job_key,
+                                &self.checkpoint_recovery_owner,
+                            )
+                    {
+                        tracing::error!(
+                            %error,
+                            %job_key,
+                            "failed to release durable checkpoint admission ownership after live family failure"
+                        );
+                    }
                     if result.is_ok() {
                         tracing::info!(
                             kind = %checkpoint_kind_str,
@@ -4441,6 +5141,67 @@ impl ActorDaemonCoordinator {
                     if let Some(respond_to) = respond_to {
                         let _ = respond_to.send(result);
                     }
+                }
+                FamilySequencerEntry::DeferredCheckpointRecovery {
+                    request,
+                    preflight_evidence_error,
+                    respond_to,
+                } => {
+                    let job_key = request.job_key.clone();
+                    let recovery = {
+                        let future = async {
+                            let preflight_evidence_error = preflight_evidence_error.as_deref();
+                            let ack = if request.working_log_applied {
+                                None
+                            } else if preflight_evidence_error.is_none() {
+                                Some(
+                                    self.coordinator
+                                        .apply_checkpoint_family(
+                                            crate::daemon::domain::FamilyKey::new(family),
+                                        )
+                                        .await?,
+                                )
+                            } else {
+                                None
+                            };
+                            crate::metrics::deferred_checkpoint_jobs::process_specific_job(
+                                &job_key,
+                                crate::metrics::deferred_checkpoint_jobs::DeferredCheckpointJobExecution::Recovery {
+                                    preflight_evidence_error,
+                                },
+                            )?;
+                            Ok::<u64, GitAiError>(ack.map_or(0, |ack| ack.seq))
+                        };
+                        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(future)).await
+                    };
+                    let result = match recovery {
+                        Ok(result) => result,
+                        Err(panic_payload) => {
+                            let panic_msg =
+                                if let Some(message) = panic_payload.downcast_ref::<String>() {
+                                    message.clone()
+                                } else if let Some(message) = panic_payload.downcast_ref::<&str>() {
+                                    (*message).to_string()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                            Err(GitAiError::Generic(format!(
+                                "daemon checkpoint recovery panic: {panic_msg}"
+                            )))
+                        }
+                    };
+                    self.clear_checkpoint_recovery_scheduled(&job_key);
+                    if let Err(error) = &result {
+                        let _ = self.record_side_effect_error(family, order, error);
+                        tracing::error!(
+                            %error,
+                            %family,
+                            %job_key,
+                            order,
+                            "durable checkpoint recovery side effect failed"
+                        );
+                    }
+                    let _ = respond_to.send(result);
                 }
                 FamilySequencerEntry::Canceled => {}
                 FamilySequencerEntry::PendingRoot => {}
@@ -6007,7 +6768,28 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn ingest_checkpoint_payload(
+        &self,
+        mut request: CheckpointRequest,
+    ) -> Result<ControlResponse, GitAiError> {
+        let durable_job_key = crate::metrics::deferred_checkpoint_jobs::enqueue_request(
+            &mut request,
+            &self.checkpoint_recovery_owner,
+        )?;
+        let result = self.ingest_admitted_checkpoint_payload(request).await;
+        if result.is_err()
+            && let Some(job_key) = durable_job_key.as_deref()
+        {
+            crate::metrics::deferred_checkpoint_jobs::release_admission_owner(
+                job_key,
+                &self.checkpoint_recovery_owner,
+            )?;
+        }
+        result
+    }
+
+    async fn ingest_admitted_checkpoint_payload(
         &self,
         request: CheckpointRequest,
     ) -> Result<ControlResponse, GitAiError> {
@@ -6086,6 +6868,9 @@ impl ActorDaemonCoordinator {
             timed_out: false,
             metrics_remaining: 0,
             notes_remaining: 0,
+            blocked_checkpoints: 0,
+            blocked_checkpoint_reasons: Vec::new(),
+            phase_error: None,
         };
 
         let mut maybe_log = |phase: &str| {
@@ -6145,7 +6930,57 @@ impl ActorDaemonCoordinator {
             result.timed_out = true;
         }
 
-        // Phase 2: drain the transcript/stream worker.
+        // Phase 2: actor-owned durable checkpoint recovery. This pass enters
+        // every repository through the same trace fence, family sequencer, and
+        // per-family execution lock as a live checkpoint.
+        if !result.timed_out {
+            let now = Instant::now();
+            if now < deadline {
+                let remaining = deadline - now;
+                maybe_log("durable checkpoint recovery");
+                match timeout(remaining, self.recover_deferred_checkpoint_jobs(usize::MAX)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "await: durable checkpoint recovery failed");
+                        record_await_phase_error(&mut result, "durable checkpoint recovery", error);
+                    }
+                    Err(_) => result.timed_out = true,
+                }
+            } else {
+                result.timed_out = true;
+            }
+        }
+
+        match crate::metrics::deferred_checkpoint_jobs::blocked_jobs() {
+            Ok(blocked) => {
+                result.blocked_checkpoints = blocked.len();
+                result.blocked_checkpoint_reasons = blocked
+                    .iter()
+                    .map(|job| format!("{}: {}", job.job_key, job.reason))
+                    .collect();
+                if !blocked.is_empty() {
+                    let blocked_message = format!(
+                        "{} checkpoint(s) are blocked by unverifiable evidence. Original evidence is preserved. Stop the background service, then run `git-ai repair checkpoint-baseline --job-key <printed-key>` to preview an evidence-backed FIFO reset. {}",
+                        blocked.len(),
+                        result.blocked_checkpoint_reasons.join(" | ")
+                    );
+                    record_await_phase_error(
+                        &mut result,
+                        "durable checkpoint recovery",
+                        blocked_message,
+                    );
+                }
+            }
+            Err(error) => {
+                record_await_phase_error(
+                    &mut result,
+                    "durable checkpoint blocked-evidence query",
+                    error,
+                );
+            }
+        }
+
+        // Phase 3: drain the transcript/stream worker.
         if !result.timed_out
             && let Some(worker) = &self.stream_worker
         {
@@ -6157,6 +6992,7 @@ impl ActorDaemonCoordinator {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "await: transcript drain failed");
+                        record_await_phase_error(&mut result, "transcript processing", e);
                     }
                     Err(_) => {
                         result.timed_out = true;
@@ -6167,7 +7003,7 @@ impl ActorDaemonCoordinator {
             }
         }
 
-        // Phase 3: flush telemetry and wait for the worker to finish.
+        // Phase 4: flush telemetry and wait for the worker to finish.
         if !result.timed_out
             && let Some(worker) = &self.telemetry_worker
         {
@@ -6182,6 +7018,7 @@ impl ActorDaemonCoordinator {
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "await: telemetry flush failed");
+                        record_await_phase_error(&mut result, "telemetry flush", e);
                     }
                     Err(_) => {
                         result.timed_out = true;
@@ -6192,10 +7029,7 @@ impl ActorDaemonCoordinator {
             }
         }
 
-        result.done = !result.timed_out
-            && result.metrics_remaining == 0
-            && result.notes_remaining == 0
-            && !self.has_pending_daemon_work();
+        result.done = await_result_is_done(&result, self.has_pending_daemon_work());
         result
     }
 
@@ -6211,16 +7045,29 @@ impl ActorDaemonCoordinator {
         if self.has_open_trace_roots_that_may_mutate_refs() {
             return true;
         }
-        if let Ok(map) = self.inflight_effects_by_family.lock()
-            && !map.is_empty()
-        {
-            return true;
+        match self.inflight_effects_by_family.lock() {
+            Ok(map) if !map.is_empty() => return true,
+            Ok(_) => {}
+            Err(_) => {
+                tracing::error!(
+                    "inflight family state lock is poisoned; treating daemon work as pending"
+                );
+                return true;
+            }
         }
-        if let Ok(map) = self.family_sequencers_by_family.lock() {
-            for state in map.values() {
-                if !state.entries.is_empty() {
-                    return true;
+        match self.family_sequencers_by_family.lock() {
+            Ok(map) => {
+                for state in map.values() {
+                    if !state.entries.is_empty() {
+                        return true;
+                    }
                 }
+            }
+            Err(_) => {
+                tracing::error!(
+                    "family sequencer state lock is poisoned; treating daemon work as pending"
+                );
+                return true;
             }
         }
         false
@@ -6230,6 +7077,15 @@ impl ActorDaemonCoordinator {
         let result = match request {
             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
             ControlRequest::CheckpointRun { request } => {
+                let mut request = *request;
+                let durable_job_key =
+                    match crate::metrics::deferred_checkpoint_jobs::enqueue_request(
+                        &mut request,
+                        &self.checkpoint_recovery_owner,
+                    ) {
+                        Ok(job_key) => job_key,
+                        Err(error) => return ControlResponse::err(error.to_string()),
+                    };
                 let stream_notification = request.stream_source.as_ref().map(|stream_source| {
                     let tool = request
                         .agent_id
@@ -6251,7 +7107,19 @@ impl ActorDaemonCoordinator {
                 // Persist checkpoint metrics before the transcript worker can emit
                 // session/token events. Backends can then deterministically enrich
                 // those later events from checkpoint context (Kilo IDE/runtime data).
-                let result = self.ingest_checkpoint_payload(*request).await;
+                let result = self.ingest_admitted_checkpoint_payload(request).await;
+                if result.is_err()
+                    && let Some(job_key) = durable_job_key.as_deref()
+                    && let Err(error) =
+                        crate::metrics::deferred_checkpoint_jobs::release_admission_owner(
+                            job_key,
+                            &self.checkpoint_recovery_owner,
+                        )
+                {
+                    return ControlResponse::err(format!(
+                        "failed to release durable checkpoint admission after family handoff failure: {error}"
+                    ));
+                }
                 if result.is_ok()
                     && let Some(worker) = &self.stream_worker
                     && let Some((
@@ -7551,6 +8419,17 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
 
     let coordinator = Arc::new(coordinator_inner);
     coordinator.start_trace_ingest_worker()?;
+    let startup_recovery = coordinator
+        .recover_deferred_checkpoint_jobs(usize::MAX)
+        .await?;
+    if startup_recovery.completed > 0 || startup_recovery.failed > 0 {
+        tracing::info!(
+            completed = startup_recovery.completed,
+            failed = startup_recovery.failed,
+            "startup durable checkpoint recovery pass finished"
+        );
+    }
+    coordinator.start_deferred_checkpoint_recovery_worker();
     let rt_handle = tokio::runtime::Handle::current();
     let control_socket_path = config.control_socket_path.clone();
     let trace_socket_path = config.trace_socket_path.clone();
@@ -8047,6 +8926,66 @@ mod tests {
     use std::ffi::OsString;
     use std::io::Write;
 
+    #[test]
+    fn await_phase_errors_are_accumulated_and_prevent_false_completion() {
+        let mut result = AwaitResult {
+            done: false,
+            timed_out: false,
+            metrics_remaining: 0,
+            notes_remaining: 0,
+            blocked_checkpoints: 0,
+            blocked_checkpoint_reasons: Vec::new(),
+            phase_error: None,
+        };
+
+        record_await_phase_error(&mut result, "transcript processing", "drain failed");
+        record_await_phase_error(&mut result, "telemetry flush", "worker cancelled");
+
+        let error = result.phase_error.as_deref().unwrap();
+        assert!(error.contains("transcript processing: drain failed"));
+        assert!(error.contains("telemetry flush: worker cancelled"));
+        assert!(!await_result_is_done(&result, false));
+
+        result.phase_error = None;
+        result.blocked_checkpoints = 1;
+        result.blocked_checkpoint_reasons = vec![
+            "checkpoint-job: Evidence error; back up then reset baseline manually".to_string(),
+        ];
+        assert!(
+            !await_result_is_done(&result, false),
+            "blocked checkpoint evidence must never be reported as successful await completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_trace_ingress_state_is_treated_as_pending_work() {
+        let coordinator = std::sync::Arc::new(ActorDaemonCoordinator::new());
+        let thread_coordinator = std::sync::Arc::clone(&coordinator);
+        let _ = std::thread::spawn(move || {
+            let _guard = thread_coordinator.trace_ingress_state.lock().unwrap();
+            panic!("poison trace ingress state");
+        })
+        .join();
+
+        assert!(coordinator.has_open_trace_roots_that_may_mutate_refs());
+    }
+
+    #[tokio::test]
+    async fn poisoned_family_work_state_is_treated_as_pending_work() {
+        let coordinator = std::sync::Arc::new(ActorDaemonCoordinator::new());
+        let thread_coordinator = std::sync::Arc::clone(&coordinator);
+        let _ = std::thread::spawn(move || {
+            let _guard = thread_coordinator
+                .inflight_effects_by_family
+                .lock()
+                .unwrap();
+            panic!("poison inflight family state");
+        })
+        .join();
+
+        assert!(coordinator.has_pending_daemon_work());
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         original: Option<OsString>,
@@ -8145,6 +9084,755 @@ mod tests {
             .expect("git stdout should be utf8")
             .trim()
             .to_string()
+    }
+
+    fn durable_recovery_test_job(
+        repo_path: &Path,
+        base_commit: crate::commands::checkpoint_agent::orchestrator::BaseCommit,
+    ) -> (
+        crate::metrics::deferred_checkpoint_jobs::ClaimedDeferredCheckpointJob,
+        CheckpointRequest,
+    ) {
+        use crate::authorship::working_log::AgentId;
+        use crate::commands::checkpoint_agent::orchestrator::CheckpointFile;
+
+        let discovered = discover_repository_in_path_no_git_exec(repo_path).unwrap();
+        let job_key = "a".repeat(64);
+        let request = CheckpointRequest {
+            trace_id: format!(
+                "{}{}",
+                crate::metrics::deferred_checkpoint_jobs::JOB_TRACE_PREFIX,
+                job_key
+            ),
+            checkpoint_kind: CheckpointKind::AiAgent,
+            agent_id: Some(AgentId {
+                tool: "opencode".to_string(),
+                id: "session".to_string(),
+                model: "test".to_string(),
+            }),
+            files: vec![CheckpointFile {
+                path: PathBuf::from("test.txt"),
+                content: Some("frozen checkpoint content\n".to_string()),
+                repo_work_dir: repo_path.to_path_buf(),
+                base_commit,
+            }],
+            path_role: PreparedPathRole::Edited,
+            stream_source: None,
+            metadata: HashMap::new(),
+        };
+        let context = crate::daemon::checkpoint::FrozenCheckpointMetricsContext {
+            git_ai_version: "test".to_string(),
+            custom_attributes: HashMap::new(),
+            repo_url: None,
+            branch: None,
+            author: "Recovery Test <recovery@example.com>".to_string(),
+        };
+        let job = crate::metrics::deferred_checkpoint_jobs::ClaimedDeferredCheckpointJob {
+            id: 1,
+            job_key,
+            lease_token: "test-lease".to_string(),
+            repo_identity: crate::metrics::deferred_checkpoint_jobs::repository_identity(
+                discovered.common_dir(),
+            ),
+            repository_workdir: repo_path.to_string_lossy().to_string(),
+            request_json: serde_json::to_string(&request).unwrap(),
+            metrics_context_json: serde_json::to_string(&context).unwrap(),
+            observed_at_ms: 1,
+            prepared_checkpoint_json: None,
+            prepared_metric_events_json: None,
+            working_log_applied: false,
+            attempts: 1,
+        };
+        (job, request)
+    }
+
+    fn test_directory_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn visit(root: &Path, current: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            let Ok(children) = std::fs::read_dir(current) else {
+                return;
+            };
+            for child in children.flatten() {
+                let path = child.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    entries.push((relative, None));
+                    visit(root, &path, entries);
+                } else {
+                    entries.push((relative, std::fs::read(&path).ok()));
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    #[test]
+    fn durable_recovery_accepts_frozen_base_only_while_head_is_current() {
+        use crate::commands::checkpoint_agent::orchestrator::BaseCommit;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        run_git_for_test(&repo_path, &["init"]);
+        run_git_for_test(&repo_path, &["config", "user.name", "Test User"]);
+        run_git_for_test(&repo_path, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo_path.join("test.txt"), "base\n").unwrap();
+        run_git_for_test(&repo_path, &["add", "test.txt"]);
+        run_git_for_test(&repo_path, &["commit", "-m", "base"]);
+        let frozen_head = run_git_for_test(&repo_path, &["rev-parse", "HEAD"]);
+        let (job, request) = durable_recovery_test_job(&repo_path, BaseCommit::Sha(frozen_head));
+
+        validate_durable_checkpoint_recovery_base(&job, &request)
+            .expect("an unchanged frozen base must be recoverable");
+    }
+
+    #[test]
+    fn durable_recovery_blocks_moved_base_before_writing_checkpoint_evidence() {
+        use crate::commands::checkpoint_agent::orchestrator::BaseCommit;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        run_git_for_test(&repo_path, &["init"]);
+        run_git_for_test(&repo_path, &["config", "user.name", "Test User"]);
+        run_git_for_test(&repo_path, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo_path.join("test.txt"), "base\n").unwrap();
+        run_git_for_test(&repo_path, &["add", "test.txt"]);
+        run_git_for_test(&repo_path, &["commit", "-m", "base"]);
+        let frozen_head = run_git_for_test(&repo_path, &["rev-parse", "HEAD"]);
+        let (job, _) = durable_recovery_test_job(&repo_path, BaseCommit::Sha(frozen_head));
+
+        std::fs::write(repo_path.join("test.txt"), "moved\n").unwrap();
+        run_git_for_test(&repo_path, &["add", "test.txt"]);
+        run_git_for_test(&repo_path, &["commit", "-m", "moved"]);
+        let ai_dir = repo_path.join(".git").join("ai");
+        let evidence_before = test_directory_snapshot(&ai_dir);
+
+        let error = process_claimed_durable_checkpoint_job(&job, true).unwrap_err();
+        assert!(matches!(error, GitAiError::EvidenceError(_)));
+        assert!(error.to_string().contains("current HEAD"));
+        assert_eq!(
+            test_directory_snapshot(&ai_dir),
+            evidence_before,
+            "base mismatch must block before any working-log side effect"
+        );
+    }
+
+    #[test]
+    fn durable_recovery_classifies_repository_disappearance_as_evidence_failure() {
+        use crate::commands::checkpoint_agent::orchestrator::BaseCommit;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        run_git_for_test(&repo_path, &["init"]);
+        let (job, _) = durable_recovery_test_job(&repo_path, BaseCommit::Initial);
+        std::fs::rename(&repo_path, temp.path().join("repo-moved")).unwrap();
+
+        let error = process_claimed_durable_checkpoint_job(&job, true).unwrap_err();
+        assert!(matches!(error, GitAiError::EvidenceError(_)));
+        assert!(
+            error.to_string().contains("can no longer be resolved"),
+            "unexpected recovery error: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("git-ai repair checkpoint-baseline --job-key")
+        );
+    }
+
+    #[test]
+    fn already_applied_recovery_finalizes_after_head_moves_or_repository_disappears() {
+        use crate::commands::checkpoint_agent::orchestrator::BaseCommit;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        run_git_for_test(&repo_path, &["init"]);
+        run_git_for_test(&repo_path, &["config", "user.name", "Test User"]);
+        run_git_for_test(&repo_path, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo_path.join("test.txt"), "base\n").unwrap();
+        run_git_for_test(&repo_path, &["add", "test.txt"]);
+        run_git_for_test(&repo_path, &["commit", "-m", "base"]);
+        let frozen_head = run_git_for_test(&repo_path, &["rev-parse", "HEAD"]);
+        let (mut job, _) =
+            durable_recovery_test_job(&repo_path, BaseCommit::Sha(frozen_head.clone()));
+        job.prepared_checkpoint_json = Some(
+            serde_json::to_string(&crate::daemon::checkpoint::PreparedCheckpointApplication {
+                base_commit: frozen_head,
+                checkpoint: None,
+            })
+            .unwrap(),
+        );
+        job.prepared_metric_events_json = Some("[]".to_string());
+        job.working_log_applied = true;
+
+        std::fs::write(repo_path.join("test.txt"), "moved\n").unwrap();
+        run_git_for_test(&repo_path, &["add", "test.txt"]);
+        run_git_for_test(&repo_path, &["commit", "-m", "moved"]);
+
+        let mut finalized_after_head_move = false;
+        process_claimed_durable_checkpoint_job_with_finalize(&job, true, |_| {
+            finalized_after_head_move = true;
+            Ok(true)
+        })
+        .expect("an already-applied checkpoint must finalize despite later HEAD movement");
+        assert!(finalized_after_head_move);
+
+        std::fs::rename(&repo_path, temp.path().join("repo-removed")).unwrap();
+        let mut finalized_without_repo = false;
+        process_claimed_durable_checkpoint_job_with_finalize(&job, true, |_| {
+            finalized_without_repo = true;
+            Ok(true)
+        })
+        .expect("an already-applied checkpoint must finalize without repository discovery");
+        assert!(finalized_without_repo);
+    }
+
+    #[test]
+    fn actor_recovery_finalizes_applied_job_without_repo_and_blocks_unapplied_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let metrics_db = temp.path().join("actor-recovery-metrics.db");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "daemon::tests::actor_recovery_missing_repo_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GIT_AI_ACTOR_RECOVERY_CHILD", "1")
+            .env("GIT_AI_TEST_METRICS_DB_PATH", &metrics_db)
+            .output()
+            .expect("spawn isolated actor recovery child test");
+        assert!(
+            output.status.success(),
+            "isolated actor recovery child failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "run in an isolated child process by actor_recovery_finalizes_applied_job_without_repo_and_blocks_unapplied_job"]
+    fn actor_recovery_missing_repo_child() {
+        if std::env::var_os("GIT_AI_ACTOR_RECOVERY_CHILD").is_none() {
+            return;
+        }
+
+        use crate::authorship::working_log::AgentId;
+        use crate::commands::checkpoint_agent::orchestrator::{BaseCommit, CheckpointFile};
+        use crate::daemon::checkpoint::PreparedCheckpointApplication;
+        use crate::metrics::MetricEvent;
+        use crate::metrics::types::{MetricEventId, SparseArray};
+
+        fn durable_pre_request(repo_path: &Path, call_id: &str) -> CheckpointRequest {
+            CheckpointRequest {
+                trace_id: format!("actor-recovery-{call_id}"),
+                checkpoint_kind: CheckpointKind::Human,
+                agent_id: Some(AgentId {
+                    tool: "opencode".to_string(),
+                    id: "actor-recovery-session".to_string(),
+                    model: "test".to_string(),
+                }),
+                files: vec![CheckpointFile {
+                    path: PathBuf::from("test.txt"),
+                    content: Some(format!("{call_id}\n")),
+                    repo_work_dir: repo_path.to_path_buf(),
+                    base_commit: BaseCommit::Initial,
+                }],
+                path_role: PreparedPathRole::WillEdit,
+                stream_source: None,
+                metadata: HashMap::from([
+                    ("tool_use_id".to_string(), call_id.to_string()),
+                    ("integration".to_string(), "opencode".to_string()),
+                ]),
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let applied_repo = temp.path().join("applied-repo");
+            let unapplied_repo = temp.path().join("unapplied-repo");
+            for repo in [&applied_repo, &unapplied_repo] {
+                std::fs::create_dir_all(repo).unwrap();
+                run_git_for_test(repo, &["init"]);
+                std::fs::write(repo.join("test.txt"), "initial\n").unwrap();
+            }
+
+            let mut applied_request = durable_pre_request(&applied_repo, "applied-call");
+            let applied_job_key =
+                crate::metrics::deferred_checkpoint_jobs::enqueue_request(
+                    &mut applied_request,
+                    "dead-daemon",
+                )
+                .unwrap()
+                .unwrap();
+            let mut unapplied_request = durable_pre_request(&unapplied_repo, "unapplied-call");
+            let unapplied_job_key =
+                crate::metrics::deferred_checkpoint_jobs::enqueue_request(
+                    &mut unapplied_request,
+                    "dead-daemon",
+                )
+                .unwrap()
+                .unwrap();
+
+            {
+                let db = crate::metrics::db::MetricsDatabase::global().unwrap();
+                let mut db = db.lock().unwrap();
+                let conn = db.deferred_jobs_connection();
+                let claimed =
+                    crate::metrics::deferred_checkpoint_jobs::claim_specific_on_connection(
+                        conn,
+                        &applied_job_key,
+                        100,
+                        60,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let prepared = serde_json::to_string(&PreparedCheckpointApplication {
+                    base_commit: "initial".to_string(),
+                    checkpoint: None,
+                })
+                .unwrap();
+                let event = serde_json::to_string(&MetricEvent {
+                    timestamp: 100,
+                    event_id: MetricEventId::Checkpoint as u16,
+                    instance_id: Some("actor-recovery-applied-metric".to_string()),
+                    values: SparseArray::new(),
+                    attrs: SparseArray::new(),
+                })
+                .unwrap();
+                assert!(
+                    crate::metrics::deferred_checkpoint_jobs::persist_prepared_on_connection(
+                        conn,
+                        &claimed,
+                        &prepared,
+                        &[event],
+                        None,
+                        101,
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    crate::metrics::deferred_checkpoint_jobs::mark_working_log_applied_on_connection(
+                        conn, &claimed, 102,
+                    )
+                    .unwrap()
+                );
+                conn.execute(
+                    "UPDATE deferred_checkpoint_jobs SET processing_started_at = 0 WHERE job_key = ?1",
+                    rusqlite::params![applied_job_key],
+                )
+                .unwrap();
+            }
+
+            std::fs::remove_dir_all(&applied_repo).unwrap();
+            std::fs::remove_dir_all(&unapplied_repo).unwrap();
+
+            let coordinator = Arc::new(ActorDaemonCoordinator::new());
+            let summary = coordinator.recover_deferred_checkpoint_jobs(2).await.unwrap();
+            assert_eq!(summary.completed, 1);
+            assert_eq!(summary.failed, 1);
+
+            let db = crate::metrics::db::MetricsDatabase::global().unwrap();
+            let mut db = db.lock().unwrap();
+            let conn = db.deferred_jobs_connection();
+            let applied_state: (String, i64) = conn
+                .query_row(
+                    "SELECT state, blocked_evidence FROM deferred_checkpoint_jobs WHERE job_key = ?1",
+                    rusqlite::params![applied_job_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(applied_state, ("done".to_string(), 0));
+            let applied_metric_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metrics WHERE event_json LIKE '%actor-recovery-applied-metric%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(applied_metric_count, 1);
+
+            let unapplied_state: (String, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT state, blocked_evidence, blocked_reason FROM deferred_checkpoint_jobs WHERE job_key = ?1",
+                    rusqlite::params![unapplied_job_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(unapplied_state.0, "pending");
+            assert_eq!(unapplied_state.1, 1);
+            assert!(
+                unapplied_state
+                    .2
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("cannot be resolved and verified"))
+            );
+        });
+    }
+
+    #[test]
+    fn expired_processing_recovery_is_fenced_and_stale_preflight_finalizes() {
+        let temp = tempfile::tempdir().unwrap();
+        let metrics_db = temp.path().join("processing-race-metrics.db");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "daemon::tests::expired_processing_recovery_race_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GIT_AI_PROCESSING_RACE_CHILD", "1")
+            .env("GIT_AI_TEST_METRICS_DB_PATH", &metrics_db)
+            .output()
+            .expect("spawn isolated expired-processing recovery child test");
+        assert!(
+            output.status.success(),
+            "isolated expired-processing recovery child failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "run in an isolated child process by expired_processing_recovery_is_fenced_and_stale_preflight_finalizes"]
+    fn expired_processing_recovery_race_child() {
+        if std::env::var_os("GIT_AI_PROCESSING_RACE_CHILD").is_none() {
+            return;
+        }
+
+        use crate::authorship::working_log::AgentId;
+        use crate::commands::checkpoint_agent::orchestrator::{BaseCommit, CheckpointFile};
+        use crate::daemon::checkpoint::PreparedCheckpointApplication;
+        use crate::metrics::MetricEvent;
+        use crate::metrics::types::{MetricEventId, SparseArray};
+
+        fn durable_pre_request(repo_path: &Path, call_id: &str) -> CheckpointRequest {
+            CheckpointRequest {
+                trace_id: format!("processing-race-{call_id}"),
+                checkpoint_kind: CheckpointKind::Human,
+                agent_id: Some(AgentId {
+                    tool: "opencode".to_string(),
+                    id: "processing-race-session".to_string(),
+                    model: "test".to_string(),
+                }),
+                files: vec![CheckpointFile {
+                    path: PathBuf::from("test.txt"),
+                    content: Some(format!("{call_id}\n")),
+                    repo_work_dir: repo_path.to_path_buf(),
+                    base_commit: BaseCommit::Initial,
+                }],
+                path_role: PreparedPathRole::WillEdit,
+                stream_source: None,
+                metadata: HashMap::from([
+                    ("tool_use_id".to_string(), call_id.to_string()),
+                    ("integration".to_string(), "opencode".to_string()),
+                ]),
+            }
+        }
+
+        fn prepared_payload() -> String {
+            serde_json::to_string(&PreparedCheckpointApplication {
+                base_commit: "initial".to_string(),
+                checkpoint: None,
+            })
+            .unwrap()
+        }
+
+        fn metric_event(instance_id: &str) -> String {
+            serde_json::to_string(&MetricEvent {
+                timestamp: 100,
+                event_id: MetricEventId::Checkpoint as u16,
+                instance_id: Some(instance_id.to_string()),
+                values: SparseArray::new(),
+                attrs: SparseArray::new(),
+            })
+            .unwrap()
+        }
+
+        fn create_repo(path: &Path) {
+            std::fs::create_dir_all(path).unwrap();
+            run_git_for_test(path, &["init"]);
+            std::fs::write(path.join("test.txt"), "initial\n").unwrap();
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+
+            // Same-daemon recovery may be routed through a synthetic family
+            // after repository disappearance, but the per-job execution lock
+            // must keep it behind the still-live owner even after lease expiry.
+            let active_repo = temp.path().join("active-repo");
+            create_repo(&active_repo);
+            let mut active_request = durable_pre_request(&active_repo, "active-call");
+            let active_job_key =
+                crate::metrics::deferred_checkpoint_jobs::enqueue_request(
+                    &mut active_request,
+                    "current-daemon",
+                )
+                .unwrap()
+                .unwrap();
+            let active_claimed = {
+                let db = crate::metrics::db::MetricsDatabase::global().unwrap();
+                let mut db = db.lock().unwrap();
+                let conn = db.deferred_jobs_connection();
+                let claimed =
+                    crate::metrics::deferred_checkpoint_jobs::claim_specific_on_connection(
+                        conn,
+                        &active_job_key,
+                        100,
+                        60,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    crate::metrics::deferred_checkpoint_jobs::persist_prepared_on_connection(
+                        conn,
+                        &claimed,
+                        &prepared_payload(),
+                        &[metric_event("active-owner-metric")],
+                        None,
+                        101,
+                    )
+                    .unwrap()
+                );
+                conn.execute(
+                    "UPDATE deferred_checkpoint_jobs SET processing_started_at = 0 WHERE job_key = ?1",
+                    rusqlite::params![active_job_key],
+                )
+                .unwrap();
+                claimed
+            };
+            std::fs::remove_dir_all(&active_repo).unwrap();
+
+            let execution_lock =
+                crate::metrics::deferred_checkpoint_jobs::checkpoint_job_execution_lock(
+                    &active_job_key,
+                )
+                .unwrap();
+            let active_guard = execution_lock.lock().unwrap();
+            let active_coordinator = Arc::new(ActorDaemonCoordinator::new());
+            let recovery_task = {
+                let active_coordinator = active_coordinator.clone();
+                tokio::spawn(async move {
+                    active_coordinator
+                        .recover_deferred_checkpoint_jobs(1)
+                        .await
+                })
+            };
+            let scheduled_deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(2);
+            loop {
+                let scheduled = active_coordinator
+                    .scheduled_checkpoint_recovery_jobs
+                    .lock()
+                    .unwrap()
+                    .contains(&active_job_key);
+                if scheduled {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < scheduled_deadline,
+                    "synthetic recovery did not reach the active job"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                !recovery_task.is_finished(),
+                "same-daemon recovery must wait behind the active job lock"
+            );
+            {
+                let db = crate::metrics::db::MetricsDatabase::global().unwrap();
+                let mut db = db.lock().unwrap();
+                let conn = db.deferred_jobs_connection();
+                let before_finish: (String, i64, String) = conn
+                    .query_row(
+                        "SELECT state, blocked_evidence, lease_token FROM deferred_checkpoint_jobs WHERE job_key = ?1",
+                        rusqlite::params![active_job_key],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(before_finish.0, "processing");
+                assert_eq!(before_finish.1, 0);
+                assert_eq!(before_finish.2, active_claimed.lease_token);
+                assert!(
+                    crate::metrics::deferred_checkpoint_jobs::mark_working_log_applied_on_connection(
+                        conn,
+                        &active_claimed,
+                        102,
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    crate::metrics::deferred_checkpoint_jobs::complete_on_connection(
+                        conn,
+                        &active_claimed,
+                        103,
+                    )
+                    .unwrap()
+                );
+            }
+            drop(active_guard);
+            let active_summary = recovery_task.await.unwrap().unwrap();
+            assert_eq!(active_summary.completed, 1);
+            assert_eq!(active_summary.failed, 0);
+
+            // A genuinely abandoned processing row has no in-process owner;
+            // a new daemon must reclaim it and surface missing evidence instead
+            // of postponing it forever.
+            let crashed_repo = temp.path().join("crashed-repo");
+            create_repo(&crashed_repo);
+            let mut crashed_request = durable_pre_request(&crashed_repo, "crashed-call");
+            let crashed_job_key =
+                crate::metrics::deferred_checkpoint_jobs::enqueue_request(
+                    &mut crashed_request,
+                    "dead-daemon",
+                )
+                .unwrap()
+                .unwrap();
+            {
+                let db = crate::metrics::db::MetricsDatabase::global().unwrap();
+                let mut db = db.lock().unwrap();
+                let conn = db.deferred_jobs_connection();
+                crate::metrics::deferred_checkpoint_jobs::claim_specific_on_connection(
+                    conn,
+                    &crashed_job_key,
+                    100,
+                    60,
+                )
+                .unwrap()
+                .unwrap();
+                conn.execute(
+                    "UPDATE deferred_checkpoint_jobs SET processing_started_at = 0 WHERE job_key = ?1",
+                    rusqlite::params![crashed_job_key],
+                )
+                .unwrap();
+            }
+            std::fs::remove_dir_all(&crashed_repo).unwrap();
+            let crashed_coordinator = Arc::new(ActorDaemonCoordinator::new());
+            let crashed_summary = crashed_coordinator
+                .recover_deferred_checkpoint_jobs(1)
+                .await
+                .unwrap();
+            assert_eq!(crashed_summary.completed, 0);
+            assert_eq!(crashed_summary.failed, 1);
+
+            // A scan-time preflight error is stale if the claimed row now says
+            // its working log is applied. It must finalize without repository
+            // discovery and publish the frozen metric exactly once.
+            let stale_repo = temp.path().join("stale-preflight-repo");
+            create_repo(&stale_repo);
+            let mut stale_request = durable_pre_request(&stale_repo, "stale-call");
+            let stale_job_key =
+                crate::metrics::deferred_checkpoint_jobs::enqueue_request(
+                    &mut stale_request,
+                    "dead-daemon",
+                )
+                .unwrap()
+                .unwrap();
+            {
+                let db = crate::metrics::db::MetricsDatabase::global().unwrap();
+                let mut db = db.lock().unwrap();
+                let conn = db.deferred_jobs_connection();
+                let claimed =
+                    crate::metrics::deferred_checkpoint_jobs::claim_specific_on_connection(
+                        conn,
+                        &stale_job_key,
+                        100,
+                        60,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    crate::metrics::deferred_checkpoint_jobs::persist_prepared_on_connection(
+                        conn,
+                        &claimed,
+                        &prepared_payload(),
+                        &[metric_event("stale-preflight-metric")],
+                        None,
+                        101,
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    crate::metrics::deferred_checkpoint_jobs::mark_working_log_applied_on_connection(
+                        conn,
+                        &claimed,
+                        102,
+                    )
+                    .unwrap()
+                );
+                conn.execute(
+                    "UPDATE deferred_checkpoint_jobs SET processing_started_at = 0 WHERE job_key = ?1",
+                    rusqlite::params![stale_job_key],
+                )
+                .unwrap();
+            }
+            std::fs::remove_dir_all(&stale_repo).unwrap();
+            crate::metrics::deferred_checkpoint_jobs::process_specific_job(
+                &stale_job_key,
+                crate::metrics::deferred_checkpoint_jobs::DeferredCheckpointJobExecution::Recovery {
+                    preflight_evidence_error: Some("stale scan-time repository preflight"),
+                },
+            )
+            .expect("the latest applied flag must override stale preflight evidence");
+
+            let db = crate::metrics::db::MetricsDatabase::global().unwrap();
+            let mut db = db.lock().unwrap();
+            let conn = db.deferred_jobs_connection();
+            for (job_key, expected_state, expected_blocked) in [
+                (&active_job_key, "done", 0_i64),
+                (&crashed_job_key, "pending", 1_i64),
+                (&stale_job_key, "done", 0_i64),
+            ] {
+                let actual: (String, i64) = conn
+                    .query_row(
+                        "SELECT state, blocked_evidence FROM deferred_checkpoint_jobs WHERE job_key = ?1",
+                        rusqlite::params![job_key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(actual, (expected_state.to_string(), expected_blocked));
+            }
+            for metric in ["active-owner-metric", "stale-preflight-metric"] {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM metrics WHERE event_json LIKE ?1",
+                        rusqlite::params![format!("%{metric}%")],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "metric {metric} must be published exactly once");
+            }
+            let crashed_reason: Option<String> = conn
+                .query_row(
+                    "SELECT blocked_reason FROM deferred_checkpoint_jobs WHERE job_key = ?1",
+                    rusqlite::params![crashed_job_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                crashed_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("cannot be resolved and verified"))
+            );
+        });
     }
 
     fn run_git_stdin_for_test(repo: &Path, args: &[&str], stdin: &str) -> String {

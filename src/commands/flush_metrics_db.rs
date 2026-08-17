@@ -6,47 +6,44 @@ use crate::api::{
     ApiClient, ApiContext, metrics_upload_allowed, metrics_upload_error_is_permanent,
     upload_metrics_with_retry,
 };
-use crate::config::Config;
 use crate::metrics::db::MetricsDatabase;
 use crate::metrics::{MetricEvent, MetricsBatch};
 
 /// Max events per batch upload
 const MAX_BATCH_SIZE: usize = 1000;
 
+fn with_locked_state<State, Value, Error>(
+    state: &std::sync::Mutex<State>,
+    context: &str,
+    operation: impl FnOnce(&mut State) -> Result<Value, Error>,
+) -> Result<Value, String>
+where
+    Error: std::fmt::Display,
+{
+    let mut state = state.lock().map_err(|error| {
+        format!("{context}: failed to acquire local metrics database lock: {error}")
+    })?;
+    operation(&mut state).map_err(|error| format!("{context}: {error}"))
+}
+
 /// Handle the flush-metrics-db command
-pub fn handle_flush_metrics_db(_args: &[String]) {
+pub fn handle_flush_metrics_db(_args: &[String]) -> Result<(), String> {
     let context = ApiContext::for_metrics();
     let client = ApiClient::new(context);
 
     if !metrics_upload_allowed(&client) {
         eprintln!("flush-metrics-db: skipping (requires an API key or login)");
-        return;
+        return Ok(());
     }
 
     // Get database connection
-    let db = match MetricsDatabase::global() {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("flush-metrics-db: failed to open metrics database: {}", e);
-            return;
-        }
-    };
-    let reporting_attributes = Config::fresh().metrics_custom_attributes().clone();
-    match db.lock() {
-        Ok(mut db_lock) => {
-            if let Err(e) = db_lock.rehydrate_unknown_daily_token_identity(&reporting_attributes) {
-                eprintln!(
-                    "flush-metrics-db: failed to repair compact token identity before upload: {}",
-                    e
-                );
-                return;
-            }
-        }
-        Err(e) => {
-            eprintln!("flush-metrics-db: failed to acquire db lock: {}", e);
-            return;
-        }
-    }
+    let db = MetricsDatabase::global()
+        .map_err(|error| format!("failed to open metrics database: {error}"))?;
+    with_locked_state(
+        db,
+        "failed to repair compact token buckets before upload",
+        |db_lock| db_lock.repair_daily_token_buckets(),
+    )?;
 
     let mut total_uploaded = 0usize;
     let mut total_batches = 0usize;
@@ -55,22 +52,9 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
 
     loop {
         // Get batch from DB
-        let batch = {
-            let mut db_lock = match db.lock() {
-                Ok(lock) => lock,
-                Err(e) => {
-                    eprintln!("flush-metrics-db: failed to acquire db lock: {}", e);
-                    break;
-                }
-            };
-            match db_lock.dequeue_pending_batch(MAX_BATCH_SIZE) {
-                Ok(batch) => batch,
-                Err(e) => {
-                    eprintln!("flush-metrics-db: failed to read batch: {}", e);
-                    break;
-                }
-            }
-        };
+        let batch = with_locked_state(db, "failed to read pending batch", |db_lock| {
+            db_lock.dequeue_pending_batch(MAX_BATCH_SIZE)
+        })?;
 
         // If batch is empty, we're done
         if batch.is_empty() {
@@ -80,6 +64,7 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
         // Parse events and build MetricsBatch
         let mut events = Vec::new();
         let mut record_ids = Vec::new();
+        let mut invalid_records = Vec::new();
 
         for record in &batch {
             match serde_json::from_str::<MetricEvent>(&record.event_json) {
@@ -88,15 +73,19 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                     record_ids.push(record.id);
                 }
                 Err(error) => {
-                    total_invalid += 1;
-                    if let Ok(mut db_lock) = db.lock() {
-                        let _ = db_lock.mark_records_undeliverable(
-                            &[(record.id, format!("invalid local metric JSON: {error}"))],
-                            current_unix_ts(),
-                        );
-                    }
+                    invalid_records
+                        .push((record.id, format!("invalid local metric JSON: {error}")));
                 }
             }
+        }
+
+        if !invalid_records.is_empty() {
+            with_locked_state(
+                db,
+                "failed to retain invalid local metrics as undeliverable",
+                |db_lock| db_lock.mark_records_undeliverable(&invalid_records, current_unix_ts()),
+            )?;
+            total_invalid += invalid_records.len();
         }
 
         if events.is_empty() {
@@ -114,12 +103,17 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                         "  ✗ batch upload response invalid ({} events kept for retry): {}",
                         event_count, e
                     );
-                    if let Ok(mut db_lock) = db.lock() {
-                        let now = current_unix_ts();
-                        let error = e.to_string();
-                        let _ = db_lock.mark_records_deferred(&record_ids, &error, now);
-                    }
-                    break;
+                    let error = e.to_string();
+                    with_locked_state(
+                        db,
+                        "failed to defer metrics after an invalid upload response",
+                        |db_lock| {
+                            db_lock.mark_records_deferred(&record_ids, &error, current_unix_ts())
+                        },
+                    )?;
+                    return Err(format!(
+                        "batch upload response invalid ({event_count} events kept for retry): {e}"
+                    ));
                 }
 
                 let successful_ids: Vec<i64> = response
@@ -132,6 +126,16 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                     .iter()
                     .map(|error| (record_ids[error.index], error.error.clone()))
                     .collect();
+
+                // The remote ACK is only a successful flush after its matching
+                // local state transition is durable. Propagate lock/SQLite
+                // failures so callers cannot report success while rows remain
+                // processing or are uploaded again.
+                with_locked_state(db, "failed to persist upload receipt", |db_lock| {
+                    let now = current_unix_ts();
+                    db_lock.mark_records_delivered(&successful_ids, now)?;
+                    db_lock.mark_records_undeliverable(&undeliverable_records, now)
+                })?;
 
                 total_uploaded += successful_ids.len();
                 total_batches += 1;
@@ -146,13 +150,6 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                         format!(" ({} marked undeliverable)", undeliverable_records.len())
                     }
                 );
-                // Keep rows as history: mark successful rows delivered and
-                // server-rejected rows permanently undeliverable.
-                if let Ok(mut db_lock) = db.lock() {
-                    let now = current_unix_ts();
-                    let _ = db_lock.mark_records_delivered(&successful_ids, now);
-                    let _ = db_lock.mark_records_undeliverable(&undeliverable_records, now);
-                }
             }
             Err(e) => {
                 let permanent = metrics_upload_error_is_permanent(&e);
@@ -167,20 +164,34 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                         event_count, e
                     );
                 }
-                if let Ok(mut db_lock) = db.lock() {
-                    let now = current_unix_ts();
-                    let error = e.to_string();
+                let error = e.to_string();
+                with_locked_state(
+                    db,
                     if permanent {
-                        let records = record_ids
-                            .iter()
-                            .map(|id| (*id, error.clone()))
-                            .collect::<Vec<_>>();
-                        let _ = db_lock.mark_records_undeliverable(&records, now);
+                        "failed to retain permanently rejected metrics"
                     } else {
-                        let _ = db_lock.mark_records_deferred(&record_ids, &error, now);
-                    }
-                }
-                break;
+                        "failed to defer metrics after upload failure"
+                    },
+                    |db_lock| {
+                        let now = current_unix_ts();
+                        if permanent {
+                            let records = record_ids
+                                .iter()
+                                .map(|id| (*id, error.clone()))
+                                .collect::<Vec<_>>();
+                            db_lock.mark_records_undeliverable(&records, now)
+                        } else {
+                            db_lock.mark_records_deferred(&record_ids, &error, now)
+                        }
+                    },
+                )?;
+                return Err(if permanent {
+                    format!(
+                        "batch upload was permanently rejected ({event_count} events retained locally without retry): {e}"
+                    )
+                } else {
+                    format!("batch upload failed ({event_count} events kept for retry): {e}")
+                });
             }
         }
     }
@@ -202,6 +213,7 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
         "flush-metrics-db: uploaded {} events in {} batch(es)",
         total_uploaded, total_batches
     );
+    Ok(())
 }
 
 fn current_unix_ts() -> u64 {
@@ -209,4 +221,44 @@ fn current_unix_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_locked_state;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn locked_state_propagates_update_errors() {
+        let state = Mutex::new(0_u8);
+
+        let error = with_locked_state(&state, "persist upload receipt", |_state| {
+            Err::<(), _>("sqlite write failed")
+        })
+        .expect_err("a failed local ACK must fail the flush");
+
+        assert!(error.contains("persist upload receipt"));
+        assert!(error.contains("sqlite write failed"));
+    }
+
+    #[test]
+    fn locked_state_propagates_poisoned_lock_errors() {
+        let state = Arc::new(Mutex::new(0_u8));
+        let thread_state = Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let _guard = thread_state.lock().unwrap();
+            panic!("poison test lock");
+        })
+        .join();
+
+        let error = with_locked_state(
+            &state,
+            "persist upload receipt",
+            |_state| Ok::<(), &str>(()),
+        )
+        .expect_err("a poisoned DB lock must fail the flush");
+
+        assert!(error.contains("persist upload receipt"));
+        assert!(error.contains("lock"));
+    }
 }

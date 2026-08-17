@@ -387,8 +387,8 @@ impl VirtualAttributions {
         human_author: Option<String>,
     ) -> Result<Self, GitAiError> {
         let working_log = repo.storage.working_log_for_base_commit(&base_commit)?;
-        let initial_attributions = working_log.read_initial_attributions();
-        let checkpoints = working_log.read_all_checkpoints().unwrap_or_default();
+        let initial_attributions = working_log.read_initial_attributions()?;
+        let checkpoints = working_log.read_all_checkpoints()?;
 
         let mut attributions: HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)> =
             HashMap::new();
@@ -597,8 +597,8 @@ impl VirtualAttributions {
         final_state_snapshot: &HashMap<String, String>,
     ) -> Result<Self, GitAiError> {
         let working_log = repo.storage.working_log_for_base_commit(&base_commit)?;
-        let initial_attributions = working_log.read_initial_attributions();
-        let checkpoints = working_log.read_all_checkpoints().unwrap_or_default();
+        let initial_attributions = working_log.read_initial_attributions()?;
+        let checkpoints = working_log.read_all_checkpoints()?;
 
         let mut attributions: HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)> =
             HashMap::new();
@@ -637,7 +637,7 @@ impl VirtualAttributions {
             // Use stored content for INITIAL since line_attrs reference that file version.
             // Fall back to final_state_snapshot only if no stored content exists.
             let file_content = working_log
-                .stored_initial_file_content_from(&initial_attributions, file_path)
+                .stored_initial_file_content_from(&initial_attributions, file_path)?
                 .or_else(|| final_state_snapshot.get(file_path).cloned())
                 .unwrap_or_default();
             file_contents.insert(file_path.clone(), file_content.clone());
@@ -782,8 +782,8 @@ impl VirtualAttributions {
         human_author: Option<String>,
     ) -> Result<Self, GitAiError> {
         let working_log = repo.storage.working_log_for_base_commit(&base_commit)?;
-        let initial_attributions = working_log.read_initial_attributions();
-        let checkpoints = working_log.read_all_checkpoints().unwrap_or_default();
+        let initial_attributions = working_log.read_initial_attributions()?;
+        let checkpoints = working_log.read_all_checkpoints()?;
 
         let mut attributions: HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)> =
             HashMap::new();
@@ -820,7 +820,7 @@ impl VirtualAttributions {
 
         for (file_path, line_attrs) in &initial_attributions.files {
             let file_content = working_log
-                .stored_initial_file_content_from(&initial_attributions, file_path)
+                .stored_initial_file_content_from(&initial_attributions, file_path)?
                 .ok_or_else(|| {
                     GitAiError::Generic(format!(
                         "INITIAL missing persisted file snapshot for {}",
@@ -3534,16 +3534,7 @@ pub fn restore_virtual_attribution_carryover(
     }
 
     let new_va =
-        VirtualAttributions::from_persisted_working_log(repo.clone(), new_head.to_string(), None)
-            .unwrap_or_else(|_| {
-                VirtualAttributions::new(
-                    repo.clone(),
-                    new_head.to_string(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    0,
-                )
-            });
+        VirtualAttributions::from_persisted_working_log(repo.clone(), new_head.to_string(), None)?;
 
     let merged_va = merge_attributions_favoring_first(carried_va, new_va, final_state.clone())?;
     let initial_attributions = merged_va.to_initial_working_log_only();

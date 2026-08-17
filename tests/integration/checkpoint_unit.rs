@@ -1300,7 +1300,7 @@ fn test_checkpoint_fails_with_initial_missing_blobs() {
         .storage
         .working_log_for_base_commit(&head_sha)
         .unwrap();
-    let initial = working_log.read_initial_attributions();
+    let initial = working_log.read_initial_attributions().unwrap();
     assert!(
         initial.files.contains_key("file_a.txt"),
         "INITIAL must contain file_a.txt for this test"

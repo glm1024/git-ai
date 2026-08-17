@@ -1004,7 +1004,7 @@ fn checkpoint_delegate_autostarts_daemon_when_unavailable() {
 
 #[test]
 #[serial]
-fn checkpoint_fails_hard_when_daemon_startup_is_blocked() {
+fn strict_checkpoint_fails_hard_when_daemon_startup_is_blocked() {
     let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::Dedicated);
 
     fs::write(repo.path().join("delegate-fallback-blocked.txt"), "base\n")
@@ -1038,10 +1038,69 @@ fn checkpoint_fails_hard_when_daemon_startup_is_blocked() {
     let result = repo.git_ai(&["checkpoint", "mock_ai", "delegate-fallback-blocked.txt"]);
     assert!(
         result.is_ok(),
-        "checkpoint should exit(0) when daemon is unavailable (never block agents)"
+        "legacy checkpoint callers should retain their historical exit(0) behavior"
+    );
+
+    let strict_result = repo.git_ai(&[
+        "checkpoint",
+        "mock_ai",
+        "--strict-errors",
+        "delegate-fallback-blocked.txt",
+    ]);
+    assert!(
+        strict_result.is_err(),
+        "strict checkpoint callers must fail when persistence cannot be acknowledged"
     );
 
     drop(held_lock);
+}
+
+#[test]
+#[serial]
+fn strict_checkpoint_returns_nonzero_for_invalid_hook_input() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::Dedicated);
+    let result = repo.git_ai(&[
+        "checkpoint",
+        "opencode",
+        "--strict-errors",
+        "--hook-input",
+        "{not-json}",
+    ]);
+
+    let error = result.expect_err("strict invalid hook input must return non-zero");
+    assert!(
+        error.contains("opencode preset error") && error.contains("Invalid JSON"),
+        "strict checkpoint should expose the parse failure: {error}"
+    );
+}
+
+#[test]
+#[serial]
+fn strict_checkpoint_rejects_bash_post_without_acknowledged_pre_snapshot() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::Dedicated);
+    let hook_input = json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "strict-bash-session",
+        "tool_use_id": "strict-bash-call",
+        "cwd": repo.path().to_string_lossy(),
+        "tool_name": "bash",
+        "tool_input": {"command": "true"}
+    })
+    .to_string();
+
+    let result = repo.git_ai(&[
+        "checkpoint",
+        "opencode",
+        "--strict-errors",
+        "--hook-input",
+        &hook_input,
+    ]);
+
+    let error = result.expect_err("strict Bash post-hook without pre snapshot must fail");
+    assert!(
+        error.contains("no acknowledged pre-hook snapshot"),
+        "strict checkpoint should expose the missing Bash pre-snapshot: {error}"
+    );
 }
 
 #[test]

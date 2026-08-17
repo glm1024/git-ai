@@ -19,6 +19,8 @@ struct OpenCodeHookInput {
     cwd: String,
     tool_input: Option<serde_json::Value>,
     #[serde(default)]
+    git_ai_file_paths: Option<Vec<String>>,
+    #[serde(default)]
     tool_name: Option<String>,
     #[serde(default, alias = "toolUseId")]
     tool_use_id: Option<String>,
@@ -45,6 +47,19 @@ impl OpenCodePreset {
             }
         }
 
+        normalized_paths
+    }
+
+    pub(crate) fn normalize_explicit_filepaths(raw_paths: &[String], cwd: &str) -> Vec<PathBuf> {
+        let mut normalized_paths = Vec::new();
+        for raw in raw_paths {
+            if let Some(path) = Self::normalize_hook_path(raw, cwd) {
+                let path = PathBuf::from(path);
+                if !normalized_paths.contains(&path) {
+                    normalized_paths.push(path);
+                }
+            }
+        }
         normalized_paths
     }
 
@@ -256,11 +271,21 @@ impl AgentPreset for OpenCodePreset {
             session_id,
             cwd,
             tool_input,
+            git_ai_file_paths,
             tool_name: _,
             tool_use_id,
         } = hook_input;
 
-        let file_paths = Self::extract_filepaths_from_tool_input(tool_input.as_ref(), &cwd);
+        // Current OpenCode/Kilo plugins resolve every explicit edit target to
+        // its repository before invoking the strict CLI.  Prefer that scoped
+        // list when present so a Git-external target in the same tool call
+        // cannot make the whole Git checkpoint fail.  Keep tool_input intact
+        // for transcript and metadata fidelity, and retain the fallback for
+        // hooks installed by older git-ai versions.
+        let file_paths = git_ai_file_paths
+            .as_ref()
+            .map(|paths| Self::normalize_explicit_filepaths(paths, &cwd))
+            .unwrap_or_else(|| Self::extract_filepaths_from_tool_input(tool_input.as_ref(), &cwd));
         let bash_command = tool_input
             .as_ref()
             .and_then(|value| {
@@ -439,6 +464,41 @@ mod tests {
             }
             _ => panic!("Expected PostFileEdit"),
         }
+    }
+
+    #[test]
+    fn test_opencode_prefers_plugin_scoped_git_paths_over_mixed_tool_input() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-mixed",
+            "cwd": "/workspace",
+            "tool_name": "apply_patch",
+            "tool_use_id": "call-mixed",
+            "git_ai_file_paths": [
+                "/workspace/repo-a/src/main.rs",
+                "/workspace/repo-b/src/lib.rs"
+            ],
+            "tool_input": {
+                "file_paths": [
+                    "/workspace/repo-a/src/main.rs",
+                    "/workspace/repo-b/src/lib.rs",
+                    "/tmp/outside.txt"
+                ]
+            }
+        })
+        .to_string();
+
+        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
+        let ParsedHookEvent::PreFileEdit(event) = &events[0] else {
+            panic!("Expected PreFileEdit");
+        };
+        assert_eq!(
+            event.file_paths,
+            vec![
+                PathBuf::from("/workspace/repo-a/src/main.rs"),
+                PathBuf::from("/workspace/repo-b/src/lib.rs"),
+            ]
+        );
     }
 
     #[test]

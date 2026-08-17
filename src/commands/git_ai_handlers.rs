@@ -4,7 +4,7 @@ use crate::authorship::range_authorship;
 use crate::authorship::stats::stats_command;
 use crate::commands;
 use crate::config;
-use crate::daemon::ControlRequest;
+use crate::daemon::{ControlRequest, ControlResponse};
 use crate::git::find_repository;
 use crate::git::find_repository_in_path;
 use crate::git::repository::{CommitRange, Repository};
@@ -49,6 +49,7 @@ pub fn handle_git_ai(args: &[String]) {
             | "d"
             | "daemon"
             | "debug"
+            | "repair"
             | "upgrade"
             | "install-hooks"
             | "install"
@@ -56,6 +57,8 @@ pub fn handle_git_ai(args: &[String]) {
             | "usage"
     );
     if needs_daemon {
+        let strict_checkpoint =
+            args[0] == "checkpoint" && args[1..].iter().any(|arg| arg == "--strict-errors");
         use crate::daemon::telemetry_handle::{
             DaemonTelemetryInitResult, init_daemon_telemetry_handle,
         };
@@ -67,7 +70,7 @@ pub fn handle_git_ai(args: &[String]) {
                     err
                 );
                 if args[0].as_str() == "checkpoint" {
-                    std::process::exit(0);
+                    std::process::exit(if strict_checkpoint { 1 } else { 0 });
                 }
                 std::process::exit(1);
             }
@@ -99,6 +102,9 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "debug" => {
             commands::debug::handle_debug(&args[1..]);
+        }
+        "repair" => {
+            commands::repair::handle_repair(&args[1..]);
         }
         "bg" | "d" | "daemon" => {
             commands::daemon::handle_daemon(&args[1..]);
@@ -189,7 +195,10 @@ pub fn handle_git_ai(args: &[String]) {
             commands::upgrade::run_with_args(&args[1..]);
         }
         "flush-metrics-db" => {
-            commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
+            if let Err(error) = commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]) {
+                eprintln!("flush-metrics-db: {error}");
+                std::process::exit(1);
+            }
         }
         "await" => {
             commands::r#await::handle_await(&args[1..]);
@@ -325,6 +334,9 @@ fn print_help() {
     eprintln!(
         "    --hook-input <json|stdin>   JSON payload required by presets, or 'stdin' to read from stdin"
     );
+    eprintln!(
+        "    --strict-errors             Return non-zero when checkpoint parsing or persistence fails"
+    );
     eprintln!("    human [pathspecs...]             Untracked/legacy human checkpoint");
     eprintln!("    mock_ai [pathspecs...]           Test preset accepting optional file pathspecs");
     eprintln!("    mock_known_human [pathspecs...]  Test preset for KnownHuman checkpoints");
@@ -365,6 +377,9 @@ fn print_help() {
     eprintln!("    --add <key> <value>   Add to array or upsert into object");
     eprintln!("    unset <key>           Remove config value (reverts to default)");
     eprintln!("  debug              Print support/debug diagnostics");
+    eprintln!("  repair             Preview or perform explicit evidence-preserving recovery");
+    eprintln!("    checkpoint-baseline --job-key <key>");
+    eprintln!("                         Preview a blocked checkpoint baseline repair");
     eprintln!("  bg                 Run and control git-ai background service");
     eprintln!("  install-hooks      Install git hooks for AI authorship tracking");
     eprintln!("    --skills               Also install agent skill files");
@@ -395,6 +410,7 @@ fn handle_checkpoint(args: &[String]) {
     let t0 = std::time::Instant::now();
 
     let mut hook_input = None;
+    let strict_errors = args.iter().any(|arg| arg == "--strict-errors");
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -405,29 +421,39 @@ fn handle_checkpoint(args: &[String]) {
                         let mut stdin = std::io::stdin();
                         let mut buffer = Vec::new();
                         if let Err(e) = stdin.read_to_end(&mut buffer) {
-                            eprintln!("Failed to read stdin for hook input: {}", e);
-                            std::process::exit(0);
+                            exit_checkpoint_failure(
+                                strict_errors,
+                                format!("Failed to read stdin for hook input: {}", e),
+                            );
                         }
                         let buffer = match decode_hook_input_bytes(buffer) {
                             Ok(buffer) => buffer,
                             Err(e) => {
-                                eprintln!("Failed to decode stdin for hook input: {}", e);
-                                std::process::exit(0);
+                                exit_checkpoint_failure(
+                                    strict_errors,
+                                    format!("Failed to decode stdin for hook input: {}", e),
+                                );
                             }
                         };
                         if buffer.trim().is_empty() {
-                            eprintln!("No hook input provided (via --hook-input or stdin).");
-                            std::process::exit(0);
+                            exit_checkpoint_failure(
+                                strict_errors,
+                                "No hook input provided (via --hook-input or stdin).",
+                            );
                         }
                         hook_input = Some(strip_utf8_bom(buffer));
                     } else if hook_input.as_ref().unwrap().trim().is_empty() {
-                        eprintln!("Error: --hook-input requires a value");
-                        std::process::exit(0);
+                        exit_checkpoint_failure(
+                            strict_errors,
+                            "Error: --hook-input requires a value",
+                        );
                     }
                     i += 2;
                 } else {
-                    eprintln!("Error: --hook-input requires a value or 'stdin' to read from stdin");
-                    std::process::exit(0);
+                    exit_checkpoint_failure(
+                        strict_errors,
+                        "Error: --hook-input requires a value or 'stdin' to read from stdin",
+                    );
                 }
             }
             _ => {
@@ -449,8 +475,10 @@ fn handle_checkpoint(args: &[String]) {
         ("human", &args[1..])
     } else if crate::commands::checkpoint_agent::presets::resolve_preset(args[0].as_str()).is_err()
     {
-        eprintln!("Usage: git-ai checkpoint <preset> [--hook-input <json|stdin>] [files...]");
-        std::process::exit(0);
+        exit_checkpoint_failure(
+            strict_errors,
+            "Usage: git-ai checkpoint <preset> [--hook-input <json|stdin>] [files...]",
+        );
     } else {
         (args[0].as_str(), &args[1..])
     };
@@ -466,14 +494,18 @@ fn handle_checkpoint(args: &[String]) {
     }
 
     let t_orchestrator = std::time::Instant::now();
-    let requests = match crate::commands::checkpoint_agent::orchestrator::execute_preset_checkpoint(
-        preset_name,
-        &effective_hook_input,
-    ) {
+    let execute_checkpoint = if strict_errors {
+        crate::commands::checkpoint_agent::orchestrator::execute_preset_checkpoint_strict
+    } else {
+        crate::commands::checkpoint_agent::orchestrator::execute_preset_checkpoint
+    };
+    let mut requests = match execute_checkpoint(preset_name, &effective_hook_input) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{} preset error: {}", preset_name, e);
-            std::process::exit(0);
+            exit_checkpoint_failure(
+                strict_errors,
+                format!("{} preset error: {}", preset_name, e),
+            );
         }
     };
 
@@ -493,8 +525,10 @@ fn handle_checkpoint(args: &[String]) {
     for request in &requests {
         for file in &request.files {
             if !file.path.is_absolute() {
-                eprintln!("Error: file path must be absolute: {}", file.path.display());
-                std::process::exit(0);
+                exit_checkpoint_failure(
+                    strict_errors,
+                    format!("Error: file path must be absolute: {}", file.path.display()),
+                );
             }
         }
     }
@@ -506,22 +540,28 @@ fn handle_checkpoint(args: &[String]) {
     {
         let config = config::Config::get();
         if config.has_repository_filters() {
-            let mut checked_repos = std::collections::HashSet::new();
-            for request in &requests {
-                for file in &request.files {
-                    if checked_repos.insert(file.repo_work_dir.clone())
-                        && let Ok(repo) =
+            let mut allowed_by_repo = std::collections::HashMap::new();
+            let skipped =
+                retain_checkpoint_requests_for_repositories(&mut requests, |repo_work_dir| {
+                    *allowed_by_repo
+                        .entry(repo_work_dir.to_path_buf())
+                        .or_insert_with(|| {
                             crate::git::repository::discover_repository_in_path_no_git_exec(
-                                &file.repo_work_dir,
+                                repo_work_dir,
                             )
-                        && !config.is_allowed_repository(&Some(repo))
-                    {
-                        eprintln!(
-                            "Skipping checkpoint because repository is excluded or not in allow_repositories list"
-                        );
-                        std::process::exit(0);
-                    }
-                }
+                            .map(|repo| config.is_allowed_repository(&Some(repo)))
+                            // Preserve the previous behavior: repository discovery
+                            // failures are sent to the daemon and reported there.
+                            .unwrap_or(true)
+                        })
+                });
+            if skipped > 0 {
+                eprintln!(
+                    "Skipping checkpoint for {skipped} excluded or non-allowlisted repository request(s)"
+                );
+            }
+            if requests.is_empty() {
+                std::process::exit(0);
             }
         }
     }
@@ -540,8 +580,10 @@ fn handle_checkpoint(args: &[String]) {
     let config = match daemon_config {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Background worker unavailable: {}", e);
-            std::process::exit(0);
+            exit_checkpoint_failure(
+                strict_errors,
+                format!("Background worker unavailable: {}", e),
+            );
         }
     };
 
@@ -566,9 +608,15 @@ fn handle_checkpoint(args: &[String]) {
                 t_send.elapsed().as_secs_f64() * 1000.0,
             );
         }
-        if let Err(e) = send_result {
-            eprintln!("Failed to send checkpoint to background worker: {}", e);
-            std::process::exit(0);
+        let response = match send_result {
+            Ok(response) => response,
+            Err(e) => exit_checkpoint_failure(
+                strict_errors,
+                format!("Failed to send checkpoint to background worker: {}", e),
+            ),
+        };
+        if let Some(error) = checkpoint_response_error(&response) {
+            exit_checkpoint_failure(strict_errors, error);
         }
         sent_count += 1;
     }
@@ -582,6 +630,92 @@ fn handle_checkpoint(args: &[String]) {
             "[perf] checkpoint: total={:.1}ms",
             t0.elapsed().as_secs_f64() * 1000.0
         );
+    }
+}
+
+fn retain_checkpoint_requests_for_repositories(
+    requests: &mut Vec<crate::commands::checkpoint_agent::orchestrator::CheckpointRequest>,
+    mut is_allowed: impl FnMut(&std::path::Path) -> bool,
+) -> usize {
+    let before = requests.len();
+    requests.retain(|request| {
+        request
+            .files
+            .iter()
+            .all(|file| is_allowed(&file.repo_work_dir))
+    });
+    before.saturating_sub(requests.len())
+}
+
+fn checkpoint_response_error(response: &ControlResponse) -> Option<String> {
+    if response.ok {
+        return None;
+    }
+
+    Some(format!(
+        "Background worker rejected checkpoint: {}",
+        response.error.as_deref().unwrap_or("unknown error")
+    ))
+}
+
+fn exit_checkpoint_failure(strict_errors: bool, message: impl std::fmt::Display) -> ! {
+    eprintln!("{}", message);
+    std::process::exit(if strict_errors { 1 } else { 0 });
+}
+
+#[cfg(test)]
+mod checkpoint_strict_tests {
+    use super::*;
+    use crate::authorship::working_log::{AgentId, CheckpointKind};
+    use crate::commands::checkpoint_agent::orchestrator::{
+        BaseCommit, CheckpointFile, CheckpointRequest,
+    };
+    use crate::daemon::checkpoint::PreparedPathRole;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn request_for_repo(repo: &str) -> CheckpointRequest {
+        let repo_work_dir = PathBuf::from(repo);
+        CheckpointRequest {
+            trace_id: "trace".to_string(),
+            checkpoint_kind: CheckpointKind::Human,
+            agent_id: Some(AgentId {
+                tool: "opencode".to_string(),
+                id: "session".to_string(),
+                model: "model".to_string(),
+            }),
+            files: vec![CheckpointFile {
+                path: repo_work_dir.join("file.rs"),
+                content: Some(String::new()),
+                repo_work_dir,
+                base_commit: BaseCommit::Initial,
+            }],
+            path_role: PreparedPathRole::WillEdit,
+            stream_source: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn daemon_rejection_is_not_treated_as_checkpoint_success() {
+        let response = ControlResponse::err("checkpoint apply failed");
+        assert_eq!(
+            checkpoint_response_error(&response).as_deref(),
+            Some("Background worker rejected checkpoint: checkpoint apply failed")
+        );
+        assert!(checkpoint_response_error(&ControlResponse::ok(None, None)).is_none());
+    }
+
+    #[test]
+    fn repository_filter_keeps_allowed_requests_from_a_mixed_repo_call() {
+        let mut requests = vec![request_for_repo("/repo-a"), request_for_repo("/repo-b")];
+        let skipped = retain_checkpoint_requests_for_repositories(&mut requests, |repo| {
+            repo == std::path::Path::new("/repo-b")
+        });
+
+        assert_eq!(skipped, 1);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].files[0].repo_work_dir, PathBuf::from("/repo-b"));
     }
 }
 

@@ -75,7 +75,7 @@ Retention:
 Rust record shape:
 
 - `BashCheckpointCall`: persisted row with optional `end_time_ns`, optional command, and parsed metadata.
-- `repo_work_dir` is retained for audit/debug metadata, but recovery candidate lookup is global by timestamp so cross-repo/cross-worktree bash commands can recover attribution.
+- `repo_work_dir` is retained as attribution scope as well as audit/debug metadata. Candidate lookup may be global for efficiency, but recovery only accepts the exact recorded worktree. A session already evidenced in the target commit may rank exact-worktree candidates, but cannot admit a candidate from another repository. Ancestor-cwd and time-only matches are not attribution evidence; unobserved cross-repo/cross-worktree writes remain unknown.
 
 ## Control API Changes
 
@@ -153,9 +153,10 @@ For each eligible file:
 
 1. Read the committed file metadata from the working tree when the committed file matches the working tree.
 2. Use both `mtime` and `ctime` when available, converted to nanoseconds since epoch.
-3. Query global bash history for calls whose `[start_time_ns, end_time_ns]` window is within ±3 seconds of either file timestamp.
-4. Score candidates by nearest timestamp distance, then prefer completed calls, then prefer calls with command text, then newest row id.
-5. If a candidate is selected, add an attestation for all unknown committed lines in that file to:
+3. Query bash history for calls whose `[start_time_ns, end_time_ns]` window is within ±3 seconds of either file timestamp.
+4. Reject every candidate whose recorded worktree does not match the target worktree exactly. In particular, an existing target-commit session, cwd ancestry, or timestamp proximity cannot authorize recovery across repository boundaries.
+5. Score the eligible candidates by evidence tier, nearest timestamp distance, completed state, command presence, then newest row id.
+6. If a candidate is selected, add an attestation for all unknown committed lines in that file to:
 
 `generate_session_id(agent_external_id, agent_tool)::generate_trace_id()`
 

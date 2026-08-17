@@ -23,6 +23,10 @@ pub enum GitAiError {
         status: u16,
         message: String,
     },
+    /// Persisted local evidence exists but cannot be verified well enough to
+    /// derive attribution safely. Callers may use this structured variant to
+    /// stop automatic retries without parsing display text.
+    EvidenceError(String),
     Generic(String),
 }
 
@@ -48,6 +52,7 @@ impl fmt::Display for GitAiError {
             GitAiError::HttpStatusError { status, message } => {
                 write!(f, "HTTP {}: {}", status, message)
             }
+            GitAiError::EvidenceError(e) => write!(f, "Evidence error: {}", e),
             GitAiError::Generic(e) => write!(f, "Generic error: {}", e),
             GitAiError::GixError(e) => write!(f, "Gix error: {}", e),
         }
@@ -106,6 +111,7 @@ impl Clone for GitAiError {
                 status: *status,
                 message: message.clone(),
             },
+            GitAiError::EvidenceError(s) => GitAiError::EvidenceError(s.clone()),
             GitAiError::Generic(s) => GitAiError::Generic(s.clone()),
             GitAiError::GixError(e) => GitAiError::Generic(format!("Gix error: {}", e)),
         }

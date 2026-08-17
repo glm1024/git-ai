@@ -322,7 +322,7 @@ where
     // Also include files from INITIAL attributions (uncommitted files from previous commits)
     // These files may not have checkpoints but still need their attribution preserved
     // when they are finally committed. See issue #356.
-    let initial_attributions_for_pathspecs = working_log.read_initial_attributions();
+    let initial_attributions_for_pathspecs = working_log.read_initial_attributions()?;
     for file_path in initial_attributions_for_pathspecs.files.keys() {
         pathspecs.insert(file_path.clone());
     }
@@ -757,7 +757,7 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
     let mut pathspecs: HashSet<String> = changed_files.into_iter().collect();
     let touched_files = working_log.all_touched_files()?;
     pathspecs.extend(touched_files);
-    let initial_attributions_for_pathspecs = working_log.read_initial_attributions();
+    let initial_attributions_for_pathspecs = working_log.read_initial_attributions()?;
     for file_path in initial_attributions_for_pathspecs.files.keys() {
         pathspecs.insert(file_path.clone());
     }

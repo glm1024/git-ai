@@ -1566,7 +1566,10 @@ crate::subdir_test_variants! {
             .expect("Amend should succeed");
 
         // Verify that fileB's AI attribution was saved in INITIAL attributions
-        let initial = repo.current_working_logs().read_initial_attributions();
+        let initial = repo
+            .current_working_logs()
+            .read_initial_attributions()
+            .unwrap();
         assert!(
             initial.files.contains_key("fileB.txt"),
             "fileB.txt should be in initial attributions"

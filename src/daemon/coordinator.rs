@@ -41,6 +41,13 @@ impl<B: GitBackend> Coordinator<B> {
 
     pub async fn apply_checkpoint(&self, repo_working_dir: &Path) -> Result<ApplyAck, GitAiError> {
         let family = self.backend.resolve_family(repo_working_dir)?;
+        self.apply_checkpoint_family(family).await
+    }
+
+    pub(crate) async fn apply_checkpoint_family(
+        &self,
+        family: FamilyKey,
+    ) -> Result<ApplyAck, GitAiError> {
         let actor = self.get_or_create_family_actor(family).await;
         actor.apply_checkpoint().await
     }

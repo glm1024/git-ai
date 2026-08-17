@@ -215,7 +215,10 @@ fn test_amend_preserves_unstaged_ai_attribution() {
         .unwrap();
 
     // Verify that fileB's AI attribution was saved in INITIAL attributions
-    let initial = repo.current_working_logs().read_initial_attributions();
+    let initial = repo
+        .current_working_logs()
+        .read_initial_attributions()
+        .unwrap();
     assert!(
         initial.files.contains_key("fileB.txt"),
         "fileB.txt should be in initial attributions"

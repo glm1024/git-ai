@@ -25,7 +25,7 @@ import { dirname, isAbsolute, join, resolve } from "path"
 // Absolute path to git-ai binary, replaced at install time by `git-ai install-hooks`
 const GIT_AI_BIN = "__GIT_AI_BINARY_PATH__"
 const CHECKPOINT_TIMEOUT_MS = 10_000
-const CHECKPOINT_ARGS = ["checkpoint", "opencode", "--hook-input", "stdin"]
+const CHECKPOINT_ARGS = ["checkpoint", "opencode", "--strict-errors", "--hook-input", "stdin"]
 
 // Tools that modify files and should be tracked
 const FILE_EDIT_TOOLS = new Set([
@@ -160,6 +160,13 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined => {
 
 const hookString = (value: unknown): string => typeof value === "string" ? value : ""
 
+const pendingCallKey = (sessionID: string, callID: string): string => JSON.stringify([sessionID, callID])
+
+type GitFileScope = {
+  filePaths: string[]
+  repoDirs: string[]
+}
+
 const extractToolCwd = (args: Record<string, unknown> | undefined): string | undefined => {
   if (typeof args?.workdir === "string") return args.workdir
   if (typeof args?.cwd === "string") return args.cwd
@@ -188,7 +195,20 @@ const debugLog = (message: string, error?: unknown): void => {
   }
 }
 
-const swallowHookErrors = <Args extends unknown[]>(
+const errorCode = (error: unknown): string | undefined => {
+  if (!error || typeof error !== "object") {
+    return undefined
+  }
+  const code = (error as { code?: unknown }).code
+  return typeof code === "string" ? code : undefined
+}
+
+const isMissingPathError = (error: unknown): boolean => {
+  const code = errorCode(error)
+  return code === "ENOENT" || code === "ENOTDIR"
+}
+
+const failClosedHook = <Args extends unknown[]>(
   label: string,
   hook: (...args: Args) => Promise<void>,
 ): ((...args: Args) => Promise<void>) => {
@@ -196,7 +216,13 @@ const swallowHookErrors = <Args extends unknown[]>(
     try {
       await hook(...args)
     } catch (error) {
-      debugLog(label, error)
+      const failure = error instanceof Error ? error : new Error(String(error))
+      try {
+        console.error(`[git-ai opencode] ${label}: ${failure.message}`)
+      } catch {
+        // Reporting must not replace the checkpoint failure that blocks the operation.
+      }
+      throw failure
     }
   }
 }
@@ -262,8 +288,13 @@ export const GitAiPlugin: Plugin = async (ctx) => {
   try {
     return createGitAiPlugin(ctx)
   } catch (error) {
-    debugLog("failed to initialize plugin", error)
-    return {}
+    const failure = error instanceof Error ? error : new Error(String(error))
+    try {
+      console.error(`[git-ai opencode] failed to initialize plugin: ${failure.message}`)
+    } catch {
+      // Preserve the original initialization failure.
+    }
+    throw failure
   }
 }
 
@@ -271,8 +302,16 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
   const { worktree, directory } = ctx
   const defaultCwd = worktree || directory || process.cwd()
 
-  // Track pending calls by callID so we can reference them in the after hook
-  const pendingCalls = new Map<string, { repoDir: string; sessionID: string; toolInput: unknown }>()
+  // OpenCode may reuse a callID in concurrent sessions, so both identifiers
+  // are required to correlate the acknowledged pre-hook with its after-hook.
+  const pendingCalls = new Map<string, {
+    repoDirs: string[]
+    filePaths: string[]
+    sessionID: string
+    toolName: string
+    toolInput: unknown
+  }>()
+  const nonGitCalls = new Map<string, string>()
 
   const nearestExistingDirectory = async (pathHint: string): Promise<string | null> => {
     let candidate = pathHint
@@ -281,7 +320,9 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
         const fileStat = await stat(candidate)
         return fileStat.isDirectory() ? candidate : dirname(candidate)
       } catch (error) {
-        debugLog(`failed to stat path while resolving git repo from ${candidate}`, error)
+        if (!isMissingPathError(error)) {
+          throw new Error(`failed to inspect path while resolving Git repository: ${candidate}`, { cause: error })
+        }
       }
 
       const parent = dirname(candidate)
@@ -295,25 +336,24 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
   }
 
   const isGitDirPointer = async (gitFilePath: string, worktreeDir: string): Promise<boolean> => {
-    try {
-      const firstLine = (await readFile(gitFilePath, "utf8")).split(/\r?\n/, 1)[0]?.trim() ?? ""
-      if (!firstLine.toLowerCase().startsWith("gitdir:")) {
-        return false
-      }
-
-      const gitDir = firstLine.slice("gitdir:".length).trim()
-      if (!gitDir) {
-        return false
-      }
-
-      const gitDirPath = isAbsolute(gitDir) || /^[a-zA-Z]:[\\/]/.test(gitDir)
-        ? gitDir
-        : resolve(worktreeDir, gitDir)
-      return (await stat(gitDirPath)).isDirectory()
-    } catch (error) {
-      debugLog(`failed to read gitdir pointer from ${gitFilePath}`, error)
-      return false
+    const firstLine = (await readFile(gitFilePath, "utf8")).split(/\r?\n/, 1)[0]?.trim() ?? ""
+    if (!firstLine.toLowerCase().startsWith("gitdir:")) {
+      throw new Error(`invalid Git metadata pointer: ${gitFilePath}`)
     }
+
+    const gitDir = firstLine.slice("gitdir:".length).trim()
+    if (!gitDir) {
+      throw new Error(`empty Git metadata pointer: ${gitFilePath}`)
+    }
+
+    const gitDirPath = isAbsolute(gitDir) || /^[a-zA-Z]:[\\/]/.test(gitDir)
+      ? gitDir
+      : resolve(worktreeDir, gitDir)
+    const gitDirStat = await stat(gitDirPath)
+    if (!gitDirStat.isDirectory()) {
+      throw new Error(`Git metadata pointer is not a directory: ${gitDirPath}`)
+    }
+    return true
   }
 
   const hasGitMetadata = async (dir: string): Promise<boolean> => {
@@ -327,11 +367,13 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
       if (fileStat.isFile()) {
         return await isGitDirPointer(marker, dir)
       }
+      throw new Error(`unsupported Git metadata entry: ${marker}`)
     } catch (error) {
-      debugLog(`failed to inspect git metadata at ${marker}`, error)
+      if (isMissingPathError(error)) {
+        return false
+      }
+      throw new Error(`failed to inspect Git metadata at ${marker}`, { cause: error })
     }
-
-    return false
   }
 
   // Helper to find git repo root from a file path or directory
@@ -352,48 +394,37 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
     return null
   }
 
+  const resolveGitFileScope = async (filePaths: string[]): Promise<GitFileScope> => {
+    const scopedFilePaths: string[] = []
+    const repoDirs = new Set<string>()
+    const reposByPath = new Map<string, string | null>()
+
+    for (const filePath of filePaths) {
+      let repoDir = reposByPath.get(filePath)
+      if (repoDir === undefined) {
+        repoDir = await findGitRepo(filePath)
+        reposByPath.set(filePath, repoDir)
+      }
+      if (!repoDir) {
+        continue
+      }
+
+      scopedFilePaths.push(filePath)
+      repoDirs.add(repoDir)
+    }
+
+    return {
+      filePaths: scopedFilePaths,
+      repoDirs: [...repoDirs],
+    }
+  }
+
   const resolveCwd = (cwd?: string): string => {
     if (!cwd) {
       return defaultCwd
     }
 
     return normalizePath(cwd, defaultCwd) || defaultCwd
-  }
-
-  const resolveRepoDir = async (filePaths: string[], cwd?: string): Promise<string | null> => {
-    const seenHints = new Set<string>()
-    const findGitRepoOnce = async (pathHint: string | undefined): Promise<string | null> => {
-      if (!pathHint || seenHints.has(pathHint)) {
-        return null
-      }
-
-      seenHints.add(pathHint)
-      return await findGitRepo(pathHint)
-    }
-
-    for (const filePath of filePaths) {
-      const repo = await findGitRepoOnce(filePath)
-      if (repo) {
-        return repo
-      }
-    }
-
-    const fromCwd = await findGitRepoOnce(cwd)
-    if (fromCwd) {
-      return fromCwd
-    }
-
-    const fromDefaultCwd = await findGitRepoOnce(defaultCwd)
-    if (fromDefaultCwd) {
-      return fromDefaultCwd
-    }
-
-    const fromProcessCwd = await findGitRepoOnce(process.cwd())
-    if (fromProcessCwd) {
-      return fromProcessCwd
-    }
-
-    return null
   }
 
   const extractMetadataFilePaths = (metadata: unknown, cwd?: string): string[] => {
@@ -443,7 +474,7 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
   }
 
   return {
-    "tool.execute.before": swallowHookErrors(
+    "tool.execute.before": failClosedHook(
       "pre-tool checkpoint failed",
       async (input: ToolHookInput, output?: { args?: unknown }) => {
         const toolName = hookString(input.tool)
@@ -455,11 +486,30 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
 
         const callID = hookString(input.callID)
         const sessionID = hookString(input.sessionID)
+        if (!callID || !sessionID) {
+          throw new Error("tracked tool call is missing callID or sessionID")
+        }
         const toolInput = output?.args ?? input.args
         const toolCwd = resolveCwd(extractToolCwd(asRecord(toolInput)))
         const filePaths = isTrackedEdit ? extractFilePaths(toolInput, toolCwd) : []
-        const repoDir = await resolveRepoDir(filePaths, toolCwd)
+        if (isTrackedEdit && filePaths.length === 0) {
+          throw new Error(`tracked edit tool ${toolName} did not expose a file path`)
+        }
+        const gitScope = isTrackedEdit ? await resolveGitFileScope(filePaths) : undefined
+        const callKey = pendingCallKey(sessionID, callID)
+        if (pendingCalls.has(callKey) || nonGitCalls.has(callKey)) {
+          throw new Error(`duplicate tracked tool call identity for session ${sessionID} and call ${callID}`)
+        }
+        const repoDir = isTrackedEdit
+          ? gitScope?.repoDirs[0] ?? null
+          // The resolved tool cwd is authoritative for Bash. Falling back to
+          // the plugin process/default cwd would snapshot an unrelated repo
+          // when an explicit non-Git workdir was requested.
+          : await findGitRepo(toolCwd)
         if (!repoDir) {
+          // Editing outside Git is intentionally out of scope. Remember the
+          // correlation so the matching after-hook is not mistaken for data loss.
+          nonGitCalls.set(callKey, toolName)
           return
         }
 
@@ -470,13 +520,20 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
           cwd: repoDir,
           tool_name: toolName,
           tool_input: toolInput,
+          ...(gitScope ? { git_ai_file_paths: gitScope.filePaths } : {}),
         })
         await runCheckpoint(hookInput)
-        pendingCalls.set(callID, { repoDir, sessionID, toolInput })
+        pendingCalls.set(callKey, {
+          repoDirs: gitScope?.repoDirs ?? [repoDir],
+          filePaths: gitScope?.filePaths ?? [],
+          sessionID,
+          toolName,
+          toolInput,
+        })
       },
     ),
 
-    "tool.execute.after": swallowHookErrors(
+    "tool.execute.after": failClosedHook(
       "post-tool checkpoint failed",
       async (input: ToolHookInput, output?: { metadata?: unknown }) => {
         const toolName = hookString(input.tool)
@@ -485,27 +542,93 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
         }
 
         const callID = hookString(input.callID)
-        const callInfo = pendingCalls.get(callID)
-        pendingCalls.delete(callID)
-
-        if (!callInfo) {
-          debugLog(`skipping post-tool checkpoint without matching pre-tool call for ${callID}`)
+        const sessionID = hookString(input.sessionID)
+        if (!callID || !sessionID) {
+          throw new Error("tracked post-tool call is missing callID or sessionID")
+        }
+        const callKey = pendingCallKey(sessionID, callID)
+        const nonGitToolName = nonGitCalls.get(callKey)
+        if (nonGitToolName !== undefined) {
+          if (nonGitToolName !== toolName) {
+            throw new Error(
+              `post-tool checkpoint tool mismatch for ${callID}: expected ${nonGitToolName}, received ${toolName}`,
+            )
+          }
+          nonGitCalls.delete(callKey)
+          // The acknowledged before-hook already established that the explicit
+          // edit target was outside Git. Do not let after-hook metadata or a
+          // different cwd reclassify the same call into an unrelated repository.
           return
+        }
+        const callInfo = pendingCalls.get(callKey)
+
+        if (callInfo && callInfo.toolName !== toolName) {
+          throw new Error(`post-tool checkpoint tool mismatch for ${callID}: expected ${callInfo.toolName}, received ${toolName}`)
         }
 
         const toolCwd = resolveCwd(extractToolCwd(asRecord(input.args)))
         const metadataFilePaths = extractMetadataFilePaths(output?.metadata, toolCwd)
-        const toolInput = withMetadataFilePaths(callInfo.toolInput, metadataFilePaths)
+        const postToolInput = input.args ?? callInfo?.toolInput
+        const toolInput = withMetadataFilePaths(postToolInput, metadataFilePaths)
+        const extractedFilePaths = isEditTool(toolName) ? extractFilePaths(toolInput, toolCwd) : []
+        if (isEditTool(toolName) && !callInfo && extractedFilePaths.length === 0) {
+          throw new Error(`tracked post-edit tool ${toolName} did not expose a file path`)
+        }
+        const candidateFilePaths = callInfo
+          // The acknowledged pre-hook scope is authoritative in this process.
+          // After-hook metadata may report extra touched files, but it must not
+          // expand the AI-attributed scope beyond that durable pre evidence.
+          ? callInfo.filePaths
+          : extractedFilePaths
+        const gitScope = isEditTool(toolName)
+          ? await resolveGitFileScope(candidateFilePaths)
+          : undefined
+
+        if (callInfo && gitScope) {
+          const beforeRepos = new Set(callInfo.repoDirs)
+          const afterRepos = new Set(gitScope.repoDirs)
+          const missingRepos = callInfo.repoDirs.filter((repo) => !afterRepos.has(repo))
+          const unexpectedRepos = gitScope.repoDirs.filter((repo) => !beforeRepos.has(repo))
+          if (missingRepos.length > 0 || unexpectedRepos.length > 0) {
+            throw new Error(
+              `post-tool checkpoint repository scope changed for ${callID}`
+              + `${missingRepos.length > 0 ? `; missing: ${missingRepos.join(", ")}` : ""}`
+              + `${unexpectedRepos.length > 0 ? `; unexpected: ${unexpectedRepos.join(", ")}` : ""}`,
+            )
+          }
+        }
+
+        const repoDir = isEditTool(toolName)
+          ? gitScope?.repoDirs[0] ?? null
+          : await findGitRepo(toolCwd)
+        if (!repoDir) {
+          if (callInfo) {
+            throw new Error(`post-tool checkpoint lost the acknowledged repository scope for ${callID}`)
+          }
+          // A matching pre may have run in another plugin process. Re-resolving
+          // from the after-hook is the correctness path; genuinely non-Git
+          // edits remain intentionally out of scope.
+          return
+        }
+        if (callInfo && isBashTool(toolName)
+          && (callInfo.repoDirs.length !== 1 || callInfo.repoDirs[0] !== repoDir)) {
+          throw new Error(
+            `post-tool checkpoint repository scope changed for ${callID}`
+            + `; expected: ${callInfo.repoDirs.join(", ")}; received: ${repoDir}`,
+          )
+        }
 
         const hookInput = JSON.stringify({
           hook_event_name: "PostToolUse",
-          session_id: callInfo.sessionID,
+          session_id: sessionID,
           tool_use_id: callID,
-          cwd: callInfo.repoDir,
+          cwd: repoDir,
           tool_name: toolName,
           tool_input: toolInput,
+          ...(gitScope ? { git_ai_file_paths: gitScope.filePaths } : {}),
         })
         await runCheckpoint(hookInput)
+        pendingCalls.delete(callKey)
       },
     ),
   }

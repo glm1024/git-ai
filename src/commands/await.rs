@@ -18,6 +18,12 @@ struct AwaitResponse {
     timed_out: bool,
     metrics_remaining: usize,
     notes_remaining: usize,
+    #[serde(default)]
+    blocked_checkpoints: usize,
+    #[serde(default)]
+    blocked_checkpoint_reasons: Vec<String>,
+    #[serde(default)]
+    phase_error: Option<String>,
 }
 
 /// Handle `git-ai await [--timeout <seconds>]`.
@@ -118,10 +124,26 @@ pub(crate) fn handle_await(args: &[String]) {
     }
 
     if !data.done {
-        eprintln!(
-            "await: background service could not finish ({} metrics, {} notes remaining)",
-            data.metrics_remaining, data.notes_remaining
-        );
+        let blocked = if data.blocked_checkpoints > 0 {
+            format!(
+                "; {} blocked checkpoint(s): {}. Original evidence is preserved; stop the background service, then run `git-ai repair checkpoint-baseline --job-key <printed-key>` for an impact preview",
+                data.blocked_checkpoints,
+                data.blocked_checkpoint_reasons.join(" | ")
+            )
+        } else {
+            String::new()
+        };
+        if let Some(error) = data.phase_error.as_deref() {
+            eprintln!(
+                "await: background service could not finish: {} ({} metrics, {} notes remaining{})",
+                error, data.metrics_remaining, data.notes_remaining, blocked
+            );
+        } else {
+            eprintln!(
+                "await: background service could not finish ({} metrics, {} notes remaining{})",
+                data.metrics_remaining, data.notes_remaining, blocked
+            );
+        }
         std::process::exit(1);
     }
 
@@ -158,5 +180,20 @@ mod tests {
         let response = ControlResponse::err("telemetry flush failed");
 
         assert_eq!(response_error_message(&response), "telemetry flush failed");
+    }
+
+    #[test]
+    fn await_response_remains_compatible_with_daemons_without_phase_error() {
+        let response: AwaitResponse = serde_json::from_value(serde_json::json!({
+            "done": true,
+            "timed_out": false,
+            "metrics_remaining": 0,
+            "notes_remaining": 0
+        }))
+        .unwrap();
+
+        assert!(response.phase_error.is_none());
+        assert_eq!(response.blocked_checkpoints, 0);
+        assert!(response.blocked_checkpoint_reasons.is_empty());
     }
 }

@@ -13,6 +13,7 @@ use crate::commands::checkpoint_agent::orchestrator::CheckpointRequest;
 use crate::error::GitAiError;
 use crate::git::repo_storage::PersistedWorkingLog;
 use crate::git::repository::Repository;
+use crate::metrics::PosEncoded;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,7 +43,7 @@ struct PreviousFileState {
 use crate::authorship::working_log::AgentId;
 
 #[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
-const AGENT_USAGE_MIN_INTERVAL_SECS: u64 = 150;
+pub(crate) const AGENT_USAGE_MIN_INTERVAL_SECS: u64 = 150;
 
 #[cfg(not(any(test, feature = "test-support")))]
 const KNOWN_HUMAN_MIN_SECS_AFTER_AI: u64 = 1;
@@ -77,6 +78,32 @@ pub(crate) fn should_emit_agent_usage(_agent_id: &AgentId) -> bool {
 pub enum PreparedPathRole {
     Edited,
     WillEdit,
+}
+
+/// Reporting and repository dimensions captured when a durable checkpoint is
+/// admitted. Recovery must not relabel an old edit with a newer profile,
+/// branch, remote, version, or Git author.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct FrozenCheckpointMetricsContext {
+    pub git_ai_version: String,
+    pub custom_attributes: HashMap<String, String>,
+    pub repo_url: Option<String>,
+    pub branch: Option<String>,
+    pub author: String,
+}
+
+impl FrozenCheckpointMetricsContext {
+    pub(crate) fn capture(repo: &Repository) -> Self {
+        Self {
+            git_ai_version: env!("CARGO_PKG_VERSION").to_string(),
+            custom_attributes: crate::config::Config::fresh()
+                .metrics_custom_attributes()
+                .clone(),
+            repo_url: crate::repo_url::resolve_repo_url_from_repo(repo),
+            branch: repo.head().ok().and_then(|head| head.shorthand().ok()),
+            author: repo.effective_author_identity().formatted_or_unknown(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +142,27 @@ pub fn build_agent_usage_attrs(
         }
     }
 
+    attrs
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) fn build_agent_usage_attrs_from_frozen(
+    context: &FrozenCheckpointMetricsContext,
+    agent_id: &AgentId,
+) -> crate::metrics::EventAttributes {
+    let session_id = generate_session_id(&agent_id.id, &agent_id.tool);
+    let mut attrs = crate::metrics::EventAttributes::with_version(&context.git_ai_version)
+        .session_id(session_id)
+        .tool(&agent_id.tool)
+        .model(&agent_id.model)
+        .external_session_id(&agent_id.id)
+        .custom_attributes_map(&context.custom_attributes);
+    if let Some(repo_url) = &context.repo_url {
+        attrs = attrs.repo_url(repo_url);
+    }
+    if let Some(branch) = &context.branch {
+        attrs = attrs.branch(branch);
+    }
     attrs
 }
 
@@ -173,6 +221,40 @@ fn build_checkpoint_attrs(
     attrs
 }
 
+fn build_checkpoint_attrs_from_frozen(
+    context: &FrozenCheckpointMetricsContext,
+    base_commit: &str,
+    agent_id: Option<&AgentId>,
+    checkpoint_metadata: &HashMap<String, String>,
+) -> crate::metrics::EventAttributes {
+    let session_id = agent_id
+        .map(|agent| generate_session_id(&agent.id, &agent.tool))
+        .unwrap_or_default();
+    let mut attrs = crate::metrics::EventAttributes::with_version(&context.git_ai_version)
+        .session_id(session_id);
+    attrs = if base_commit == "initial" {
+        attrs.base_commit_sha_null()
+    } else {
+        attrs.base_commit_sha(base_commit)
+    };
+    if let Some(agent_id) = agent_id {
+        attrs = attrs
+            .tool(&agent_id.tool)
+            .model(&agent_id.model)
+            .external_session_id(&agent_id.id);
+    }
+    let custom_attributes =
+        checkpoint_metric_custom_attributes(&context.custom_attributes, checkpoint_metadata);
+    attrs = attrs.custom_attributes_map(&custom_attributes);
+    if let Some(repo_url) = &context.repo_url {
+        attrs = attrs.repo_url(repo_url);
+    }
+    if let Some(branch) = &context.branch {
+        attrs = attrs.branch(branch);
+    }
+    attrs
+}
+
 fn checkpoint_metric_custom_attributes(
     configured: &HashMap<String, String>,
     checkpoint_metadata: &HashMap<String, String>,
@@ -210,27 +292,83 @@ pub fn execute_resolved_checkpoint_from_daemon(
 ) -> Result<(), GitAiError> {
     let checkpoint_start = Instant::now();
     tracing::debug!("[BENCHMARK] Starting daemon replay checkpoint");
-    execute_resolved_checkpoint(
+    let prepared = prepare_resolved_checkpoint(
         repo,
         author,
         kind,
-        true,
         checkpoint_request,
         resolved,
         checkpoint_start,
-    )
-    .map(|_| ())
+        None,
+    )?;
+    apply_prepared_checkpoint_from_daemon(repo, &prepared.application)?;
+    crate::observability::log_metrics(prepared.metric_events)?;
+    Ok(())
 }
 
-fn execute_resolved_checkpoint(
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PreparedCheckpointApplication {
+    pub base_commit: String,
+    pub checkpoint: Option<Checkpoint>,
+}
+
+struct PreparedCheckpointSideEffect {
+    application: PreparedCheckpointApplication,
+    metric_events: Vec<crate::metrics::MetricEvent>,
+}
+
+pub(crate) fn prepare_resolved_checkpoint_from_daemon(
     repo: &Repository,
     author: &str,
     kind: CheckpointKind,
-    quiet: bool,
+    checkpoint_request: CheckpointRequest,
+    resolved: ResolvedCheckpointExecution,
+    frozen_metrics_context: Option<&FrozenCheckpointMetricsContext>,
+) -> Result<
+    (
+        PreparedCheckpointApplication,
+        Vec<crate::metrics::MetricEvent>,
+    ),
+    GitAiError,
+> {
+    let prepared = prepare_resolved_checkpoint(
+        repo,
+        author,
+        kind,
+        checkpoint_request,
+        resolved,
+        Instant::now(),
+        frozen_metrics_context,
+    )?;
+    Ok((prepared.application, prepared.metric_events))
+}
+
+pub(crate) fn apply_prepared_checkpoint_from_daemon(
+    repo: &Repository,
+    prepared: &PreparedCheckpointApplication,
+) -> Result<bool, GitAiError> {
+    let Some(checkpoint) = prepared.checkpoint.as_ref() else {
+        return Ok(false);
+    };
+    let working_log = repo
+        .storage
+        .working_log_for_base_commit(&prepared.base_commit)?;
+    // A durable job must never publish a checkpoint whose content-addressed
+    // facts are absent or corrupt. If validation fails, the caller leaves the
+    // job retryable instead of marking a broken reference done.
+    working_log.validate_checkpoint_blob_references(checkpoint)?;
+    working_log.append_checkpoint_idempotent(checkpoint)
+}
+
+fn prepare_resolved_checkpoint(
+    repo: &Repository,
+    author: &str,
+    kind: CheckpointKind,
     checkpoint_request: CheckpointRequest,
     mut resolved: ResolvedCheckpointExecution,
     checkpoint_start: Instant,
-) -> Result<(usize, usize, usize), GitAiError> {
+    frozen_metrics_context: Option<&FrozenCheckpointMetricsContext>,
+) -> Result<PreparedCheckpointSideEffect, GitAiError> {
     if kind.is_ai() && checkpoint_request.agent_id.is_none() {
         return Err(GitAiError::Generic(
             "AI checkpoint is missing agent_id".to_string(),
@@ -246,7 +384,7 @@ fn execute_resolved_checkpoint(
     }
 
     let read_checkpoints_start = Instant::now();
-    let mut checkpoints = working_log.read_all_checkpoints()?;
+    let checkpoints = working_log.read_all_checkpoints()?;
     tracing::debug!(
         "[BENCHMARK] Reading {} checkpoints took {:?}",
         checkpoints.len(),
@@ -274,7 +412,13 @@ fn execute_resolved_checkpoint(
                 "[KnownHuman] Rejected: fired within {}s of an AI checkpoint on the same file",
                 KNOWN_HUMAN_MIN_SECS_AFTER_AI
             );
-            return Ok((0, 0, 0));
+            return Ok(PreparedCheckpointSideEffect {
+                application: PreparedCheckpointApplication {
+                    base_commit: resolved.base_commit,
+                    checkpoint: None,
+                },
+                metric_events: Vec::new(),
+            });
         }
     }
 
@@ -323,6 +467,8 @@ fn execute_resolved_checkpoint(
         entries_start.elapsed()
     );
 
+    let mut prepared_checkpoint = None;
+    let mut metric_events = Vec::new();
     if !entries.is_empty() {
         let checkpoint_create_start = Instant::now();
         let mut checkpoint = Checkpoint::new(
@@ -372,20 +518,21 @@ fn execute_resolved_checkpoint(
             checkpoint_create_start.elapsed()
         );
 
-        let append_start = Instant::now();
-        working_log.append_checkpoint(&checkpoint)?;
-        tracing::debug!(
-            "[BENCHMARK] Appending checkpoint to working log took {:?}",
-            append_start.elapsed()
-        );
-        checkpoints.push(checkpoint.clone());
-
-        let mut attrs = build_checkpoint_attrs(
-            repo,
-            &resolved.base_commit,
-            checkpoint.agent_id.as_ref(),
-            &checkpoint_request.metadata,
-        );
+        let mut attrs = if let Some(context) = frozen_metrics_context {
+            build_checkpoint_attrs_from_frozen(
+                context,
+                &resolved.base_commit,
+                checkpoint.agent_id.as_ref(),
+                &checkpoint_request.metadata,
+            )
+        } else {
+            build_checkpoint_attrs(
+                repo,
+                &resolved.base_commit,
+                checkpoint.agent_id.as_ref(),
+                &checkpoint_request.metadata,
+            )
+        };
 
         // Add trace_id to attributes - links all checkpoint events together
         if let Some(ref tid) = checkpoint.trace_id {
@@ -423,56 +570,26 @@ fn execute_resolved_checkpoint(
             }
 
             let file_attrs = attrs.clone().author(&checkpoint.author);
-            crate::metrics::record(values, file_attrs)?;
+            metric_events.push(crate::metrics::MetricEvent::from_values_with_timestamp(
+                values,
+                file_attrs.to_sparse(),
+                Some(checkpoint.timestamp.min(u64::from(u32::MAX)) as u32),
+            ));
         }
-    }
-
-    let agent_tool = if kind.is_ai() {
-        checkpoint_request
-            .agent_id
-            .as_ref()
-            .map(|aid| aid.tool.as_str())
-    } else {
-        None
-    };
-
-    let label = if entries.len() > 1 {
-        "checkpoint"
-    } else {
-        "commit"
-    };
-
-    if !quiet {
-        let log_author = agent_tool.unwrap_or(author);
-        let files_with_entries = entries.len();
-        let total_uncommitted_files = resolved.files.len();
-
-        if files_with_entries == total_uncommitted_files {
-            eprintln!(
-                "{} {} changed {} file(s) that have changed since the last {}",
-                kind.to_str(),
-                log_author,
-                files_with_entries,
-                label
-            );
-        } else {
-            eprintln!(
-                "{} {} changed {} of the {} file(s) that have changed since the last {} ({} already checkpointed)",
-                kind.to_str(),
-                log_author,
-                files_with_entries,
-                total_uncommitted_files,
-                label,
-                total_uncommitted_files - files_with_entries
-            );
-        }
+        prepared_checkpoint = Some(checkpoint);
     }
 
     tracing::debug!(
         "[BENCHMARK] Total checkpoint run took {:?}",
         checkpoint_start.elapsed()
     );
-    Ok((entries.len(), resolved.files.len(), checkpoints.len()))
+    Ok(PreparedCheckpointSideEffect {
+        application: PreparedCheckpointApplication {
+            base_commit: resolved.base_commit,
+            checkpoint: prepared_checkpoint,
+        },
+        metric_events,
+    })
 }
 
 fn save_current_file_states(
@@ -481,18 +598,17 @@ fn save_current_file_states(
 ) -> Result<HashMap<String, String>, GitAiError> {
     let _read_start = Instant::now();
 
-    let blobs_dir = working_log.dir.join("blobs");
+    let working_log = Arc::new(working_log.clone());
     let dirty_files = working_log.dirty_files.clone();
     let files = files.to_vec();
 
     let file_content_hashes = crate::tokio_runtime::block_on(async {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
-        let blobs_dir = Arc::new(blobs_dir);
         let dirty_files = Arc::new(dirty_files);
 
         let mut futures = Vec::with_capacity(files.len());
         for file_path in files {
-            let blobs_dir = Arc::clone(&blobs_dir);
+            let working_log = Arc::clone(&working_log);
             let dirty_files = Arc::clone(&dirty_files);
             let semaphore = Arc::clone(&semaphore);
 
@@ -516,17 +632,7 @@ fn save_current_file_states(
                 })?;
 
                 crate::tokio_runtime::spawn_blocking_result(move || {
-                    // Create SHA256 hash of the content
-                    let mut hasher = Sha256::new();
-                    hasher.update(content.as_bytes());
-                    let sha = format!("{:x}", hasher.finalize());
-
-                    // Ensure blobs directory exists
-                    std::fs::create_dir_all(&*blobs_dir)?;
-
-                    // Write content to blob file
-                    let blob_path = blobs_dir.join(&sha);
-                    std::fs::write(blob_path, content.as_bytes())?;
+                    let sha = working_log.persist_file_version(content.as_ref())?;
 
                     Ok::<(String, String), GitAiError>((file_path, sha))
                 })
@@ -855,7 +961,7 @@ async fn get_checkpoint_entries(
 
     // Read INITIAL attributions from working log (empty if file doesn't exist)
     let initial_read_start = Instant::now();
-    let initial_data = working_log.read_initial_attributions();
+    let initial_data = working_log.read_initial_attributions()?;
     let initial_snapshot_contents: HashMap<String, Arc<str>> = {
         let mut map = HashMap::new();
         for file_path in initial_data.files.keys() {
@@ -1169,6 +1275,7 @@ fn compute_line_stats(
 #[cfg(test)]
 mod kilo_runtime_metadata_tests {
     use super::*;
+    use crate::authorship::working_log::WorkingLogEntry;
     use crate::metrics::PosEncoded;
 
     #[test]
@@ -1181,6 +1288,35 @@ mod kilo_runtime_metadata_tests {
             attrs.get(&crate::metrics::attrs::attr_pos::BASE_COMMIT_SHA.to_string()),
             Some(&serde_json::Value::Null)
         );
+    }
+
+    #[test]
+    fn prepared_checkpoint_with_missing_blob_is_not_applied() {
+        let repo = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        let base_commit = "prepared-missing-blob".to_string();
+        let checkpoint = Checkpoint::new(
+            CheckpointKind::AiAgent,
+            "diff".to_string(),
+            "agent".to_string(),
+            vec![WorkingLogEntry::new(
+                "src/missing.rs".to_string(),
+                "0".repeat(64),
+                Vec::new(),
+                Vec::new(),
+            )],
+        );
+        let prepared = PreparedCheckpointApplication {
+            base_commit: base_commit.clone(),
+            checkpoint: Some(checkpoint),
+        };
+
+        assert!(apply_prepared_checkpoint_from_daemon(repo.gitai_repo(), &prepared).is_err());
+        let working_log = repo
+            .gitai_repo()
+            .storage
+            .working_log_for_base_commit(&base_commit)
+            .unwrap();
+        assert!(working_log.read_all_checkpoints().unwrap().is_empty());
     }
 
     #[test]

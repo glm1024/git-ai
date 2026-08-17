@@ -1,6 +1,6 @@
 use crate::api::{ApiClient, ApiContext};
 use crate::auth::state::AuthStatus;
-use crate::auth::{collect_auth_status, format_unix_timestamp, AuthState};
+use crate::auth::{AuthState, collect_auth_status, format_unix_timestamp};
 use crate::config;
 use crate::metrics::db::{MetricsDatabase, MetricsStatus};
 use std::fmt::Write as _;

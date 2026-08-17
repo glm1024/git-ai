@@ -938,12 +938,17 @@ pub struct BashToolHookContext<'a> {
 pub fn signal_daemon_bash_hook_attempt(
     phase: BashHookAttemptPhase,
     signal: BashHookAttemptSignal<'_>,
-) {
-    let Some(socket) = effective_daemon_socket() else {
-        return;
-    };
+) -> Result<(), GitAiError> {
+    let socket = effective_daemon_socket().ok_or_else(|| {
+        GitAiError::Generic(format!(
+            "no daemon socket available for BashHookAttempt {phase:?}"
+        ))
+    })?;
     if !socket.exists() {
-        return;
+        return Err(GitAiError::Generic(format!(
+            "daemon socket does not exist for BashHookAttempt {phase:?}: {}",
+            socket.display()
+        )));
     }
     let original_cwd = signal.original_cwd.to_string_lossy().to_string();
     let discovered_repo_work_dir = signal
@@ -983,10 +988,15 @@ pub fn signal_daemon_bash_hook_attempt(
             command,
         },
     };
-    if let Err(e) = send_control_request_with_timeout(&socket, &request, Duration::from_millis(500))
-    {
-        tracing::debug!("Failed to signal bash hook attempt {:?}: {}", phase, e);
+    let response =
+        send_control_request_with_timeout(&socket, &request, Duration::from_millis(500))?;
+    if !response.ok {
+        return Err(GitAiError::Generic(format!(
+            "daemon rejected BashHookAttempt {phase:?}: {}",
+            response.error.as_deref().unwrap_or("unknown error")
+        )));
     }
+    Ok(())
 }
 
 struct BashSessionEndSignal<'a> {
@@ -1085,10 +1095,10 @@ pub fn handle_bash_pre_tool_use_with_context_and_cwd(
     // build_checkpoint_files — catastrophic on large repos. Fall back to git
     // status which only reports actually changed files.
     let dirty_paths: Vec<PathBuf> = if wm.is_none() {
-        match git_status_fallback(repo_root) {
-            Ok(paths) => paths.into_iter().map(|p| repo_root.join(p)).collect(),
-            Err(_) => vec![],
-        }
+        git_status_fallback(repo_root)?
+            .into_iter()
+            .map(|p| repo_root.join(p))
+            .collect()
     } else {
         snap.entries.keys().map(|rel| repo_root.join(rel)).collect()
     };
@@ -1110,7 +1120,13 @@ pub fn handle_bash_pre_tool_use_with_context_and_cwd(
         command: context.command.map(ToString::to_string),
     };
 
-    send_control_request(&socket, &request)?;
+    let response = send_control_request(&socket, &request)?;
+    if !response.ok {
+        return Err(GitAiError::Generic(format!(
+            "daemon rejected BashSessionStart: {}",
+            response.error.as_deref().unwrap_or("unknown error")
+        )));
+    }
 
     Ok(BashPreHookResult { dirty_paths })
 }

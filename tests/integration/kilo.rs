@@ -280,9 +280,7 @@ fn test_kilo_checkpoint_metric_precedes_token_snapshot_for_backend_context() {
                 )
                 .unwrap();
             let rows = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                })
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();

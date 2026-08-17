@@ -7,6 +7,7 @@
 
 pub mod attrs;
 pub mod db;
+pub(crate) mod deferred_checkpoint_jobs;
 pub(crate) mod deferred_commit_jobs;
 pub(crate) mod deferred_lifecycle_jobs;
 pub mod events;

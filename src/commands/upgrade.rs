@@ -5,17 +5,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
 #[cfg(windows)]
 type WindowsHandle = *mut std::ffi::c_void;
 #[cfg(windows)]
@@ -46,12 +52,16 @@ unsafe extern "system" {
     fn Process32FirstW(snapshot: WindowsHandle, entry: *mut ProcessEntry32W) -> i32;
     fn Process32NextW(snapshot: WindowsHandle, entry: *mut ProcessEntry32W) -> i32;
     fn CloseHandle(handle: WindowsHandle) -> i32;
+    fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
 }
 
 const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
 const GIT_AI_RELEASE_ENV: &str = "GIT_AI_RELEASE_TAG";
+const GIT_AI_INSTALL_EXPECTED_VERSION_ENV: &str = "GIT_AI_INSTALL_EXPECTED_VERSION";
 #[cfg(windows)]
 const GIT_AI_RESTART_DAEMON_AFTER_INSTALL_ENV: &str = "GIT_AI_RESTART_DAEMON_AFTER_INSTALL";
+#[cfg(windows)]
+const GIT_AI_UPDATE_RECEIPT_PATH_ENV: &str = "GIT_AI_UPDATE_RECEIPT_PATH";
 const GIT_AI_DAEMON_UPGRADE_ENV: &str = "GIT_AI_DAEMON_UPGRADE";
 const BACKGROUND_SPAWN_THROTTLE_SECS: u64 = 60;
 const ENV_BACKGROUND_UPGRADE_WORKER: &str = "GIT_AI_BACKGROUND_UPGRADE_WORKER";
@@ -85,12 +95,22 @@ struct ChannelRelease {
     checksum: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct UpdateCache {
     last_checked_at: u64,
     available_tag: Option<String>,
     available_semver: Option<String>,
     channel: String,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpgradeReceipt {
+    format: u32,
+    expected_version: String,
+    installed_version: String,
+    release_tag: String,
+    completed_at_utc: String,
 }
 
 impl UpdateCache {
@@ -109,6 +129,32 @@ impl UpdateCache {
 
     fn matches_channel(&self, channel: UpdateChannel) -> bool {
         self.channel == channel.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedPendingDisposition {
+    NewerThanCurrent,
+    CurrentNeedsReceipt,
+    OlderThanCurrent,
+}
+
+fn classify_cached_pending_update(
+    cache: Option<&UpdateCache>,
+    channel: UpdateChannel,
+    current_version: &str,
+) -> Option<CachedPendingDisposition> {
+    let cache = cache?;
+    if !cache.matches_channel(channel) || !cache.update_available() {
+        return None;
+    }
+    // A pending state is actionable only when both identity fields exist.
+    cache.available_tag.as_deref()?;
+    let pending_version = cache.available_semver.as_deref()?;
+    match compare_numeric_versions(pending_version, current_version)? {
+        std::cmp::Ordering::Greater => Some(CachedPendingDisposition::NewerThanCurrent),
+        std::cmp::Ordering::Equal => Some(CachedPendingDisposition::CurrentNeedsReceipt),
+        std::cmp::Ordering::Less => Some(CachedPendingDisposition::OlderThanCurrent),
     }
 }
 
@@ -138,6 +184,404 @@ fn read_update_cache() -> Option<UpdateCache> {
     let path = get_update_check_cache_path()?;
     let bytes = fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(any(windows, test))]
+fn get_upgrade_receipt_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Ok(test_cache_dir) = std::env::var("GIT_AI_TEST_CACHE_DIR") {
+            return Some(PathBuf::from(test_cache_dir).join("upgrade-receipt.json"));
+        }
+    }
+
+    crate::config::git_ai_dir_path().map(|path| path.join("upgrade-receipt.json"))
+}
+
+#[cfg(any(windows, test))]
+fn validate_upgrade_receipt_identity(
+    receipt: &UpgradeReceipt,
+    current_version: &str,
+) -> Result<(), String> {
+    if receipt.format != 1 {
+        return Err(format!("unsupported receipt format {}", receipt.format));
+    }
+    if receipt.expected_version != receipt.installed_version {
+        return Err("expected and installed versions differ".to_string());
+    }
+    if receipt.installed_version != current_version {
+        return Err(format!(
+            "receipt installed version {} does not match running version {}",
+            receipt.installed_version, current_version
+        ));
+    }
+    if semver_from_tag(&receipt.release_tag) != receipt.expected_version {
+        return Err("release tag does not match the expected version".to_string());
+    }
+    if receipt.completed_at_utc.trim().is_empty() {
+        return Err("receipt completion timestamp is empty".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn validate_upgrade_receipt(
+    receipt: &UpgradeReceipt,
+    cache: Option<&UpdateCache>,
+    channel: UpdateChannel,
+    current_version: &str,
+) -> Result<(), String> {
+    validate_upgrade_receipt_identity(receipt, current_version)?;
+    let cache = cache.ok_or_else(|| "pending update cache is missing".to_string())?;
+    if !cache.matches_channel(channel) || !cache.update_available() {
+        return Err("pending update cache is absent or belongs to another channel".to_string());
+    }
+    if cache.available_semver.as_deref() != Some(receipt.expected_version.as_str())
+        || cache.available_tag.as_deref() != Some(receipt.release_tag.as_str())
+    {
+        return Err("receipt does not match the pending update cache".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+enum UpgradeReceiptFileResult {
+    Absent,
+    CleanupOnly,
+    Blocked {
+        reason: String,
+    },
+    Completed {
+        receipt: UpgradeReceipt,
+        cleanup_error: Option<String>,
+    },
+}
+
+#[cfg(any(windows, test))]
+fn replace_update_cache_file(
+    temp_path: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let temp_wide: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
+            MoveFileExW(
+                temp_wide.as_ptr(),
+                path_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            return Err(format!(
+                "could not durably replace update cache at {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, path).map_err(|error| {
+            format!(
+                "could not atomically replace update cache at {}: {error}",
+                path.display()
+            )
+        })?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    format!(
+                        "could not sync update cache directory {}: {error}",
+                        parent.display()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn write_update_cache_strict(cache: &UpdateCache) -> Result<(), String> {
+    let path = get_update_check_cache_path()
+        .ok_or_else(|| "could not determine update cache path".to_string())?;
+    #[cfg(test)]
+    if std::env::var("GIT_AI_TEST_CACHE_CLEAR_FAILURE").as_deref() == Ok("1") {
+        return Err("injected update cache clear failure".to_string());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("update cache path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create update cache directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_nanos();
+    let temp_path = parent.join(format!(".update_check.tmp.{}.{nonce}", std::process::id()));
+    let json = serde_json::to_vec(cache)
+        .map_err(|error| format!("could not serialize cleared update cache: {error}"))?;
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| {
+                format!(
+                    "could not create update cache staging file {}: {error}",
+                    temp_path.display()
+                )
+            })?;
+        file.write_all(&json).map_err(|error| {
+            format!(
+                "could not write update cache staging file {}: {error}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            format!(
+                "could not sync update cache staging file {}: {error}",
+                temp_path.display()
+            )
+        })?;
+        drop(file);
+        replace_update_cache_file(&temp_path, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result?;
+
+    let verified = fs::read(&path)
+        .map_err(|error| {
+            format!(
+                "could not read back update cache at {}: {error}",
+                path.display()
+            )
+        })
+        .and_then(|bytes| {
+            serde_json::from_slice::<UpdateCache>(&bytes)
+                .map_err(|error| format!("could not parse written update cache: {error}"))
+        })?;
+    if &verified != cache {
+        return Err("written update cache did not pass exact read-back verification".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn persist_update_state_strict(
+    channel: UpdateChannel,
+    release: Option<&ChannelRelease>,
+) -> Result<(), String> {
+    let mut cache = UpdateCache::new(channel);
+    cache.last_checked_at = current_timestamp();
+    if let Some(release) = release {
+        cache.available_tag = Some(release.tag.clone());
+        cache.available_semver = Some(release.semver.clone());
+    }
+    write_update_cache_strict(&cache)
+}
+
+#[cfg(any(windows, test))]
+fn clear_pending_update_cache_strict(channel: UpdateChannel) -> Result<(), String> {
+    persist_update_state_strict(channel, None)
+}
+
+#[cfg(any(windows, test))]
+fn pin_pending_release_for_install_strict(
+    channel: UpdateChannel,
+    release: &ChannelRelease,
+) -> Result<(), String> {
+    // The channel can advance between the earlier availability check and the
+    // daemon's post-shutdown install. Persist the exact release we are about to
+    // install before fetching or launching it, so its receipt can only consume
+    // a matching pending state.
+    persist_update_state_strict(channel, Some(release))
+}
+
+fn should_recover_missing_windows_receipt(
+    action: &UpgradeAction,
+    cache: Option<&UpdateCache>,
+    channel: UpdateChannel,
+    release: &ChannelRelease,
+    current_version: &str,
+) -> bool {
+    matches!(action, &UpgradeAction::AlreadyLatest)
+        && classify_cached_pending_update(cache, channel, current_version)
+            == Some(CachedPendingDisposition::CurrentNeedsReceipt)
+        && cache.is_some_and(|cache| {
+            cache.available_tag.as_deref() == Some(release.tag.as_str())
+                && cache.available_semver.as_deref() == Some(release.semver.as_str())
+        })
+}
+
+#[cfg(any(windows, test))]
+fn remove_upgrade_receipt(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(test)]
+    if std::env::var("GIT_AI_TEST_RECEIPT_DELETE_FAILURE").as_deref() == Ok("1") {
+        return Err("injected receipt deletion failure".to_string());
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove upgrade receipt at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn reconcile_upgrade_receipt_files(
+    channel: UpdateChannel,
+    cache: Option<&UpdateCache>,
+    current_version: &str,
+) -> UpgradeReceiptFileResult {
+    let Some(path) = get_upgrade_receipt_path() else {
+        return UpgradeReceiptFileResult::Blocked {
+            reason: "could not determine upgrade receipt path".to_string(),
+        };
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return UpgradeReceiptFileResult::Absent;
+        }
+        Err(error) => {
+            return UpgradeReceiptFileResult::Blocked {
+                reason: format!(
+                    "could not read upgrade receipt at {}: {error}",
+                    path.display()
+                ),
+            };
+        }
+    };
+    let receipt = match serde_json::from_slice::<UpgradeReceipt>(&bytes) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return UpgradeReceiptFileResult::Blocked {
+                reason: format!("invalid receipt JSON: {error}"),
+            };
+        }
+    };
+    if let Err(reason) = validate_upgrade_receipt_identity(&receipt, current_version) {
+        return UpgradeReceiptFileResult::Blocked { reason };
+    }
+    let matches_pending = cache.is_some_and(|cache| {
+        cache.matches_channel(channel)
+            && cache.update_available()
+            && cache.available_semver.as_deref() == Some(receipt.expected_version.as_str())
+            && cache.available_tag.as_deref() == Some(receipt.release_tag.as_str())
+    });
+    if !matches_pending {
+        // The receipt is self-consistent and belongs to the running binary, but
+        // there is no exact matching pending update. It is cleanup debt from a
+        // previously-cleared cache, a channel change, or a newer update. Remove
+        // only the old receipt; never clear the current cache or emit success.
+        return match remove_upgrade_receipt(&path) {
+            Ok(()) => UpgradeReceiptFileResult::CleanupOnly,
+            Err(reason) => UpgradeReceiptFileResult::Blocked { reason },
+        };
+    }
+    if let Err(reason) = validate_upgrade_receipt(&receipt, cache, channel, current_version) {
+        return UpgradeReceiptFileResult::Blocked { reason };
+    }
+    if let Err(reason) = clear_pending_update_cache_strict(channel) {
+        // The receipt remains durable. Do not record completion or re-run the
+        // installer until cache clearing can be retried successfully.
+        return UpgradeReceiptFileResult::Blocked { reason };
+    }
+
+    let cleanup_error = remove_upgrade_receipt(&path)
+        .err()
+        .map(|reason| format!("pending cache was cleared, but receipt cleanup failed: {reason}"));
+    UpgradeReceiptFileResult::Completed {
+        receipt,
+        cleanup_error,
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsUpgradeReceiptStatus {
+    Absent,
+    CleanupOnly,
+    Completed,
+    Blocked,
+}
+
+#[cfg(windows)]
+fn reconcile_completed_windows_upgrade(
+    channel: UpdateChannel,
+    cache: Option<&UpdateCache>,
+    api_base_url: &str,
+) -> WindowsUpgradeReceiptStatus {
+    match reconcile_upgrade_receipt_files(channel, cache, env!("CARGO_PKG_VERSION")) {
+        UpgradeReceiptFileResult::Absent => WindowsUpgradeReceiptStatus::Absent,
+        UpgradeReceiptFileResult::CleanupOnly => {
+            log_message(
+                "upgrade_receipt_cleanup_completed",
+                "info",
+                Some(serde_json::json!({
+                    "channel": channel.as_str(),
+                    "completion_source": "cleared_cache_tombstone"
+                })),
+            );
+            WindowsUpgradeReceiptStatus::CleanupOnly
+        }
+        UpgradeReceiptFileResult::Blocked { reason } => {
+            log_message(
+                "upgrade_receipt_rejected",
+                "warn",
+                Some(serde_json::json!({
+                    "reason": reason,
+                    "channel": channel.as_str()
+                })),
+            );
+            WindowsUpgradeReceiptStatus::Blocked
+        }
+        UpgradeReceiptFileResult::Completed {
+            receipt,
+            cleanup_error,
+        } => {
+            if let Some(ref cleanup_error) = cleanup_error {
+                log_message(
+                    "upgrade_receipt_cleanup_failed",
+                    "warn",
+                    Some(serde_json::json!({
+                        "reason": cleanup_error,
+                        "release_tag": receipt.release_tag.as_str(),
+                        "installed_version": receipt.installed_version.as_str(),
+                        "channel": channel.as_str()
+                    })),
+                );
+            }
+            log_message(
+                "daemon_upgraded",
+                "info",
+                Some(serde_json::json!({
+                    "release_tag": receipt.release_tag.as_str(),
+                    "installed_version": receipt.installed_version.as_str(),
+                    "api_base_url": api_base_url,
+                    "channel": channel.as_str(),
+                    "completion_source": "verified_windows_receipt",
+                    "receipt_cleanup_completed": cleanup_error.is_none()
+                })),
+            );
+            WindowsUpgradeReceiptStatus::Completed
+        }
+    }
 }
 
 fn write_update_cache(cache: &UpdateCache) {
@@ -499,6 +943,30 @@ fn try_mock_releases(base: &str, channel: UpdateChannel) -> Option<Result<Channe
 fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
+        let expected_version = semver_from_tag(tag);
+        if expected_version.is_empty() {
+            return Err(format!(
+                "Unable to determine expected version from tag '{tag}'"
+            ));
+        }
+        let receipt_path = get_upgrade_receipt_path()
+            .ok_or_else(|| "Could not determine Windows upgrade receipt path".to_string())?;
+        match fs::metadata(&receipt_path) {
+            Ok(_) => {
+                return Err(format!(
+                    "A Windows upgrade receipt already exists at {}. Reconcile or inspect it before scheduling another installer.",
+                    receipt_path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect Windows upgrade receipt path {}: {error}",
+                    receipt_path.display()
+                ));
+            }
+        }
+
         if let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() {
             // Best effort: stop the daemon before we hand off to the detached installer.
             // The install script also has a fallback kill path so old released binaries
@@ -532,15 +1000,20 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
         fs::write(&log_file, format!("Starting upgrade at PID {}\n", pid))
             .map_err(|e| format!("Failed to create log file: {}", e))?;
 
-        // PowerShell wrapper that executes the script file with logging
+        // PowerShell wrapper that executes the script file with logging. Paths
+        // travel through environment variables so quote characters in a user
+        // profile cannot corrupt the wrapper source.
         let ps_wrapper = format!(
-            "$logFile = '{}'; \
+            "$logFile = $env:GIT_AI_UPGRADE_LOG_FILE; \
              Start-Transcript -Path $logFile -Append -Force | Out-Null; \
              Write-Host 'Running verified install script...'; \
              try {{ \
-                  $ErrorActionPreference = 'Continue'; \
-                  & '{}'; \
-                  Write-Host 'Install script completed'; \
+                  $ErrorActionPreference = 'Stop'; \
+                  & $env:GIT_AI_UPGRADE_SCRIPT_PATH; \
+                  if (-not (Test-Path -LiteralPath $env:{})) {{ \
+                      throw 'Install script exited without a verified upgrade receipt'; \
+                  }}; \
+                  Write-Host 'Install script produced a verified upgrade receipt'; \
               }} catch {{ \
                   Write-Host \"Error: $_\"; \
                   Write-Host \"Stack trace: $($_.ScriptStackTrace)\"; \
@@ -550,9 +1023,9 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
                       if (Test-Path $daemonExe) {{ try {{ & $daemonExe bg start *> $null }} catch {{ }} }} \
                   }}; \
                   Stop-Transcript | Out-Null; \
-                  Remove-Item -Path '{}' -Force -ErrorAction SilentlyContinue; \
+                  Remove-Item -LiteralPath $env:GIT_AI_UPGRADE_SCRIPT_PATH -Force -ErrorAction SilentlyContinue; \
               }}",
-            log_path_str, script_path_str, GIT_AI_RESTART_DAEMON_AFTER_INSTALL_ENV, script_path_str
+            GIT_AI_UPDATE_RECEIPT_PATH_ENV, GIT_AI_RESTART_DAEMON_AFTER_INSTALL_ENV
         );
 
         let spawn_powershell = |exe: &str| -> std::io::Result<std::process::Child> {
@@ -562,7 +1035,11 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
                 .arg("Bypass")
                 .arg("-Command")
                 .arg(&ps_wrapper)
-                .env(GIT_AI_RELEASE_ENV, tag);
+                .env(GIT_AI_RELEASE_ENV, tag)
+                .env(GIT_AI_INSTALL_EXPECTED_VERSION_ENV, &expected_version)
+                .env(GIT_AI_UPDATE_RECEIPT_PATH_ENV, &receipt_path)
+                .env("GIT_AI_UPGRADE_LOG_FILE", &log_path_str)
+                .env("GIT_AI_UPGRADE_SCRIPT_PATH", &script_path_str);
 
             // Hide the spawned console to prevent any host/UI bleed-through
             cmd.creation_flags(CREATE_NO_WINDOW);
@@ -600,7 +1077,6 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
 
     #[cfg(not(windows))]
     {
-        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
         // Write script to ~/.git-ai/tmp/ to avoid /tmp noexec or permission issues.
@@ -625,7 +1101,9 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
         let script_path_str = script_path.to_string_lossy().to_string();
 
         let mut cmd = Command::new("bash");
-        cmd.arg(&script_path_str).env(GIT_AI_RELEASE_ENV, tag);
+        cmd.arg(&script_path_str)
+            .env(GIT_AI_RELEASE_ENV, tag)
+            .env(GIT_AI_INSTALL_EXPECTED_VERSION_ENV, semver_from_tag(tag));
 
         if silent {
             cmd.env(GIT_AI_DAEMON_UPGRADE_ENV, "1");
@@ -690,6 +1168,30 @@ fn run_impl_with_url(
 ) -> UpgradeAction {
     let current_version = env!("CARGO_PKG_VERSION");
 
+    #[cfg(windows)]
+    {
+        let cache = read_update_cache();
+        let receipt_status =
+            reconcile_completed_windows_upgrade(channel, cache.as_ref(), api_base_url);
+        if receipt_status == WindowsUpgradeReceiptStatus::Blocked {
+            eprintln!(
+                "A Windows upgrade receipt is present but cannot be reconciled safely. Check the upgrade logs before retrying."
+            );
+            std::process::exit(1);
+        }
+        if receipt_status == WindowsUpgradeReceiptStatus::Absent
+            && cache.as_ref().is_some_and(|cache| {
+                cache.matches_channel(channel)
+                    && cache.available_semver.as_deref() == Some(current_version)
+            })
+        {
+            eprintln!(
+                "The running Windows version matches a pending update, but its completion receipt is missing. The pending state was retained; inspect the upgrade log before retrying."
+            );
+            std::process::exit(1);
+        }
+    }
+
     println!("Checking for updates (channel: {})...", channel.as_str());
 
     let release = match fetch_release_for_channel(api_base_url, channel) {
@@ -710,7 +1212,14 @@ fn run_impl_with_url(
     println!();
 
     let action = determine_action(force, &release, current_version);
-    let cache_release = matches!(action, UpgradeAction::UpgradeAvailable);
+    let cache_release = matches!(action, UpgradeAction::UpgradeAvailable)
+        || (cfg!(windows) && matches!(action, UpgradeAction::ForceReinstall));
+    #[cfg(windows)]
+    if let Err(error) = persist_update_state_strict(channel, cache_release.then_some(&release)) {
+        eprintln!("Could not durably record Windows update state: {error}");
+        std::process::exit(1);
+    }
+    #[cfg(not(windows))]
     persist_update_state(channel, cache_release.then_some(&release));
 
     log_message(
@@ -793,17 +1302,31 @@ fn run_impl_with_url(
 
     match run_install_script(&script_content, &release.tag, false) {
         Ok(()) => {
-            // On Windows, we spawn the installer in the background and can't verify success
             #[cfg(not(windows))]
             {
                 println!("\x1b[1;32m✓\x1b[0m Successfully installed {}!", release.tag);
+                log_message(
+                    "upgraded",
+                    "info",
+                    Some(serde_json::json!({
+                        "release_tag": release.tag,
+                        "current_version": current_version,
+                        "api_base_url": api_base_url,
+                        "channel": channel.as_str()
+                    })),
+                );
             }
 
+            // Detached Windows launch is only a schedule acknowledgement. The
+            // new process clears the pending cache and records success after it
+            // validates and consumes the installer's durable receipt.
+            #[cfg(windows)]
             log_message(
-                "upgraded",
+                "upgrade_scheduled",
                 "info",
                 Some(serde_json::json!({
                     "release_tag": release.tag,
+                    "expected_version": release.semver,
                     "current_version": current_version,
                     "api_base_url": api_base_url,
                     "channel": channel.as_str()
@@ -912,10 +1435,6 @@ pub enum DaemonUpdateCheckResult {
 /// no pending update was found or updates are disabled.
 pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult, String> {
     let config = config::Config::fresh();
-    if config.version_checks_disabled() || config.auto_updates_disabled() {
-        return Ok(DaemonUpdateCheckResult::NoUpdate);
-    }
-
     let channel = config.update_channel();
     let api_base_url = config.api_base_url();
 
@@ -925,6 +1444,15 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
     // persisted that fact — re-checking the 24h guard would always say
     // "too soon" and the install would never run.
     let cache = read_update_cache();
+    #[cfg(windows)]
+    if reconcile_completed_windows_upgrade(channel, cache.as_ref(), api_base_url)
+        != WindowsUpgradeReceiptStatus::Absent
+    {
+        return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
+    if config.version_checks_disabled() || config.auto_updates_disabled() {
+        return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
     let has_pending_update = cache
         .as_ref()
         .is_some_and(|c| c.matches_channel(channel) && c.update_available());
@@ -937,11 +1465,48 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
     let release = fetch_release_for_channel(api_base_url, channel)?;
     let current_version = env!("CARGO_PKG_VERSION");
     let action = determine_action(false, &release, current_version);
+    #[cfg(windows)]
+    let recover_missing_receipt = should_recover_missing_windows_receipt(
+        &action,
+        cache.as_ref(),
+        channel,
+        &release,
+        current_version,
+    );
+    #[cfg(not(windows))]
+    let recover_missing_receipt = false;
 
-    if action != UpgradeAction::UpgradeAvailable {
-        // Cache was stale or version changed between check and install.
+    if action != UpgradeAction::UpgradeAvailable && !recover_missing_receipt {
+        #[cfg(not(windows))]
         persist_update_state(channel, None);
+        #[cfg(windows)]
+        log_message(
+            "daemon_update_pending_without_receipt",
+            "warn",
+            Some(serde_json::json!({
+                "release_tag": release.tag,
+                "current_version": current_version,
+                "channel": channel.as_str(),
+                "result": action.to_string()
+            })),
+        );
         return Ok(DaemonUpdateCheckResult::NoUpdate);
+    }
+
+    #[cfg(windows)]
+    pin_pending_release_for_install_strict(channel, &release)?;
+
+    #[cfg(windows)]
+    if recover_missing_receipt {
+        log_message(
+            "daemon_recovering_missing_upgrade_receipt",
+            "warn",
+            Some(serde_json::json!({
+                "release_tag": release.tag.as_str(),
+                "current_version": current_version,
+                "channel": channel.as_str()
+            })),
+        );
     }
 
     log_message(
@@ -949,9 +1514,10 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
         "info",
         Some(serde_json::json!({
             "current_version": current_version,
-            "release_tag": release.tag,
+            "release_tag": release.tag.as_str(),
             "api_base_url": api_base_url,
-            "channel": channel.as_str()
+            "channel": channel.as_str(),
+            "receipt_recovery": recover_missing_receipt
         })),
     );
 
@@ -961,14 +1527,30 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
         fetch_and_verify_install_script(api_base_url, channel.as_str(), &checksums)?;
     run_install_script(&script_content, &release.tag, true)?;
 
-    // Clear the cached update now that we've installed it.
-    persist_update_state(channel, None);
+    #[cfg(not(windows))]
+    {
+        // Unix execution is synchronous: a zero exit status includes exact
+        // expected-version validation, so the pending cache can be cleared.
+        persist_update_state(channel, None);
+        log_message(
+            "daemon_upgraded",
+            "info",
+            Some(serde_json::json!({
+                "release_tag": release.tag,
+                "current_version": current_version,
+                "api_base_url": api_base_url,
+                "channel": channel.as_str()
+            })),
+        );
+    }
 
+    #[cfg(windows)]
     log_message(
-        "daemon_upgraded",
+        "daemon_upgrade_scheduled",
         "info",
         Some(serde_json::json!({
             "release_tag": release.tag,
+            "expected_version": release.semver,
             "current_version": current_version,
             "api_base_url": api_base_url,
             "channel": channel.as_str()
@@ -985,30 +1567,102 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
 /// the channel has a newer version than the running binary.
 pub fn check_for_update_available() -> Result<DaemonUpdateCheckResult, String> {
     let config = config::Config::fresh();
-    if config.version_checks_disabled() {
+    check_for_update_available_with_settings(
+        config.update_channel(),
+        config.api_base_url(),
+        config.version_checks_disabled(),
+        config.auto_updates_disabled(),
+        cfg!(windows),
+    )
+}
+
+fn check_for_update_available_with_settings(
+    channel: UpdateChannel,
+    api_base_url: &str,
+    version_checks_disabled: bool,
+    auto_updates_disabled: bool,
+    windows_receipt_recovery_enabled: bool,
+) -> Result<DaemonUpdateCheckResult, String> {
+    let cache = read_update_cache();
+    #[cfg(windows)]
+    let cache = match reconcile_completed_windows_upgrade(channel, cache.as_ref(), api_base_url) {
+        WindowsUpgradeReceiptStatus::Absent => cache,
+        WindowsUpgradeReceiptStatus::CleanupOnly | WindowsUpgradeReceiptStatus::Completed => {
+            read_update_cache()
+        }
+        WindowsUpgradeReceiptStatus::Blocked => {
+            return Ok(DaemonUpdateCheckResult::NoUpdate);
+        }
+    };
+    if version_checks_disabled {
         return Ok(DaemonUpdateCheckResult::NoUpdate);
     }
 
-    let channel = config.update_channel();
-    let api_base_url = config.api_base_url();
-    let cache = read_update_cache();
-
     if !should_check_for_updates(channel, cache.as_ref()) {
-        // Even if it's not time to re-check, an earlier check may have found an update.
-        if let Some(ref c) = cache
-            && c.matches_channel(channel)
-            && c.update_available()
-            && !config.auto_updates_disabled()
-        {
-            return Ok(DaemonUpdateCheckResult::UpdateReady);
+        // A fresh cache must not trigger shutdown merely because it contains a
+        // pending field. Only a newer version is an update; on Windows an exact
+        // current-version pending state is receipt recovery. Older state waits
+        // for the next normal channel check and is then cleared.
+        let mut validate_current_receipt_against_channel = false;
+        if !auto_updates_disabled {
+            match classify_cached_pending_update(cache.as_ref(), channel, env!("CARGO_PKG_VERSION"))
+            {
+                Some(CachedPendingDisposition::NewerThanCurrent) => {
+                    return Ok(DaemonUpdateCheckResult::UpdateReady);
+                }
+                Some(CachedPendingDisposition::CurrentNeedsReceipt)
+                    if windows_receipt_recovery_enabled =>
+                {
+                    // A same-version pending cache is only a receipt-recovery
+                    // candidate. Re-fetch the selected channel before asking
+                    // the daemon to restart: the channel may have rolled back
+                    // or advanced to a different tag since this cache was
+                    // written.
+                    validate_current_receipt_against_channel = true;
+                }
+                Some(CachedPendingDisposition::CurrentNeedsReceipt)
+                | Some(CachedPendingDisposition::OlderThanCurrent)
+                | None => {}
+            }
         }
-        return Ok(DaemonUpdateCheckResult::NoUpdate);
+        if !validate_current_receipt_against_channel {
+            return Ok(DaemonUpdateCheckResult::NoUpdate);
+        }
     }
 
     let release = fetch_release_for_channel(api_base_url, channel)?;
     let current_version = env!("CARGO_PKG_VERSION");
     let action = determine_action(false, &release, current_version);
+    if windows_receipt_recovery_enabled
+        && should_recover_missing_windows_receipt(
+            &action,
+            cache.as_ref(),
+            channel,
+            &release,
+            current_version,
+        )
+    {
+        log_message(
+            "update_pending_receipt_recovery_ready",
+            "warn",
+            Some(serde_json::json!({
+                "release_tag": release.tag,
+                "current_version": current_version,
+                "channel": channel.as_str(),
+                "result": action.to_string(),
+                "recovery": "rerun_exact_release_installer"
+            })),
+        );
+        return if auto_updates_disabled {
+            Ok(DaemonUpdateCheckResult::NoUpdate)
+        } else {
+            Ok(DaemonUpdateCheckResult::UpdateReady)
+        };
+    }
     let cache_release = matches!(action, UpgradeAction::UpgradeAvailable);
+    #[cfg(windows)]
+    persist_update_state_strict(channel, cache_release.then_some(&release))?;
+    #[cfg(not(windows))]
     persist_update_state(channel, cache_release.then_some(&release));
 
     log_message(
@@ -1022,32 +1676,44 @@ pub fn check_for_update_available() -> Result<DaemonUpdateCheckResult, String> {
         })),
     );
 
-    if action == UpgradeAction::UpgradeAvailable && !config.auto_updates_disabled() {
+    if action == UpgradeAction::UpgradeAvailable && !auto_updates_disabled {
         Ok(DaemonUpdateCheckResult::UpdateReady)
     } else {
         Ok(DaemonUpdateCheckResult::NoUpdate)
     }
 }
 
-fn is_newer_version(latest: &str, current: &str) -> bool {
-    let parse_version =
-        |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse::<u32>().ok()).collect() };
+fn compare_numeric_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let parse_version = |value: &str| -> Option<Vec<u32>> {
+        if value.is_empty() {
+            return None;
+        }
+        value
+            .split('.')
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+    };
 
-    let latest_parts = parse_version(latest);
-    let current_parts = parse_version(current);
+    let left_parts = parse_version(left)?;
+    let right_parts = parse_version(right)?;
 
-    for i in 0..latest_parts.len().max(current_parts.len()) {
-        let latest_part = latest_parts.get(i).copied().unwrap_or(0);
-        let current_part = current_parts.get(i).copied().unwrap_or(0);
+    for i in 0..left_parts.len().max(right_parts.len()) {
+        let left_part = left_parts.get(i).copied().unwrap_or(0);
+        let right_part = right_parts.get(i).copied().unwrap_or(0);
 
-        if latest_part > current_part {
-            return true;
-        } else if latest_part < current_part {
-            return false;
+        if left_part > right_part {
+            return Some(std::cmp::Ordering::Greater);
+        } else if left_part < right_part {
+            return Some(std::cmp::Ordering::Less);
         }
     }
 
-    false
+    Some(std::cmp::Ordering::Equal)
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    compare_numeric_versions(latest, current) == Some(std::cmp::Ordering::Greater)
 }
 
 #[cfg(test)]
@@ -1119,12 +1785,302 @@ mod tests {
     }
 
     #[test]
+    fn test_cached_pending_update_three_state_classification() {
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.available_tag = Some("v2.4.0".to_string());
+        cache.available_semver = Some("2.4.0".to_string());
+
+        assert_eq!(
+            classify_cached_pending_update(Some(&cache), UpdateChannel::Latest, "2.3.9"),
+            Some(CachedPendingDisposition::NewerThanCurrent)
+        );
+        assert_eq!(
+            classify_cached_pending_update(Some(&cache), UpdateChannel::Latest, "2.4.0"),
+            Some(CachedPendingDisposition::CurrentNeedsReceipt)
+        );
+        assert_eq!(
+            classify_cached_pending_update(Some(&cache), UpdateChannel::Latest, "2.4.1"),
+            Some(CachedPendingDisposition::OlderThanCurrent)
+        );
+
+        let release = ChannelRelease {
+            tag: "v2.4.0".to_string(),
+            semver: "2.4.0".to_string(),
+            checksum: "a".repeat(64),
+        };
+        assert!(!should_recover_missing_windows_receipt(
+            &UpgradeAction::RunningNewerVersion,
+            Some(&cache),
+            UpdateChannel::Latest,
+            &release,
+            "2.4.1",
+        ));
+    }
+
+    #[test]
     fn test_semver_from_tag_strips_prefix_and_suffix() {
         assert_eq!(semver_from_tag("v1.2.3"), "1.2.3");
         assert_eq!(semver_from_tag("1.2.3"), "1.2.3");
         assert_eq!(semver_from_tag("v1.2.3-next-abc"), "1.2.3");
         assert_eq!(semver_from_tag("enterprise-v1.2.3"), "1.2.3");
         assert_eq!(semver_from_tag("enterprise-v1.2.3-next-abc"), "1.2.3");
+    }
+
+    fn test_receipt(version: &str) -> UpgradeReceipt {
+        UpgradeReceipt {
+            format: 1,
+            expected_version: version.to_string(),
+            installed_version: version.to_string(),
+            release_tag: format!("v{version}"),
+            completed_at_utc: "2026-08-09T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_upgrade_receipt_requires_exact_running_and_pending_versions() {
+        let receipt = test_receipt("2.3.4");
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.available_semver = Some("2.3.4".to_string());
+        cache.available_tag = Some("v2.3.4".to_string());
+
+        assert!(
+            validate_upgrade_receipt(&receipt, Some(&cache), UpdateChannel::Latest, "2.3.4")
+                .is_ok()
+        );
+        assert!(
+            validate_upgrade_receipt(&receipt, Some(&cache), UpdateChannel::Latest, "2.3.3")
+                .is_err()
+        );
+
+        cache.available_tag = Some("v2.3.4-next-other".to_string());
+        assert!(
+            validate_upgrade_receipt(&receipt, Some(&cache), UpdateChannel::Latest, "2.3.4")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_upgrade_receipt_rejects_self_inconsistent_content() {
+        let mut receipt = test_receipt("2.3.4");
+        receipt.installed_version = "2.3.5".to_string();
+        assert!(validate_upgrade_receipt(&receipt, None, UpdateChannel::Latest, "2.3.5").is_err());
+
+        let mut receipt = test_receipt("2.3.4");
+        receipt.release_tag = "v2.3.5".to_string();
+        assert!(validate_upgrade_receipt(&receipt, None, UpdateChannel::Latest, "2.3.4").is_err());
+    }
+
+    #[test]
+    fn test_upgrade_receipt_requires_pending_cache() {
+        let receipt = test_receipt("2.3.4");
+        assert!(validate_upgrade_receipt(&receipt, None, UpdateChannel::Latest, "2.3.4").is_err());
+
+        let empty_cache = UpdateCache::new(UpdateChannel::Latest);
+        assert!(
+            validate_upgrade_receipt(&receipt, Some(&empty_cache), UpdateChannel::Latest, "2.3.4")
+                .is_err()
+        );
+    }
+
+    fn write_test_upgrade_receipt(receipt: &UpgradeReceipt) -> PathBuf {
+        let path = get_upgrade_receipt_path().unwrap();
+        fs::write(&path, serde_json::to_vec(receipt).unwrap()).unwrap();
+        path
+    }
+
+    fn write_test_pending_update(version: &str) -> UpdateCache {
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.available_semver = Some(version.to_string());
+        cache.available_tag = Some(format!("v{version}"));
+        write_update_cache(&cache);
+        cache
+    }
+
+    #[test]
+    #[serial]
+    fn test_receipt_cache_clear_failure_keeps_receipt_and_pending_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let cache = write_test_pending_update("2.3.4");
+        let receipt_path = write_test_upgrade_receipt(&test_receipt("2.3.4"));
+        unsafe {
+            std::env::set_var("GIT_AI_TEST_CACHE_CLEAR_FAILURE", "1");
+        }
+
+        let result = reconcile_upgrade_receipt_files(UpdateChannel::Latest, Some(&cache), "2.3.4");
+
+        unsafe {
+            std::env::remove_var("GIT_AI_TEST_CACHE_CLEAR_FAILURE");
+        }
+        assert!(matches!(result, UpgradeReceiptFileResult::Blocked { .. }));
+        assert!(receipt_path.exists());
+        assert!(read_update_cache().is_some_and(|cache| cache.update_available()));
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn test_receipt_delete_failure_clears_pending_and_reports_cleanup_debt() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let cache = write_test_pending_update("2.3.4");
+        let receipt_path = write_test_upgrade_receipt(&test_receipt("2.3.4"));
+        unsafe {
+            std::env::set_var("GIT_AI_TEST_RECEIPT_DELETE_FAILURE", "1");
+        }
+
+        let result = reconcile_upgrade_receipt_files(UpdateChannel::Latest, Some(&cache), "2.3.4");
+
+        unsafe {
+            std::env::remove_var("GIT_AI_TEST_RECEIPT_DELETE_FAILURE");
+        }
+        assert!(matches!(
+            result,
+            UpgradeReceiptFileResult::Completed {
+                cleanup_error: Some(_),
+                ..
+            }
+        ));
+        assert!(receipt_path.exists());
+        let cleared_cache = read_update_cache().expect("cleared cache tombstone");
+        assert!(cleared_cache.matches_channel(UpdateChannel::Latest));
+        assert!(!cleared_cache.update_available());
+
+        let second_result =
+            reconcile_upgrade_receipt_files(UpdateChannel::Latest, Some(&cleared_cache), "2.3.4");
+        assert!(matches!(
+            second_result,
+            UpgradeReceiptFileResult::CleanupOnly
+        ));
+        assert!(!receipt_path.exists());
+        assert!(read_update_cache().is_some_and(|cache| !cache.update_available()));
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn test_receipt_success_clears_pending_before_consuming_receipt() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let cache = write_test_pending_update("2.3.4");
+        let receipt_path = write_test_upgrade_receipt(&test_receipt("2.3.4"));
+
+        let result = reconcile_upgrade_receipt_files(UpdateChannel::Latest, Some(&cache), "2.3.4");
+
+        assert!(matches!(
+            result,
+            UpgradeReceiptFileResult::Completed {
+                cleanup_error: None,
+                ..
+            }
+        ));
+        assert!(!receipt_path.exists());
+        assert!(read_update_cache().is_some_and(|cache| {
+            cache.matches_channel(UpdateChannel::Latest) && !cache.update_available()
+        }));
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn test_current_receipt_without_cache_is_cleanup_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let receipt_path = write_test_upgrade_receipt(&test_receipt("2.3.4"));
+
+        let result = reconcile_upgrade_receipt_files(UpdateChannel::Latest, None, "2.3.4");
+
+        assert!(matches!(result, UpgradeReceiptFileResult::CleanupOnly));
+        assert!(!receipt_path.exists());
+        assert!(read_update_cache().is_none());
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn test_current_receipt_with_different_cleared_channel_is_cleanup_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let mut other_cache = UpdateCache::new(UpdateChannel::Next);
+        other_cache.last_checked_at = current_timestamp();
+        write_update_cache(&other_cache);
+        let receipt_path = write_test_upgrade_receipt(&test_receipt("2.3.4"));
+
+        let result =
+            reconcile_upgrade_receipt_files(UpdateChannel::Latest, Some(&other_cache), "2.3.4");
+
+        assert!(matches!(result, UpgradeReceiptFileResult::CleanupOnly));
+        assert!(!receipt_path.exists());
+        assert_eq!(read_update_cache(), Some(other_cache));
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn test_old_current_receipt_does_not_clear_newer_pending_update() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let newer_cache = write_test_pending_update("2.4.0");
+        let receipt_path = write_test_upgrade_receipt(&test_receipt("2.3.4"));
+
+        let result =
+            reconcile_upgrade_receipt_files(UpdateChannel::Latest, Some(&newer_cache), "2.3.4");
+
+        assert!(matches!(result, UpgradeReceiptFileResult::CleanupOnly));
+        assert!(!receipt_path.exists());
+        assert_eq!(read_update_cache(), Some(newer_cache));
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn test_windows_install_pins_advanced_channel_release_before_launch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let old_cache = write_test_pending_update("2.3.4");
+        assert_eq!(old_cache.available_tag.as_deref(), Some("v2.3.4"));
+
+        let advanced_release = ChannelRelease {
+            tag: "v2.4.0".to_string(),
+            semver: "2.4.0".to_string(),
+            checksum: "a".repeat(64),
+        };
+        pin_pending_release_for_install_strict(UpdateChannel::Latest, &advanced_release).unwrap();
+
+        let pinned = read_update_cache().expect("exact pending release");
+        assert!(pinned.matches_channel(UpdateChannel::Latest));
+        assert_eq!(pinned.available_tag.as_deref(), Some("v2.4.0"));
+        assert_eq!(pinned.available_semver.as_deref(), Some("2.4.0"));
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    fn test_exact_current_pending_release_recovers_missing_windows_receipt() {
+        let release = ChannelRelease {
+            tag: "v2.4.0".to_string(),
+            semver: "2.4.0".to_string(),
+            checksum: "a".repeat(64),
+        };
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.available_tag = Some(release.tag.clone());
+        cache.available_semver = Some(release.semver.clone());
+
+        assert!(should_recover_missing_windows_receipt(
+            &UpgradeAction::AlreadyLatest,
+            Some(&cache),
+            UpdateChannel::Latest,
+            &release,
+            "2.4.0",
+        ));
+
+        cache.available_tag = Some("v2.3.9".to_string());
+        assert!(!should_recover_missing_windows_receipt(
+            &UpgradeAction::AlreadyLatest,
+            Some(&cache),
+            UpdateChannel::Latest,
+            &release,
+            "2.4.0",
+        ));
     }
 
     #[test]
@@ -1833,6 +2789,89 @@ mod tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    fn write_fresh_current_pending_update(tag: &str) {
+        let mut cache = UpdateCache::new(UpdateChannel::Latest);
+        cache.last_checked_at = current_timestamp();
+        cache.available_tag = Some(tag.to_string());
+        cache.available_semver = Some(env!("CARGO_PKG_VERSION").to_string());
+        write_update_cache(&cache);
+    }
+
+    fn mock_latest_release(tag: &str) -> String {
+        format!(
+            r#"mock://{{"channels":{{"latest":{{"version":"{}","checksum":"{}"}}}}}}"#,
+            tag,
+            "a".repeat(64)
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn fresh_current_pending_windows_release_requires_exact_channel_match() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        write_fresh_current_pending_update(&current_tag);
+
+        let result = check_for_update_available_with_settings(
+            UpdateChannel::Latest,
+            &mock_latest_release(&current_tag),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result, DaemonUpdateCheckResult::UpdateReady);
+        assert!(read_update_cache().is_some_and(|cache| cache.update_available()));
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn fresh_current_pending_windows_release_rollback_clears_stale_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        write_fresh_current_pending_update(&current_tag);
+
+        let result = check_for_update_available_with_settings(
+            UpdateChannel::Latest,
+            &mock_latest_release("v1.0.0"),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result, DaemonUpdateCheckResult::NoUpdate);
+        assert!(read_update_cache().is_some_and(|cache| !cache.update_available()));
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn fresh_current_pending_windows_different_tag_clears_stale_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+        let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        write_fresh_current_pending_update(&current_tag);
+        let different_tag = format!("{}-next-other", current_tag);
+
+        let result = check_for_update_available_with_settings(
+            UpdateChannel::Latest,
+            &mock_latest_release(&different_tag),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result, DaemonUpdateCheckResult::NoUpdate);
+        assert!(read_update_cache().is_some_and(|cache| !cache.update_available()));
+        clear_test_cache_dir();
     }
 
     #[test]

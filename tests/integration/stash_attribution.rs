@@ -1600,7 +1600,10 @@ fn test_partial_stash_trims_unstashed_initial_metadata() {
         "unstashed session metadata should be dropped"
     );
 
-    let live_initial = repo.current_working_logs().read_initial_attributions();
+    let live_initial = repo
+        .current_working_logs()
+        .read_initial_attributions()
+        .unwrap();
     assert!(
         !live_initial.prompts.contains_key("prompt_a"),
         "live INITIAL should not retain metadata for the stashed file"

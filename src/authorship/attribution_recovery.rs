@@ -1226,6 +1226,15 @@ fn select_best_bash_candidate<'a>(
     candidates
         .iter()
         .filter_map(|candidate| {
+            // A nearby timestamp is only a correlation signal.  Do not let a
+            // Bash call from an unrelated worktree (or merely an ancestor
+            // cwd) claim unknown lines in this commit.  Cross-repository Bash
+            // writes are not observable from the current command/cwd hook
+            // contract, so they must stay unknown.  A session already present
+            // in the target commit can rank same-worktree candidates, but it
+            // cannot prove that this Bash call wrote across repositories.
+            let tier =
+                bash_candidate_tier(candidate, existing_commit_sessions, target_repo_work_dir)?;
             let distance = timestamps
                 .iter()
                 .filter_map(|ts| recovery_distance_to_call_window(*ts, candidate))
@@ -1233,11 +1242,7 @@ fn select_best_bash_candidate<'a>(
             Some(BashCandidateSelection {
                 candidate,
                 distance_ns: distance,
-                tier: bash_candidate_tier(
-                    candidate,
-                    existing_commit_sessions,
-                    target_repo_work_dir,
-                ),
+                tier,
             })
         })
         .min_by(|left, right| {
@@ -1272,27 +1277,21 @@ struct BashCandidateSelection<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BashCandidateTier {
     ExistingCommitSession,
-    WorkdirAncestor,
-    CwdAncestor,
-    TimeOnly,
+    SameWorktree,
 }
 
 impl BashCandidateTier {
     fn score(self) -> u8 {
         match self {
             Self::ExistingCommitSession => 0,
-            Self::WorkdirAncestor => 1,
-            Self::CwdAncestor => 2,
-            Self::TimeOnly => 3,
+            Self::SameWorktree => 1,
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::ExistingCommitSession => "existing_commit_session",
-            Self::WorkdirAncestor => "workdir_ancestor",
-            Self::CwdAncestor => "cwd_ancestor",
-            Self::TimeOnly => "time_only",
+            Self::SameWorktree => "same_worktree",
         }
     }
 }
@@ -1301,23 +1300,17 @@ fn bash_candidate_tier(
     candidate: &BashCheckpointCall,
     existing_commit_sessions: &HashSet<String>,
     target_repo_work_dir: &str,
-) -> BashCandidateTier {
+) -> Option<BashCandidateTier> {
+    if candidate.repo_work_dir.as_deref() != Some(target_repo_work_dir) {
+        return None;
+    }
+
     let session_id = bash_candidate_session_id(candidate);
     if existing_commit_sessions.contains(&session_id) {
-        return BashCandidateTier::ExistingCommitSession;
+        return Some(BashCandidateTier::ExistingCommitSession);
     }
 
-    if let Some(repo_work_dir) = candidate.repo_work_dir.as_deref()
-        && path_is_equal_or_child(target_repo_work_dir, repo_work_dir)
-    {
-        return BashCandidateTier::WorkdirAncestor;
-    }
-
-    if path_is_equal_or_child(target_repo_work_dir, &candidate.original_cwd) {
-        return BashCandidateTier::CwdAncestor;
-    }
-
-    BashCandidateTier::TimeOnly
+    Some(BashCandidateTier::SameWorktree)
 }
 
 fn bash_candidate_session_id(candidate: &BashCheckpointCall) -> String {
@@ -1450,16 +1443,6 @@ fn existing_commit_session_ids(authorship_log: &AuthorshipLog) -> HashSet<String
         }
     }
     sessions
-}
-
-fn path_is_equal_or_child(child: &str, parent: &str) -> bool {
-    if child.is_empty() || parent.is_empty() {
-        return false;
-    }
-
-    let child = Path::new(child);
-    let parent = Path::new(parent);
-    child == parent || child.starts_with(parent)
 }
 
 fn insert_session_record(
@@ -1899,7 +1882,7 @@ mod tests {
         let existing_sessions = HashSet::from([existing_session]);
         let candidates = vec![
             bash_call(1, "closer-session", "tool-closer", "/repo", 1_040, None),
-            bash_call(2, "existing-session", "tool-existing", "/other", 900, None),
+            bash_call(2, "existing-session", "tool-existing", "/repo", 900, None),
         ];
 
         let selection =
@@ -1917,8 +1900,8 @@ mod tests {
             generate_session_id("existing-near", "codex"),
         ]);
         let candidates = vec![
-            bash_call(1, "existing-far", "tool-far", "/other", 900, None),
-            bash_call(2, "existing-near", "tool-near", "/other", 1_000, None),
+            bash_call(1, "existing-far", "tool-far", "/repo", 900, None),
+            bash_call(2, "existing-near", "tool-near", "/repo", 1_000, None),
         ];
 
         let selection =
@@ -1930,13 +1913,33 @@ mod tests {
     }
 
     #[test]
-    fn bash_candidate_ranking_prefers_workdir_ancestor_when_no_session_matches() {
+    fn bash_candidate_ranking_rejects_existing_session_from_different_repo() {
+        let existing_session = generate_session_id("existing-session", "codex");
+        let existing_sessions = HashSet::from([existing_session]);
+        let candidates = vec![bash_call(
+            1,
+            "existing-session",
+            "tool-other-repo",
+            "/other",
+            1_040,
+            None,
+        )];
+
+        assert!(
+            select_best_bash_candidate(&candidates, &[1_050], &existing_sessions, "/repo")
+                .is_none(),
+            "the same session in a commit does not prove that a Bash call wrote across repositories"
+        );
+    }
+
+    #[test]
+    fn bash_candidate_ranking_accepts_exact_worktree_when_no_session_matches() {
         let candidates = vec![
             bash_call(
                 1,
-                "ancestor-session",
-                "tool-ancestor",
-                "/tmp/work",
+                "same-worktree-session",
+                "tool-same-worktree",
+                "/tmp/work/repo",
                 900,
                 None,
             ),
@@ -1947,18 +1950,18 @@ mod tests {
             select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/tmp/work/repo")
                 .expect("expected candidate");
 
-        assert_eq!(selection.candidate.tool_use_id, "tool-ancestor");
-        assert_eq!(selection.tier, BashCandidateTier::WorkdirAncestor);
+        assert_eq!(selection.candidate.tool_use_id, "tool-same-worktree");
+        assert_eq!(selection.tier, BashCandidateTier::SameWorktree);
     }
 
     #[test]
-    fn bash_candidate_ranking_prefers_workdir_ancestor_over_cwd_ancestor() {
+    fn bash_candidate_ranking_prefers_exact_worktree_over_parent_cwd() {
         let candidates = vec![
             bash_call(
                 1,
-                "workdir-ancestor-session",
-                "tool-workdir-ancestor",
-                "/tmp/work",
+                "same-worktree-session",
+                "tool-same-worktree",
+                "/tmp/work/repo",
                 900,
                 None,
             ),
@@ -1976,12 +1979,12 @@ mod tests {
             select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/tmp/work/repo")
                 .expect("expected candidate");
 
-        assert_eq!(selection.candidate.tool_use_id, "tool-workdir-ancestor");
-        assert_eq!(selection.tier, BashCandidateTier::WorkdirAncestor);
+        assert_eq!(selection.candidate.tool_use_id, "tool-same-worktree");
+        assert_eq!(selection.tier, BashCandidateTier::SameWorktree);
     }
 
     #[test]
-    fn bash_candidate_ranking_prefers_cwd_ancestor_over_time_only() {
+    fn bash_candidate_ranking_rejects_parent_cwd_without_target_session() {
         let candidates = vec![
             unresolved_bash_attempt(
                 1,
@@ -1994,27 +1997,47 @@ mod tests {
             bash_call(2, "closer-session", "tool-closer", "/other", 1_040, None),
         ];
 
-        let selection =
+        assert!(
             select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/tmp/work/repo")
-                .expect("expected candidate");
-
-        assert_eq!(selection.candidate.tool_use_id, "tool-cwd-ancestor");
-        assert_eq!(selection.tier, BashCandidateTier::CwdAncestor);
+                .is_none(),
+            "an ancestor cwd does not prove that the Bash call wrote the target repository"
+        );
     }
 
     #[test]
-    fn bash_candidate_ranking_falls_back_to_closest_time() {
+    fn bash_candidate_ranking_rejects_time_only_candidates() {
         let candidates = vec![
             bash_call(1, "far-session", "tool-far", "/other-a", 900, None),
             bash_call(2, "near-session", "tool-near", "/other-b", 1_040, None),
         ];
 
-        let selection = select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/repo")
-            .expect("expected candidate");
+        assert!(
+            select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/repo").is_none(),
+            "time proximity alone must not turn an unrelated repository write into AI code"
+        );
+    }
 
-        assert_eq!(selection.candidate.tool_use_id, "tool-near");
-        assert_eq!(selection.tier, BashCandidateTier::TimeOnly);
-        assert_eq!(selection.distance_ns, 10);
+    #[test]
+    fn bash_candidate_ranking_rejects_nested_repository_below_recorded_worktree() {
+        let candidates = vec![bash_call(
+            1,
+            "outer-session",
+            "tool-outer",
+            "/tmp/work",
+            1_040,
+            None,
+        )];
+
+        assert!(
+            select_best_bash_candidate(
+                &candidates,
+                &[1_050],
+                &HashSet::new(),
+                "/tmp/work/nested-repo"
+            )
+            .is_none(),
+            "path ancestry does not prove that nested repositories were inside the observed worktree scope"
+        );
     }
 
     #[test]

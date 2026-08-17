@@ -210,7 +210,7 @@ fn test_read_all_checkpoints_filters_incompatible_versions() {
 }
 
 #[test]
-fn test_oversized_checkpoints_file_is_truncated_before_read() {
+fn test_oversized_checkpoints_file_is_preserved_and_rejected_before_read() {
     let repo = TestRepo::new();
     let repo_storage = storage_for(&repo);
     let working_log = repo_storage
@@ -221,20 +221,18 @@ fn test_oversized_checkpoints_file_is_truncated_before_read() {
     fs::write(&checkpoints_file, "this is intentionally not valid json\n")
         .expect("write oversized checkpoints fixture");
 
-    let checkpoints = working_log
+    let error = working_log
         .read_all_checkpoints_with_size_limit_for_test(8)
-        .expect("oversized checkpoint file should be reset before parsing");
+        .expect_err("oversized checkpoint file must fail closed before parsing");
 
     assert!(
-        checkpoints.is_empty(),
-        "oversized checkpoints file should read back as empty"
+        error.to_string().contains("exceeded maximum size"),
+        "oversized checkpoint error should explain the blocking limit"
     );
     assert_eq!(
-        fs::metadata(&checkpoints_file)
-            .expect("empty checkpoints file should remain")
-            .len(),
-        0,
-        "oversized checkpoints file should be truncated to an empty file"
+        fs::read_to_string(&checkpoints_file).expect("oversized checkpoint evidence should remain"),
+        "this is intentionally not valid json\n",
+        "oversized checkpoint evidence must never be deleted as a side effect of reading"
     );
 }
 
@@ -371,7 +369,7 @@ fn test_write_initial_with_contents_persists_snapshot_blob() {
         )
         .expect("write INITIAL with contents");
 
-    let initial = working_log.read_initial_attributions();
+    let initial = working_log.read_initial_attributions().unwrap();
     let blob_sha = initial
         .file_blobs
         .get("src/test.rs")

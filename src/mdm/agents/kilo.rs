@@ -134,8 +134,8 @@ impl KiloInstaller {
         )?;
         content = Self::replace_required(
             content,
-            "const CHECKPOINT_ARGS = [\"checkpoint\", \"opencode\", \"--hook-input\", \"stdin\"]",
-            "const CHECKPOINT_ARGS = [\"checkpoint\", \"kilo\", \"--hook-input\", \"stdin\"]",
+            "const CHECKPOINT_ARGS = [\"checkpoint\", \"opencode\", \"--strict-errors\", \"--hook-input\", \"stdin\"]",
+            "const CHECKPOINT_ARGS = [\"checkpoint\", \"kilo\", \"--strict-errors\", \"--hook-input\", \"stdin\"]",
             1,
         )?;
         content = Self::replace_required(
@@ -392,13 +392,17 @@ mod tests {
         let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
         assert!(content.contains("@kilocode/plugin"));
         assert!(!content.contains("@opencode-ai/plugin"));
-        assert!(content.contains("[\"checkpoint\", \"kilo\", \"--hook-input\", \"stdin\"]"));
+        assert!(content.contains(
+            "[\"checkpoint\", \"kilo\", \"--strict-errors\", \"--hook-input\", \"stdin\"]"
+        ));
         assert!(content.contains("process.env.KILO_PLATFORM"));
         assert!(content.contains("process.env.KILO_CLIENT"));
         assert!(content.contains("process.env.KILO_EDITOR_NAME"));
         assert!(content.contains("process.env.KILO_DB"));
         assert!(content.contains("const GIT_AI_BIN = \"/usr/local/bin/git-ai\""));
         assert!(!content.contains("__GIT_AI_BINARY_PATH__"));
+        assert!(content.contains("failClosedHook"));
+        assert!(!content.contains("swallowHookErrors"));
     }
 
     #[test]
@@ -408,13 +412,83 @@ mod tests {
             .find("await runCheckpoint(hookInput)")
             .expect("pre checkpoint call");
         let track_pending_call = content
-            .find("pendingCalls.set(callID")
+            .find("pendingCalls.set(callKey")
             .expect("pending call insertion");
 
         assert!(
             pre_checkpoint < track_pending_call,
             "a failed Kilo pre checkpoint must not enable a post-only checkpoint"
         );
+    }
+
+    #[test]
+    fn test_kilo_plugin_reconstructs_post_after_plugin_restart() {
+        let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
+        let post_hook = content.find("\"tool.execute.after\"").expect("post hook");
+        let post_content = &content[post_hook..];
+        let post_checkpoint = post_content
+            .find("await runCheckpoint(hookInput)")
+            .expect("post checkpoint call");
+        let delete_pending = post_content
+            .rfind("pendingCalls.delete(callKey)")
+            .expect("pending call deletion");
+
+        assert!(post_checkpoint < delete_pending);
+        assert!(post_content.contains("const postToolInput = input.args ?? callInfo?.toolInput"));
+        assert!(post_content.contains("const candidateFilePaths = callInfo"));
+        assert!(post_content.contains("? callInfo.filePaths"));
+        assert!(!post_content.contains("new Set([...callInfo.filePaths, ...extractedFilePaths])"));
+        assert!(post_content.contains("await resolveGitFileScope(candidateFilePaths)"));
+        assert!(!post_content.contains("has no acknowledged pre-tool call"));
+    }
+
+    #[test]
+    fn test_kilo_plugin_scopes_reused_call_ids_by_session() {
+        let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
+        assert!(content.contains(
+            "pendingCallKey = (sessionID: string, callID: string): string => JSON.stringify([sessionID, callID])"
+        ));
+        assert!(content.contains("pendingCalls.set(callKey"));
+        assert!(content.contains("const callKey = pendingCallKey(sessionID, callID)"));
+        assert!(content.contains("pendingCalls.get(callKey)"));
+        assert!(content.contains("pendingCalls.delete(callKey)"));
+        assert!(content.contains("pendingCalls.has(callKey) || nonGitCalls.has(callKey)"));
+        assert!(content.contains("callInfo.toolName !== toolName"));
+    }
+
+    #[test]
+    fn test_kilo_plugin_keeps_explicit_non_git_edits_out_of_scope() {
+        let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
+        assert!(content.contains("await resolveGitFileScope(filePaths)"));
+        assert!(content.contains("const nonGitToolName = nonGitCalls.get(callKey)"));
+        assert!(content.contains("nonGitCalls.delete(callKey)"));
+    }
+
+    #[test]
+    fn test_kilo_plugin_does_not_fallback_from_non_git_bash_cwd() {
+        let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
+        assert!(content.contains(": await findGitRepo(toolCwd)"));
+        assert!(!content.contains("findGitRepoOnce(defaultCwd)"));
+        assert!(!content.contains("findGitRepoOnce(process.cwd())"));
+    }
+
+    #[test]
+    fn test_kilo_plugin_fails_closed_on_repository_inspection_errors() {
+        let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
+        assert!(content.contains("isMissingPathError"));
+        assert!(content.contains("invalid Git metadata pointer"));
+        assert!(content.contains("failed to inspect Git metadata"));
+    }
+
+    #[test]
+    fn test_kilo_plugin_scopes_mixed_edits_to_every_git_repository() {
+        let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
+        assert!(content.contains("resolveGitFileScope"));
+        assert!(content.contains("git_ai_file_paths"));
+        assert!(content.contains("repoDirs"));
+        assert!(content.contains("missingRepos"));
+        assert!(content.contains("unexpectedRepos"));
+        assert!(content.contains("lost the acknowledged repository scope"));
     }
 
     #[test]

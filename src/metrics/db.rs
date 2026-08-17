@@ -5,10 +5,7 @@
 //! other delivered metrics remain available as local history. The server
 //! handles idempotency.
 
-use crate::config::{
-    REPORTING_PROFILE_RESERVED_ATTRIBUTE_KEYS, REPORTING_PROFILE_VERSION,
-    REPORTING_PROFILE_VERSION_ATTRIBUTE,
-};
+use crate::config::{REPORTING_PROFILE_VERSION, REPORTING_PROFILE_VERSION_ATTRIBUTE};
 use crate::error::GitAiError;
 use crate::metrics::attrs::attr_pos;
 use crate::metrics::events::{
@@ -19,17 +16,17 @@ use crate::metrics::session_compaction::{SessionObservation, compact_session_eve
 use crate::metrics::types::{MetricEvent, MetricEventId, SparseArray};
 use crate::utils::LockFile;
 use chrono::{Local, TimeZone};
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Current schema version (must match MIGRATIONS.len())
-const SCHEMA_VERSION: usize = 11;
+const SCHEMA_VERSION: usize = 15;
 
 // This value is part of the metrics retry index schema. Changing it requires a
 // migration that rebuilds `metrics_retryable` with the same literal used by
@@ -229,6 +226,22 @@ const MIGRATIONS: &[&str] = &[
     // Migration 10 -> 11: persist immutable Event 8 ref transitions before
     // rev-list/build work so a side-effect failure remains retryable.
     crate::metrics::deferred_lifecycle_jobs::DEFERRED_LIFECYCLE_JOBS_SCHEMA_SQL,
+    // Migration 11 -> 12: persist checkpoint requests and their exact prepared
+    // working-log/metric side effects before publishing either durability domain.
+    crate::metrics::deferred_checkpoint_jobs::DEFERRED_CHECKPOINT_JOBS_SCHEMA_SQL,
+    // Migration 12 -> 13: session_activity reporting identity columns are
+    // added idempotently by add_session_reporting_identity_columns(). Existing
+    // sessions start ambiguous because their historical profile cannot be
+    // reconstructed from compact rows.
+    "",
+    // Migration 13 -> 14: permanently retain checkpoint path scope and
+    // evidence-blocking diagnostics. Columns are added idempotently before the
+    // index is rebuilt so interrupted upgrades can safely resume.
+    crate::metrics::deferred_checkpoint_jobs::DEFERRED_CHECKPOINT_RECOVERY_INDEX_SQL,
+    // Migration 14 -> 15: distinguish an explicit, evidence-backed operator
+    // abandonment from normal completion. Columns are added idempotently before
+    // this empty transactional migration.
+    "",
 ];
 
 /// Global database singleton
@@ -281,7 +294,8 @@ pub(crate) struct CompactTokenRecord {
 
 struct PendingDailyTokenDelta {
     bucket_key: String,
-    anonymous_bucket_key: String,
+    recoverable_anonymous_buckets: BTreeMap<String, String>,
+    identified: bool,
     date_key: String,
     timezone: String,
     machine_id: String,
@@ -502,6 +516,9 @@ impl MetricsDatabase {
         if let Ok(current_version) = version_check {
             if current_version == SCHEMA_VERSION {
                 self.add_deferred_commit_parent_note_column()?;
+                self.add_session_reporting_identity_columns()?;
+                self.add_deferred_checkpoint_recovery_columns()?;
+                self.add_deferred_checkpoint_terminal_columns()?;
                 self.ensure_legacy_content_insert_guard()?;
                 if self.legacy_content_rows_exist()? {
                     self.compact_legacy_content_events()?;
@@ -511,6 +528,10 @@ impl MetricsDatabase {
                     100,
                 )?;
                 crate::metrics::deferred_lifecycle_jobs::compact_done_payloads_on_connection(
+                    &mut self.conn,
+                    100,
+                )?;
+                crate::metrics::deferred_checkpoint_jobs::compact_done_payloads_on_connection(
                     &mut self.conn,
                     100,
                 )?;
@@ -576,6 +597,10 @@ impl MetricsDatabase {
             100,
         )?;
         crate::metrics::deferred_lifecycle_jobs::compact_done_payloads_on_connection(
+            &mut self.conn,
+            100,
+        )?;
+        crate::metrics::deferred_checkpoint_jobs::compact_done_payloads_on_connection(
             &mut self.conn,
             100,
         )?;
@@ -649,6 +674,19 @@ impl MetricsDatabase {
         }
         if from_version == 10 {
             self.add_deferred_commit_parent_note_column()?;
+        }
+        if from_version == 13 {
+            self.add_deferred_checkpoint_recovery_columns()?;
+        }
+        if from_version == 14 {
+            self.add_deferred_checkpoint_terminal_columns()?;
+        }
+        // Version 6 is the first schema containing session_activity. Add the
+        // columns before compacting legacy content so those rows can establish
+        // identity from their own historical attrs. Version 12 upgrades
+        // already-compacted sessions conservatively as legacy-ambiguous.
+        if from_version == 6 || from_version == 12 {
+            self.add_session_reporting_identity_columns()?;
         }
 
         let migration_sql = MIGRATIONS[from_version];
@@ -873,6 +911,66 @@ impl MetricsDatabase {
         )
     }
 
+    fn add_session_reporting_identity_columns(&mut self) -> Result<(), GitAiError> {
+        for (name, sql) in [
+            (
+                "reporting_identity_email",
+                "ALTER TABLE session_activity ADD COLUMN reporting_identity_email TEXT",
+            ),
+            (
+                "reporting_identity_state",
+                "ALTER TABLE session_activity ADD COLUMN reporting_identity_state TEXT NOT NULL DEFAULT 'legacy_ambiguous'",
+            ),
+        ] {
+            self.add_column_if_missing("session_activity", name, sql)?;
+        }
+        Ok(())
+    }
+
+    fn add_deferred_checkpoint_recovery_columns(&mut self) -> Result<(), GitAiError> {
+        for (name, sql) in [
+            (
+                "path_scope_json",
+                "ALTER TABLE deferred_checkpoint_jobs ADD COLUMN path_scope_json TEXT",
+            ),
+            (
+                "admission_owner",
+                "ALTER TABLE deferred_checkpoint_jobs ADD COLUMN admission_owner TEXT",
+            ),
+            (
+                "blocked_evidence",
+                "ALTER TABLE deferred_checkpoint_jobs ADD COLUMN blocked_evidence INTEGER NOT NULL DEFAULT 0 CHECK (blocked_evidence IN (0, 1))",
+            ),
+            (
+                "blocked_reason",
+                "ALTER TABLE deferred_checkpoint_jobs ADD COLUMN blocked_reason TEXT",
+            ),
+        ] {
+            self.add_column_if_missing("deferred_checkpoint_jobs", name, sql)?;
+        }
+        Ok(())
+    }
+
+    fn add_deferred_checkpoint_terminal_columns(&mut self) -> Result<(), GitAiError> {
+        for (name, sql) in [
+            (
+                "terminal_resolution",
+                "ALTER TABLE deferred_checkpoint_jobs ADD COLUMN terminal_resolution TEXT NOT NULL DEFAULT 'normal' CHECK (terminal_resolution IN ('normal', 'manual_abandoned'))",
+            ),
+            (
+                "repair_id",
+                "ALTER TABLE deferred_checkpoint_jobs ADD COLUMN repair_id TEXT",
+            ),
+            (
+                "repair_backup_path",
+                "ALTER TABLE deferred_checkpoint_jobs ADD COLUMN repair_backup_path TEXT",
+            ),
+        ] {
+            self.add_column_if_missing("deferred_checkpoint_jobs", name, sql)?;
+        }
+        Ok(())
+    }
+
     fn add_column_if_missing(
         &mut self,
         table: &str,
@@ -919,67 +1017,7 @@ impl MetricsDatabase {
         }
 
         let tx = self.conn.transaction()?;
-        let mut ids = Vec::with_capacity(events.len());
-
-        {
-            let mut stmt = tx.prepare_cached(
-                r#"
-                INSERT INTO metrics (
-                    event_json,
-                    delivered_ts,
-                    event_ts,
-                    event_kind,
-                    trace_id,
-                    session_id,
-                    parent_session_id,
-                    tool,
-                    external_session_id,
-                    external_parent_session_id,
-                    external_event_id,
-                    external_parent_event_id,
-                    external_tool_use_id
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                "#,
-            )?;
-
-            for event_json in events {
-                let metadata = extract_metric_event_metadata(event_json);
-                let event_ts = metadata.as_ref().map(|m| i64::from(m.event_ts));
-                let event_kind = metadata.as_ref().map(|m| i64::from(m.event_kind));
-                let delivered_ts = delivered_ts.map(|ts| ts as i64);
-
-                stmt.execute(params![
-                    event_json,
-                    delivered_ts,
-                    event_ts,
-                    event_kind,
-                    metadata.as_ref().and_then(|m| m.trace_id.as_deref()),
-                    metadata.as_ref().and_then(|m| m.session_id.as_deref()),
-                    metadata
-                        .as_ref()
-                        .and_then(|m| m.parent_session_id.as_deref()),
-                    metadata.as_ref().and_then(|m| m.tool.as_deref()),
-                    metadata
-                        .as_ref()
-                        .and_then(|m| m.external_session_id.as_deref()),
-                    metadata
-                        .as_ref()
-                        .and_then(|m| m.external_parent_session_id.as_deref()),
-                    metadata
-                        .as_ref()
-                        .and_then(|m| m.external_event_id.as_deref()),
-                    metadata
-                        .as_ref()
-                        .and_then(|m| m.external_parent_event_id.as_deref()),
-                    metadata
-                        .as_ref()
-                        .and_then(|m| m.external_tool_use_id.as_deref()),
-                ])?;
-                ids.push(tx.last_insert_rowid());
-            }
-        }
-
+        let ids = insert_event_jsons_in_transaction(&tx, events, delivered_ts)?;
         tx.commit()?;
         self.prune_old_metrics_if_due()?;
         Ok(ids)
@@ -1029,8 +1067,9 @@ impl MetricsDatabase {
             tx.execute(
                 r#"
                 INSERT INTO session_activity (
-                    session_id, first_ts, last_ts, tool, model, repo_url, external_session_id
-                ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
+                    session_id, first_ts, last_ts, tool, model, repo_url,
+                    external_session_id, reporting_identity_state
+                ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 'unbound')
                 ON CONFLICT(session_id) DO UPDATE SET
                     first_ts = MIN(session_activity.first_ts, excluded.first_ts),
                     last_ts = MAX(session_activity.last_ts, excluded.last_ts),
@@ -1051,6 +1090,8 @@ impl MetricsDatabase {
                     external_session_id,
                 ],
             )?;
+            let reporting_identity_allows_recovery =
+                observe_session_reporting_identity(&tx, &session_id, &observation.attrs)?;
 
             if !external_session_id.is_empty() {
                 let recovery_key = recovery_event_key(
@@ -1179,13 +1220,7 @@ impl MetricsDatabase {
                 ],
             )?;
 
-            if token.baseline_only
-                || (input_delta == 0
-                    && output_delta == 0
-                    && cache_read_delta == 0
-                    && cache_write_delta == 0
-                    && request_count == 0)
-            {
+            if token.baseline_only {
                 continue;
             }
 
@@ -1196,12 +1231,36 @@ impl MetricsDatabase {
                     token.provider.as_deref(),
                     &machine_id,
                     &token.source_key,
+                    &session_id,
                 )?;
+            let identified = compact_identity_email(&snapshot_attrs).is_some();
+            let has_daily_delta = input_delta > 0
+                || output_delta > 0
+                || cache_read_delta > 0
+                || cache_write_delta > 0
+                || request_count > 0;
+            let can_recover_existing_anonymous = identified
+                && reporting_identity_allows_recovery
+                && anonymous_bucket_key != bucket_key;
+            if !has_daily_delta {
+                if !can_recover_existing_anonymous {
+                    continue;
+                }
+                let anonymous_exists: i64 = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_token_daily WHERE bucket_key = ?1)",
+                    params![anonymous_bucket_key],
+                    |row| row.get(0),
+                )?;
+                if anonymous_exists == 0 {
+                    continue;
+                }
+            }
             let delta = pending_token_deltas
                 .entry(bucket_key.clone())
                 .or_insert_with(|| PendingDailyTokenDelta {
                     bucket_key,
-                    anonymous_bucket_key,
+                    recoverable_anonymous_buckets: BTreeMap::new(),
+                    identified,
                     date_key,
                     timezone: timezone.clone(),
                     machine_id: machine_id.clone(),
@@ -1215,6 +1274,11 @@ impl MetricsDatabase {
                     request_count: 0,
                     provider: token.provider.clone(),
                 });
+            if can_recover_existing_anonymous {
+                delta
+                    .recoverable_anonymous_buckets
+                    .insert(anonymous_bucket_key, session_id.clone());
+            }
             delta.input = delta.input.saturating_add(input_delta);
             delta.output = delta.output.saturating_add(output_delta);
             delta.cache_read = delta.cache_read.saturating_add(cache_read_delta);
@@ -1232,22 +1296,24 @@ impl MetricsDatabase {
         }
 
         let mut pending_token_deltas = pending_token_deltas.into_values().collect::<Vec<_>>();
-        // Materialize unknown deltas first, then let the most recently observed
-        // valid identity claim that transient bucket. This matters when one
-        // compaction batch spans an A -> unknown -> B profile transition.
-        pending_token_deltas.sort_by_key(|delta| {
-            (
-                delta.anonymous_bucket_key != delta.bucket_key,
-                Reverse(delta.sequence),
-            )
-        });
+        // Materialize anonymous deltas first, then let a proven same-session
+        // identity claim only the corresponding session-scoped bucket.
+        pending_token_deltas.sort_by_key(|delta| (delta.identified, Reverse(delta.sequence)));
 
         for delta in pending_token_deltas {
             let attrs_json = serde_json::to_string(&delta.attrs)?;
-            if delta.anonymous_bucket_key != delta.bucket_key {
+            let target_email = compact_identity_email(&delta.attrs);
+            for (anonymous_bucket_key, session_id) in &delta.recoverable_anonymous_buckets {
+                if !session_reporting_identity_is_bound_to(
+                    &tx,
+                    session_id,
+                    target_email.as_deref(),
+                )? {
+                    continue;
+                }
                 migrate_unknown_daily_token_bucket(
                     &tx,
-                    &delta.anonymous_bucket_key,
+                    anonymous_bucket_key,
                     &delta.bucket_key,
                     &attrs_json,
                     &delta.timezone,
@@ -1301,20 +1367,13 @@ impl MetricsDatabase {
         Ok(metric_ids)
     }
 
-    /// Re-key cumulative token snapshots that use a legacy project identity or
-    /// were recorded before a valid reporting email existed. Existing valid
-    /// user identities are never re-keyed: if a machine legitimately changes
-    /// from user A to user B, both remain separate business buckets.
+    /// Repair legacy project/source-key shape without guessing historical
+    /// reporting identity from the process's current configuration.
     ///
-    /// The migration and replacement outbox snapshot are committed together.
-    /// A pending anonymous row is replaced; an in-flight row stays immutable
-    /// and the new identified snapshot becomes its cumulative successor.
-    pub(crate) fn rehydrate_unknown_daily_token_identity(
-        &mut self,
-        reporting_attributes: &HashMap<String, String>,
-    ) -> Result<Vec<i64>, GitAiError> {
-        let configured_email = configured_reporting_email(reporting_attributes);
-
+    /// Current-revision source keys remain stable. Legacy revisions are re-keyed
+    /// only from identity already present in their own persisted attributes;
+    /// anonymous historical rows stay anonymous.
+    pub(crate) fn repair_daily_token_buckets(&mut self) -> Result<Vec<i64>, GitAiError> {
         let tx = self.conn.transaction()?;
         let rows = {
             let mut stmt = tx.prepare(
@@ -1348,17 +1407,26 @@ impl MetricsDatabase {
         let mut refreshed_ids = BTreeSet::new();
         for row in rows {
             let mut target_attrs = row.attrs.clone();
-            if legacy_daily_token_bucket_revision(&row.bucket_key)
-                && !has_explicit_project_key(&target_attrs)
-            {
+            let legacy_revision = legacy_daily_token_bucket_revision(&row.bucket_key);
+            if legacy_revision && !has_explicit_project_key(&target_attrs) {
                 mark_legacy_project_identity_ambiguous(&mut target_attrs, &row.bucket_key)?;
             } else {
                 canonicalize_snapshot_repo_url(&mut target_attrs);
             }
-            let source_email = compact_identity_email(&target_attrs);
-            if source_email.is_none() && configured_email.is_some() {
-                apply_reporting_attributes(&mut target_attrs, reporting_attributes)?;
+
+            if !legacy_revision {
+                if target_attrs != row.attrs {
+                    let target_attrs_json = serde_json::to_string(&target_attrs)?;
+                    tx.execute(
+                        "UPDATE session_token_daily SET attrs_json = ?1, timezone = ?2 \
+                         WHERE bucket_key = ?3",
+                        params![target_attrs_json, row.timezone, row.bucket_key],
+                    )?;
+                    refreshed_ids.insert(refresh_daily_token_outbox(&tx, &row.bucket_key)?);
+                }
+                continue;
             }
+
             let target_email =
                 compact_identity_email(&target_attrs).unwrap_or_else(|| "unknown".to_string());
             let target_attrs_json = serde_json::to_string(&target_attrs)?;
@@ -2863,6 +2931,74 @@ fn u64_to_sqlite(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
+/// Record the first trustworthy reporting-profile identity observed for a
+/// session. Only that identity may recover earlier anonymous facts from the
+/// same session. A later different identity makes the session permanently
+/// ambiguous for recovery; both explicitly identified streams still retain
+/// their own direct Event9 buckets.
+fn observe_session_reporting_identity(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    attrs: &SparseArray,
+) -> Result<bool, GitAiError> {
+    let Some(current_email) = compact_identity_email(attrs) else {
+        return Ok(false);
+    };
+    let (stored_email, state) = tx.query_row(
+        "SELECT reporting_identity_email, reporting_identity_state \
+         FROM session_activity WHERE session_id = ?1",
+        params![session_id],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+    )?;
+
+    match state.as_str() {
+        "unbound" => {
+            tx.execute(
+                "UPDATE session_activity \
+                 SET reporting_identity_email = ?1, reporting_identity_state = 'bound' \
+                 WHERE session_id = ?2 AND reporting_identity_state = 'unbound'",
+                params![current_email, session_id],
+            )?;
+            Ok(true)
+        }
+        "bound" if stored_email.as_deref() == Some(current_email.as_str()) => Ok(true),
+        "bound" => {
+            tx.execute(
+                "UPDATE session_activity SET reporting_identity_state = 'conflicted' \
+                 WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            Ok(false)
+        }
+        // Existing compact sessions have no trustworthy historical profile
+        // provenance. Unknown/future states also fail closed.
+        "legacy_ambiguous" | "conflicted" => Ok(false),
+        _ => Ok(false),
+    }
+}
+
+fn session_reporting_identity_is_bound_to(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    expected_email: Option<&str>,
+) -> Result<bool, GitAiError> {
+    let Some(expected_email) = expected_email else {
+        return Ok(false);
+    };
+    let state = tx
+        .query_row(
+            "SELECT reporting_identity_email, reporting_identity_state \
+             FROM session_activity WHERE session_id = ?1",
+            params![session_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(matches!(
+        state,
+        Some((Some(email), state)) if state == "bound" && email == expected_email
+    ))
+}
+
 fn compact_repo_matches(repo_url: Option<&str>, repo_filter: Option<&str>) -> bool {
     match repo_filter {
         None => true,
@@ -2877,6 +3013,7 @@ fn daily_token_bucket(
     provider: Option<&str>,
     machine_id: &str,
     source_key: &str,
+    session_id: &str,
 ) -> Result<(String, String, String, String, SparseArray), GitAiError> {
     let local_time = Local
         .timestamp_opt(i64::from(timestamp), 0)
@@ -2907,12 +3044,12 @@ fn daily_token_bucket(
     } else {
         "td3"
     };
-    let user_email =
-        compact_identity_email(&snapshot_attrs).unwrap_or_else(|| "unknown".to_string());
+    let user_email = compact_identity_email(&snapshot_attrs);
+    let anonymous_identity = anonymous_daily_token_identity(session_id);
     let bucket_key = daily_token_bucket_key(
         revision,
         &date_key,
-        &user_email,
+        user_email.as_deref().unwrap_or(&anonymous_identity),
         machine_id,
         &snapshot_attrs,
         provider,
@@ -2920,7 +3057,7 @@ fn daily_token_bucket(
     let anonymous_bucket_key = daily_token_bucket_key(
         revision,
         &date_key,
-        "unknown",
+        &anonymous_identity,
         machine_id,
         &snapshot_attrs,
         provider,
@@ -2932,6 +3069,13 @@ fn daily_token_bucket(
         timezone,
         snapshot_attrs,
     ))
+}
+
+fn anonymous_daily_token_identity(session_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"git-ai-anonymous-session-token-v1\0");
+    hasher.update(session_id.as_bytes());
+    format!("unknown-session:{:x}", hasher.finalize())
 }
 
 fn daily_token_bucket_key(
@@ -3061,45 +3205,6 @@ fn canonicalize_snapshot_repo_url(attrs: &mut SparseArray) {
     }
 }
 
-fn apply_reporting_attributes(
-    attrs: &mut SparseArray,
-    reporting_attributes: &HashMap<String, String>,
-) -> Result<(), GitAiError> {
-    let mut custom_attrs = compact_custom_attributes(attrs);
-    for key in REPORTING_PROFILE_RESERVED_ATTRIBUTE_KEYS {
-        custom_attrs.remove(*key);
-    }
-    for key in [
-        "department_name",
-        "office_name",
-        "team_name",
-        "user_name",
-        "user_email",
-    ] {
-        let Some(value) = reporting_attributes.get(key).and_then(|value| {
-            if key == "user_email" {
-                compact_valid_email(value)
-            } else {
-                compact_non_empty(value).map(str::to_string)
-            }
-        }) else {
-            continue;
-        };
-        custom_attrs.insert(key.to_string(), Value::String(value));
-    }
-    if configured_reporting_email(reporting_attributes).is_some() {
-        custom_attrs.insert(
-            REPORTING_PROFILE_VERSION_ATTRIBUTE.to_string(),
-            Value::String(REPORTING_PROFILE_VERSION.to_string()),
-        );
-    }
-    attrs.insert(
-        attr_pos::CUSTOM_ATTRIBUTES.to_string(),
-        Value::String(serde_json::to_string(&custom_attrs)?),
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 fn token_snapshot_machine_id() -> String {
     "git-ai-test-install".to_string()
@@ -3175,27 +3280,6 @@ fn compact_profile_string(attrs: &Map<String, Value>, key: &str) -> Option<Strin
         .as_str()
         .and_then(compact_non_empty)
         .map(str::to_string)
-}
-
-fn configured_reporting_email(attributes: &HashMap<String, String>) -> Option<String> {
-    (attributes
-        .get(REPORTING_PROFILE_VERSION_ATTRIBUTE)
-        .map(String::as_str)
-        == Some(REPORTING_PROFILE_VERSION)
-        && ["department_name", "office_name", "user_name"]
-            .iter()
-            .all(|key| {
-                attributes
-                    .get(*key)
-                    .and_then(|value| compact_non_empty(value))
-                    .is_some()
-            }))
-    .then(|| {
-        attributes
-            .get("user_email")
-            .and_then(|email| compact_valid_email(email))
-    })
-    .flatten()
 }
 
 fn compact_valid_email(email: &str) -> Option<String> {
@@ -3379,6 +3463,84 @@ fn extract_metric_event_ts_from_value(value: &Value) -> Option<u32> {
         .map(|ts| ts as u32)
 }
 
+/// Insert already-serialized metric events inside a caller-owned transaction.
+///
+/// Deferred jobs use this helper so their outbox rows and `done` tombstone can
+/// commit atomically without losing the metadata columns needed immediately by
+/// session/recovery/history queries.
+pub(crate) fn insert_event_jsons_in_transaction(
+    tx: &Transaction<'_>,
+    events: &[String],
+    delivered_ts: Option<u64>,
+) -> Result<Vec<i64>, GitAiError> {
+    let mut ids = Vec::with_capacity(events.len());
+    let mut stmt = tx.prepare_cached(
+        r#"
+        INSERT INTO metrics (
+            event_json,
+            delivered_ts,
+            event_ts,
+            event_kind,
+            trace_id,
+            session_id,
+            parent_session_id,
+            tool,
+            external_session_id,
+            external_parent_session_id,
+            external_event_id,
+            external_parent_event_id,
+            external_tool_use_id
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+    )?;
+
+    for event_json in events {
+        let metadata = extract_metric_event_metadata(event_json);
+        let event_ts = metadata
+            .as_ref()
+            .map(|metadata| i64::from(metadata.event_ts));
+        let event_kind = metadata
+            .as_ref()
+            .map(|metadata| i64::from(metadata.event_kind));
+        stmt.execute(params![
+            event_json,
+            delivered_ts.map(|timestamp| timestamp.min(i64::MAX as u64) as i64),
+            event_ts,
+            event_kind,
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.trace_id.as_deref()),
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.session_id.as_deref()),
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.parent_session_id.as_deref()),
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.tool.as_deref()),
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.external_session_id.as_deref()),
+            metadata
+                .as_ref()
+                .and_then(|metadata| { metadata.external_parent_session_id.as_deref() }),
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.external_event_id.as_deref()),
+            metadata
+                .as_ref()
+                .and_then(|metadata| { metadata.external_parent_event_id.as_deref() }),
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.external_tool_use_id.as_deref()),
+        ])?;
+        ids.push(tx.last_insert_rowid());
+    }
+    Ok(ids)
+}
+
 fn extract_metric_event_metadata(event_json: &str) -> Option<MetricEventMetadata> {
     let value: Value = serde_json::from_str(event_json).ok()?;
     let event_ts = extract_metric_event_ts_from_value(&value)?;
@@ -3465,7 +3627,7 @@ mod tests {
     use crate::metrics::{EventAttributes, MetricsBatch};
     use rusqlite::StatementStatus;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use tempfile::TempDir;
 
     fn create_test_db() -> (MetricsDatabase, TempDir) {
@@ -3689,6 +3851,24 @@ mod tests {
         cache_read_tokens: u64,
         baseline_only: bool,
     ) -> SessionObservation {
+        codex_cumulative_observation_for_session(
+            ts,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            baseline_only,
+            "session-codex-child",
+        )
+    }
+
+    fn codex_cumulative_observation_for_session(
+        ts: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        baseline_only: bool,
+        session_id: &str,
+    ) -> SessionObservation {
         let raw = json!({
             "_git_ai_token_baseline_only": baseline_only,
             "payload": {
@@ -3706,8 +3886,8 @@ mod tests {
             .repo_url("github.com/acme/repo")
             .author("alice@example.com")
             .tool("codex")
-            .session_id("session-codex-child")
-            .external_session_id("external-codex-child")
+            .session_id(session_id)
+            .external_session_id(format!("external-{session_id}"))
             .trace_id(format!("trace-{ts}"))
             .custom_attributes(r#"{"project_key":"repo","ide":"codex"}"#)
             .to_sparse();
@@ -3726,6 +3906,7 @@ mod tests {
                     "ide": "codex",
                     "department_name": "云计算研发部",
                     "office_name": "研发四处",
+                    "team_name": "研发一组",
                     "user_name": "Alice",
                     "user_email": user_email,
                     "git_ai_reporting_profile_version": REPORTING_PROFILE_VERSION,
@@ -3734,23 +3915,6 @@ mod tests {
             ),
         );
         observation
-    }
-
-    fn reporting_attributes(user_email: &str) -> HashMap<String, String> {
-        [
-            ("department_name", "云计算研发部"),
-            ("office_name", "研发四处"),
-            ("team_name", "研发一组"),
-            ("user_name", "Alice"),
-            ("user_email", user_email),
-            (
-                REPORTING_PROFILE_VERSION_ATTRIBUTE,
-                REPORTING_PROFILE_VERSION,
-            ),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect()
     }
 
     #[test]
@@ -4021,7 +4185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_daily_snapshot_coalesces_sessions_with_the_same_business_dimensions() {
+    fn test_daily_snapshot_keeps_anonymous_sessions_separate_with_same_dimensions() {
         let (mut db, _temp_dir) = create_test_db();
         let first_ts = seconds_ago(60);
         let first = compact_observation(first_ts, 8);
@@ -4039,15 +4203,40 @@ mod tests {
         db.insert_session_observations(&[first, second]).unwrap();
 
         let event_jsons = pending_event_jsons(&db);
-        assert_eq!(event_jsons.len(), 1);
-        let event = serde_json::from_str::<MetricEvent>(&event_jsons[0]).unwrap();
-        assert_eq!(event.values.get("1").and_then(Value::as_u64), Some(20));
-        assert_eq!(event.values.get("2").and_then(Value::as_u64), Some(16));
-        assert_eq!(event.values.get("5").and_then(Value::as_u64), Some(2));
-        assert!(
+        assert_eq!(event_jsons.len(), 2);
+        let events = event_jsons
+            .iter()
+            .map(|event| serde_json::from_str::<MetricEvent>(event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.values.get("1").and_then(Value::as_u64).unwrap())
+                .sum::<u64>(),
+            20
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.values.get("2").and_then(Value::as_u64).unwrap())
+                .sum::<u64>(),
+            16
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.values.get("5").and_then(Value::as_u64).unwrap())
+                .sum::<u64>(),
+            2
+        );
+        assert!(events.iter().all(|event| {
             sparse_get_string(&event.attrs, attr_pos::SESSION_ID)
                 .flatten()
                 .is_none()
+        }));
+        assert_ne!(
+            events[0].values["0"], events[1].values["0"],
+            "anonymous Event9 source keys must retain a stable session provenance boundary"
         );
     }
 
@@ -4060,7 +4249,7 @@ mod tests {
                 .branch(branch)
                 .tool("claude")
                 .model("claude-sonnet-4")
-                .session_id(format!("session-{branch}"))
+                .session_id("session-dimension-test")
                 .custom_attributes(custom_attributes)
                 .to_sparse()
         };
@@ -4082,10 +4271,16 @@ mod tests {
             r#"{"project_key":"another-repo","ide":"vscode","organization_id":"org-a"}"#,
         );
 
-        let base_key =
-            daily_token_bucket(timestamp, &base, Some("anthropic"), "install-1", "ts1:test")
-                .unwrap()
-                .0;
+        let base_key = daily_token_bucket(
+            timestamp,
+            &base,
+            Some("anthropic"),
+            "install-1",
+            "ts1:test",
+            "session-dimension-test",
+        )
+        .unwrap()
+        .0;
         assert_eq!(
             base_key,
             daily_token_bucket(
@@ -4094,6 +4289,7 @@ mod tests {
                 Some("anthropic"),
                 "install-1",
                 "ts1:test",
+                "session-dimension-test",
             )
             .unwrap()
             .0,
@@ -4107,6 +4303,7 @@ mod tests {
                 Some("anthropic"),
                 "install-1",
                 "ts1:test",
+                "session-dimension-test",
             )
             .unwrap()
             .0
@@ -4119,15 +4316,23 @@ mod tests {
                 Some("anthropic"),
                 "install-1",
                 "ts1:test",
+                "session-dimension-test",
             )
             .unwrap()
             .0
         );
         assert_ne!(
             base_key,
-            daily_token_bucket(timestamp, &base, Some("anthropic"), "install-2", "ts1:test",)
-                .unwrap()
-                .0,
+            daily_token_bucket(
+                timestamp,
+                &base,
+                Some("anthropic"),
+                "install-2",
+                "ts1:test",
+                "session-dimension-test",
+            )
+            .unwrap()
+            .0,
             "separate installations must not overwrite each other's cumulative snapshots"
         );
     }
@@ -4153,6 +4358,7 @@ mod tests {
                 Some("anthropic"),
                 "install-1",
                 "ts1:test",
+                "session-canonical-remote",
             )
             .unwrap()
         };
@@ -4343,8 +4549,12 @@ mod tests {
         drop(db);
 
         let mut restarted = MetricsDatabase::open_at_path(&db_path).unwrap();
+        assert!(restarted.repair_daily_token_buckets().unwrap().is_empty());
         let refreshed = restarted
-            .rehydrate_unknown_daily_token_identity(&reporting_attributes("alice@example.com"))
+            .insert_session_observations(&[with_reporting_email(
+                codex_cumulative_observation(first_ts + 1, 100, 0, 0, false),
+                "alice@example.com",
+            )])
             .unwrap();
         assert_eq!(refreshed.len(), 1);
         let pending = pending_event_jsons(&restarted);
@@ -4361,7 +4571,7 @@ mod tests {
         let mut restarted_again = MetricsDatabase::open_at_path(&db_path).unwrap();
         assert!(
             restarted_again
-                .rehydrate_unknown_daily_token_identity(&reporting_attributes("alice@example.com",))
+                .repair_daily_token_buckets()
                 .unwrap()
                 .is_empty()
         );
@@ -4375,6 +4585,131 @@ mod tests {
             )
             .unwrap();
         assert_eq!(persisted_outbox_id, first_successor_id);
+    }
+
+    #[test]
+    fn test_restart_profile_b_cannot_claim_session_a_anonymous_delta() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("restart-a-to-b-metrics.db");
+        let first_ts = seconds_ago(90);
+        let mut db = MetricsDatabase::open_at_path(&db_path).unwrap();
+        db.insert_session_observations(&[with_reporting_email(
+            codex_cumulative_observation(first_ts, 100, 0, 0, false),
+            "alice@example.com",
+        )])
+        .unwrap();
+        db.insert_session_observations(&[codex_cumulative_observation(
+            first_ts + 1,
+            120,
+            0,
+            0,
+            false,
+        )])
+        .unwrap();
+        let anonymous_before_restart = pending_metric_events(&db)
+            .into_iter()
+            .find(|(_, event)| compact_identity_email(&event.attrs).is_none())
+            .unwrap()
+            .1;
+        let anonymous_source_key = anonymous_before_restart.values["0"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let anonymous_instance_id = anonymous_before_restart.values["12"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drop(db);
+
+        let mut restarted = MetricsDatabase::open_at_path(&db_path).unwrap();
+        assert!(
+            restarted.repair_daily_token_buckets().unwrap().is_empty(),
+            "the current process profile cannot prove a historical anonymous bucket's identity"
+        );
+        let anonymous_after_repair = pending_metric_events(&restarted)
+            .into_iter()
+            .find(|(_, event)| compact_identity_email(&event.attrs).is_none())
+            .unwrap()
+            .1;
+        assert_eq!(
+            anonymous_after_repair.values["0"].as_str(),
+            Some(anonymous_source_key.as_str()),
+            "a conservative restart repair must preserve the stable Event9 source key"
+        );
+        assert_eq!(
+            anonymous_after_repair.values["12"].as_str(),
+            Some(anonymous_instance_id.as_str()),
+            "a conservative restart repair must not create a duplicate Event9 generation"
+        );
+
+        restarted
+            .insert_session_observations(&[with_reporting_email(
+                codex_cumulative_observation(first_ts + 2, 170, 0, 0, false),
+                "bob@example.com",
+            )])
+            .unwrap();
+
+        let mut snapshots = pending_metric_events(&restarted)
+            .into_iter()
+            .map(|(_, event)| {
+                (
+                    compact_identity_email(&event.attrs),
+                    event.values["1"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort();
+        assert_eq!(
+            snapshots,
+            vec![
+                (None, 20),
+                (Some("alice@example.com".to_string()), 100),
+                (Some("bob@example.com".to_string()), 50),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_known_profile_only_claims_anonymous_tokens_from_the_same_session() {
+        let (mut db, _temp_dir) = create_test_db();
+        let first_ts = seconds_ago(60);
+        db.insert_session_observations(&[codex_cumulative_observation_for_session(
+            first_ts,
+            100,
+            0,
+            0,
+            false,
+            "session-anonymous",
+        )])
+        .unwrap();
+        db.insert_session_observations(&[with_reporting_email(
+            codex_cumulative_observation_for_session(
+                first_ts + 1,
+                50,
+                0,
+                0,
+                false,
+                "session-alice",
+            ),
+            "alice@example.com",
+        )])
+        .unwrap();
+
+        let mut snapshots = pending_metric_events(&db)
+            .into_iter()
+            .map(|(_, event)| {
+                (
+                    compact_identity_email(&event.attrs),
+                    event.values["1"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort();
+        assert_eq!(
+            snapshots,
+            vec![(None, 100), (Some("alice@example.com".to_string()), 50),],
+            "a daily anonymous bucket must not mix sessions before identity recovery"
+        );
     }
 
     #[test]
@@ -4413,8 +4748,12 @@ mod tests {
 
         db.mark_records_delivered(&[original_id], unix_now())
             .unwrap();
+        assert!(db.repair_daily_token_buckets().unwrap().is_empty());
         let refreshed = db
-            .rehydrate_unknown_daily_token_identity(&reporting_attributes("configured@example.com"))
+            .insert_session_observations(&[with_reporting_email(
+                codex_cumulative_observation(first_ts + 1, 100, 0, 0, false),
+                "configured@example.com",
+            )])
             .unwrap();
         assert_eq!(refreshed.len(), 1);
         let successor = pending_metric_events(&db)
@@ -4470,9 +4809,7 @@ mod tests {
         refresh_daily_token_outbox(&tx, legacy_bucket_key).unwrap();
         tx.commit().unwrap();
 
-        let refreshed = db
-            .rehydrate_unknown_daily_token_identity(&HashMap::new())
-            .unwrap();
+        let refreshed = db.repair_daily_token_buckets().unwrap();
         assert_eq!(refreshed.len(), 1);
         let ambiguous_event = pending_metric_events(&db)[0].1.clone();
         assert_ne!(
@@ -4591,24 +4928,20 @@ mod tests {
             .unwrap();
         db.insert_session_observations(&[user_b]).unwrap();
 
-        assert!(
-            db.rehydrate_unknown_daily_token_identity(&reporting_attributes("bob@example.com"))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(db.repair_daily_token_buckets().unwrap().is_empty());
         assert_eq!(
             db.conn
                 .query_row("SELECT COUNT(*) FROM session_token_daily", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         let mut snapshots = pending_event_jsons(&db)
             .into_iter()
             .map(|event| serde_json::from_str::<MetricEvent>(&event).unwrap())
             .map(|event| {
                 (
-                    compact_identity_email(&event.attrs).unwrap(),
+                    compact_identity_email(&event.attrs),
                     event.values.get("1").and_then(Value::as_u64).unwrap(),
                 )
             })
@@ -4617,8 +4950,9 @@ mod tests {
         assert_eq!(
             snapshots,
             vec![
-                ("alice@example.com".to_string(), 100),
-                ("bob@example.com".to_string(), 70),
+                (None, 20),
+                (Some("alice@example.com".to_string()), 100),
+                (Some("bob@example.com".to_string()), 50),
             ]
         );
     }
@@ -4645,11 +4979,7 @@ mod tests {
         );
 
         db.insert_session_observations(&[legacy_user_a]).unwrap();
-        assert!(
-            db.rehydrate_unknown_daily_token_identity(&reporting_attributes("bob@example.com"))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(db.repair_daily_token_buckets().unwrap().is_empty());
 
         let event = serde_json::from_str::<MetricEvent>(&pending_event_jsons(&db)[0]).unwrap();
         assert_eq!(
@@ -4664,7 +4994,7 @@ mod tests {
     }
 
     #[test]
-    fn test_daily_snapshot_same_batch_assigns_transient_unknown_delta_to_latest_identity() {
+    fn test_daily_snapshot_same_batch_keeps_transient_unknown_delta_across_a_to_b() {
         let (mut db, _temp_dir) = create_test_db();
         let first_ts = seconds_ago(60);
         let user_a = with_reporting_email(
@@ -4685,7 +5015,7 @@ mod tests {
             .map(|event| serde_json::from_str::<MetricEvent>(&event).unwrap())
             .map(|event| {
                 (
-                    compact_identity_email(&event.attrs).unwrap(),
+                    compact_identity_email(&event.attrs),
                     event.values.get("1").and_then(Value::as_u64).unwrap(),
                 )
             })
@@ -4694,14 +5024,15 @@ mod tests {
         assert_eq!(
             snapshots,
             vec![
-                ("alice@example.com".to_string(), 100),
-                ("bob@example.com".to_string(), 70),
+                (None, 20),
+                (Some("alice@example.com".to_string()), 100),
+                (Some("bob@example.com".to_string()), 50),
             ]
         );
     }
 
     #[test]
-    fn test_reused_anonymous_bucket_generations_have_exact_supersession_ids() {
+    fn test_conflicting_profile_does_not_supersede_reused_anonymous_generation() {
         let (mut db, _temp_dir) = create_test_db();
         let first_ts = seconds_ago(90);
 
@@ -4785,16 +5116,29 @@ mod tests {
             Some(anonymous_instance_one.as_str())
         );
         assert_eq!(
-            user_b_event.values["13"].as_array().unwrap()[0].as_str(),
-            Some(anonymous_instance_two.as_str())
-        );
-        assert_eq!(
             user_a_event.values["11"].as_array().unwrap()[0].as_str(),
             Some(shared_anonymous_source_key.as_str())
         );
-        assert_eq!(
-            user_b_event.values["11"].as_array().unwrap()[0].as_str(),
-            Some(shared_anonymous_source_key.as_str())
+        assert!(
+            user_b_event
+                .values
+                .get("11")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+                && user_b_event
+                    .values
+                    .get("13")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty),
+            "profile B must not claim an anonymous generation from a session already bound to A"
+        );
+        assert!(
+            pending_metric_events(&db).into_iter().any(|(_, event)| {
+                compact_identity_email(&event.attrs).is_none()
+                    && event.values["0"].as_str() == Some(shared_anonymous_source_key.as_str())
+                    && event.values["12"].as_str() == Some(anonymous_instance_two.as_str())
+            }),
+            "the ambiguous generation must remain preserved under its original stable identity"
         );
 
         // ACK corrections out of order. Each ACK clears only the aliases owned
@@ -5221,6 +5565,7 @@ mod tests {
             "session_token_daily",
             "deferred_commit_metric_jobs",
             "deferred_lifecycle_metric_jobs",
+            "deferred_checkpoint_jobs",
         ] {
             let table_count: i64 = db
                 .conn
@@ -5237,6 +5582,26 @@ mod tests {
                 .unwrap(),
             "deferred Event 1 jobs must persist the parent-note snapshot"
         );
+        assert!(
+            db.column_exists("session_activity", "reporting_identity_email")
+                .unwrap()
+        );
+        assert!(
+            db.column_exists("session_activity", "reporting_identity_state")
+                .unwrap()
+        );
+        for column in [
+            "path_scope_json",
+            "admission_owner",
+            "blocked_evidence",
+            "blocked_reason",
+        ] {
+            assert!(
+                db.column_exists("deferred_checkpoint_jobs", column)
+                    .unwrap(),
+                "fresh schema is missing deferred checkpoint column {column}"
+            );
+        }
     }
 
     #[test]
@@ -5546,6 +5911,14 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION.to_string());
         assert!(db.column_exists("session_activity", "last_ts").unwrap());
         assert!(
+            db.column_exists("session_activity", "reporting_identity_email")
+                .unwrap()
+        );
+        assert!(
+            db.column_exists("session_activity", "reporting_identity_state")
+                .unwrap()
+        );
+        assert!(
             db.column_exists("session_recovery_events", "external_tool_use_id")
                 .unwrap()
         );
@@ -5557,6 +5930,232 @@ mod tests {
             db.column_exists("session_token_daily", "outbox_metric_id")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn test_migrates_version_12_sessions_as_legacy_identity_ambiguous() {
+        let (mut db, _temp_dir) = create_test_db();
+        db.conn
+            .execute_batch(
+                r#"
+                DROP INDEX session_activity_last_ts;
+                DROP TABLE session_activity;
+                CREATE TABLE session_activity (
+                    session_id TEXT PRIMARY KEY NOT NULL,
+                    first_ts INTEGER NOT NULL,
+                    last_ts INTEGER NOT NULL,
+                    tool TEXT NOT NULL,
+                    model TEXT,
+                    repo_url TEXT,
+                    external_session_id TEXT
+                );
+                CREATE INDEX session_activity_last_ts
+                    ON session_activity (last_ts, repo_url, tool);
+                INSERT INTO session_activity (
+                    session_id, first_ts, last_ts, tool, model, repo_url,
+                    external_session_id
+                ) VALUES (
+                    'legacy-session', 1, 2, 'codex', 'gpt-5',
+                    'https://github.com/acme/repo', 'external-legacy-session'
+                );
+                UPDATE schema_metadata SET value = '12' WHERE key = 'version';
+                "#,
+            )
+            .unwrap();
+
+        db.initialize_schema().unwrap();
+
+        let (email, state): (Option<String>, String) = db
+            .conn
+            .query_row(
+                "SELECT reporting_identity_email, reporting_identity_state \
+                 FROM session_activity WHERE session_id = 'legacy-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(email, None);
+        assert_eq!(state, "legacy_ambiguous");
+    }
+
+    #[test]
+    fn test_migrates_version_13_deferred_checkpoint_recovery_columns_idempotently() {
+        let (mut db, _temp_dir) = create_test_db();
+        db.conn
+            .execute_batch(
+                r#"
+                DROP TABLE deferred_checkpoint_jobs;
+                CREATE TABLE deferred_checkpoint_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_key TEXT NOT NULL UNIQUE,
+                    repo_identity TEXT NOT NULL,
+                    repository_workdir TEXT NOT NULL,
+                    integration TEXT NOT NULL,
+                    external_session_id TEXT NOT NULL,
+                    external_tool_use_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    request_shape_sha256 TEXT NOT NULL,
+                    request_evidence_sha256 TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    metrics_context_json TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    prepared_checkpoint_json TEXT,
+                    prepared_metric_events_json TEXT,
+                    working_log_applied INTEGER NOT NULL DEFAULT 0
+                        CHECK (working_log_applied IN (0, 1)),
+                    state TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending', 'processing', 'done')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at INTEGER NOT NULL DEFAULT 0,
+                    processing_started_at INTEGER,
+                    lease_token TEXT,
+                    last_error TEXT,
+                    metric_ids_json TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    completed_at INTEGER
+                );
+                CREATE INDEX deferred_checkpoint_jobs_due
+                    ON deferred_checkpoint_jobs (state, next_retry_at, id)
+                    WHERE state != 'done';
+                CREATE INDEX deferred_checkpoint_jobs_repo_order
+                    ON deferred_checkpoint_jobs (repo_identity, state, id);
+                INSERT INTO deferred_checkpoint_jobs (
+                    job_key, repo_identity, repository_workdir, integration,
+                    external_session_id, external_tool_use_id, phase,
+                    request_shape_sha256, request_evidence_sha256, request_json,
+                    metrics_context_json, observed_at_ms, created_at, updated_at
+                ) VALUES (
+                    'legacy-job', 'repo', '/repo', 'kilo-v7', 'session', 'call',
+                    'pre', 'shape', 'evidence', '{}', '{}', 1, 1, 1
+                );
+                UPDATE schema_metadata SET value = '13' WHERE key = 'version';
+                "#,
+            )
+            .unwrap();
+
+        db.initialize_schema().unwrap();
+        db.initialize_schema()
+            .expect("schema 14 recovery-column repair must be idempotent");
+
+        for column in [
+            "path_scope_json",
+            "admission_owner",
+            "blocked_evidence",
+            "blocked_reason",
+        ] {
+            assert!(
+                db.column_exists("deferred_checkpoint_jobs", column)
+                    .unwrap(),
+                "migration is missing deferred checkpoint column {column}"
+            );
+        }
+        let legacy: (Option<String>, i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT path_scope_json, blocked_evidence, blocked_reason FROM deferred_checkpoint_jobs WHERE job_key = 'legacy-job'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (None, 0, None));
+
+        let due_index_sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'deferred_checkpoint_jobs_due'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(due_index_sql.contains("blocked_evidence = 0"));
+    }
+
+    #[test]
+    fn test_migrates_version_14_checkpoint_manual_terminal_columns_idempotently() {
+        let (mut db, _temp_dir) = create_test_db();
+        db.conn
+            .execute_batch(
+                r#"
+                DROP INDEX deferred_checkpoint_jobs_due;
+                DROP INDEX deferred_checkpoint_jobs_repo_order;
+                DROP TABLE deferred_checkpoint_jobs;
+                CREATE TABLE deferred_checkpoint_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_key TEXT NOT NULL UNIQUE,
+                    repo_identity TEXT NOT NULL,
+                    repository_workdir TEXT NOT NULL,
+                    integration TEXT NOT NULL,
+                    external_session_id TEXT NOT NULL,
+                    external_tool_use_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    request_shape_sha256 TEXT NOT NULL,
+                    request_evidence_sha256 TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    metrics_context_json TEXT NOT NULL,
+                    path_scope_json TEXT,
+                    admission_owner TEXT,
+                    observed_at_ms INTEGER NOT NULL,
+                    prepared_checkpoint_json TEXT,
+                    prepared_metric_events_json TEXT,
+                    working_log_applied INTEGER NOT NULL DEFAULT 0
+                        CHECK (working_log_applied IN (0, 1)),
+                    state TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending', 'processing', 'done')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at INTEGER NOT NULL DEFAULT 0,
+                    processing_started_at INTEGER,
+                    lease_token TEXT,
+                    last_error TEXT,
+                    blocked_evidence INTEGER NOT NULL DEFAULT 0
+                        CHECK (blocked_evidence IN (0, 1)),
+                    blocked_reason TEXT,
+                    metric_ids_json TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    completed_at INTEGER
+                );
+                CREATE INDEX deferred_checkpoint_jobs_due
+                    ON deferred_checkpoint_jobs (state, next_retry_at, id)
+                    WHERE state != 'done' AND blocked_evidence = 0;
+                CREATE INDEX deferred_checkpoint_jobs_repo_order
+                    ON deferred_checkpoint_jobs (repo_identity, state, id);
+                INSERT INTO deferred_checkpoint_jobs (
+                    job_key, repo_identity, repository_workdir, integration,
+                    external_session_id, external_tool_use_id, phase,
+                    request_shape_sha256, request_evidence_sha256, request_json,
+                    metrics_context_json, observed_at_ms, blocked_evidence,
+                    blocked_reason, created_at, updated_at
+                ) VALUES (
+                    'blocked-v14', 'repo', '/repo', 'kilo-v7', 'session', 'call',
+                    'pre', 'shape', 'evidence', '{}', '{}', 1, 1,
+                    'corrupt INITIAL', 1, 1
+                );
+                UPDATE schema_metadata SET value = '14' WHERE key = 'version';
+                "#,
+            )
+            .unwrap();
+
+        db.initialize_schema().unwrap();
+        db.initialize_schema()
+            .expect("schema 15 terminal-column repair must be idempotent");
+
+        for column in ["terminal_resolution", "repair_id", "repair_backup_path"] {
+            assert!(
+                db.column_exists("deferred_checkpoint_jobs", column)
+                    .unwrap(),
+                "migration is missing deferred checkpoint column {column}"
+            );
+        }
+        let migrated: (String, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT terminal_resolution, repair_id, repair_backup_path FROM deferred_checkpoint_jobs WHERE job_key = 'blocked-v14'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, ("normal".to_string(), None, None));
     }
 
     #[test]

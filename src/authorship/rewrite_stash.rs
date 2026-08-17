@@ -90,7 +90,7 @@ fn clean_working_log_for_stash(
     }
 
     let persisted = repo.storage.working_log_for_base_commit(head_sha)?;
-    let mut initial = persisted.read_initial_attributions();
+    let mut initial = persisted.read_initial_attributions()?;
 
     if pathspecs.is_empty() {
         initial.files.clear();
@@ -282,7 +282,7 @@ fn write_path_filtered_working_log(
         .storage
         .working_log_for_base_commit(filtered_base_commit)?;
 
-    let mut initial = source_log.read_initial_attributions();
+    let mut initial = source_log.read_initial_attributions()?;
     initial
         .files
         .retain(|path, _| path_matches_any(path, pathspecs));
@@ -346,14 +346,18 @@ fn copy_blob_sha(
     blob_sha: &str,
     copied_blobs: &mut HashSet<String>,
 ) -> Result<(), GitAiError> {
-    if blob_sha.is_empty() || !copied_blobs.insert(blob_sha.to_string()) {
+    if !copied_blobs.insert(blob_sha.to_string()) {
         return Ok(());
     }
 
-    let source = source_log.dir.join("blobs").join(blob_sha);
-    let target_blobs = target_log.dir.join("blobs");
-    fs::create_dir_all(&target_blobs)?;
-    fs::copy(source, target_blobs.join(blob_sha))?;
+    let content = source_log.get_file_version(blob_sha)?;
+    let persisted_sha = target_log.persist_file_version(&content)?;
+    if persisted_sha != blob_sha {
+        return Err(GitAiError::Generic(format!(
+            "blob {} changed identity while copying filtered stash state",
+            blob_sha
+        )));
+    }
     Ok(())
 }
 
@@ -402,7 +406,7 @@ fn restore_stash_attributions(
         return Ok(());
     }
 
-    let initial = stash_log.read_initial_attributions();
+    let initial = stash_log.read_initial_attributions()?;
     if initial.files.is_empty() {
         return Ok(());
     }
@@ -424,14 +428,14 @@ fn restore_stash_attributions_with_shift(
         return Ok(());
     }
 
-    let initial = stash_log.read_initial_attributions();
+    let initial = stash_log.read_initial_attributions()?;
     if initial.files.is_empty() {
         return Ok(());
     }
 
     let mut stash_file_contents: HashMap<String, String> = HashMap::new();
     for file_path in initial.files.keys() {
-        if let Some(content) = stash_log.stored_initial_file_content_from(&initial, file_path) {
+        if let Some(content) = stash_log.stored_initial_file_content_from(&initial, file_path)? {
             stash_file_contents.insert(file_path.clone(), content);
         }
     }
@@ -523,17 +527,14 @@ fn copy_initial_blobs(
     dst_log: &PersistedWorkingLog,
     initial: &InitialAttributions,
 ) -> Result<(), GitAiError> {
-    if initial.file_blobs.is_empty() {
-        return Ok(());
-    }
-
-    let dst_blobs = dst_log.dir.join("blobs");
-    fs::create_dir_all(&dst_blobs)?;
     for blob_sha in initial.file_blobs.values() {
-        let src = src_log.dir.join("blobs").join(blob_sha);
-        let dst = dst_blobs.join(blob_sha);
-        if src.exists() && !dst.exists() {
-            fs::copy(src, dst)?;
+        let content = src_log.get_file_version(blob_sha)?;
+        let persisted_sha = dst_log.persist_file_version(&content)?;
+        if persisted_sha != *blob_sha {
+            return Err(GitAiError::Generic(format!(
+                "blob {} changed identity while copying INITIAL state",
+                blob_sha
+            )));
         }
     }
     Ok(())
@@ -579,7 +580,7 @@ fn merge_initial_replacing_paths(
     }
 
     let restored_paths: HashSet<String> = source.files.keys().cloned().collect();
-    let mut target = working_log.read_initial_attributions();
+    let mut target = working_log.read_initial_attributions()?;
     for path in &restored_paths {
         target.files.remove(path);
         target.file_blobs.remove(path);

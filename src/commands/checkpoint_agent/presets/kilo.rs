@@ -30,6 +30,8 @@ struct KiloHookInput {
     cwd: String,
     tool_input: Option<serde_json::Value>,
     #[serde(default)]
+    git_ai_file_paths: Option<Vec<String>>,
+    #[serde(default)]
     tool_name: Option<String>,
     #[serde(default, alias = "toolUseId")]
     tool_use_id: Option<String>,
@@ -227,6 +229,7 @@ impl AgentPreset for KiloPreset {
             session_id,
             cwd,
             tool_input,
+            git_ai_file_paths,
             tool_name: _,
             tool_use_id,
             platform,
@@ -235,8 +238,12 @@ impl AgentPreset for KiloPreset {
             database_path,
         } = hook_input;
 
-        let file_paths =
-            OpenCodePreset::extract_filepaths_from_tool_input(tool_input.as_ref(), &cwd);
+        let file_paths = git_ai_file_paths
+            .as_ref()
+            .map(|paths| OpenCodePreset::normalize_explicit_filepaths(paths, &cwd))
+            .unwrap_or_else(|| {
+                OpenCodePreset::extract_filepaths_from_tool_input(tool_input.as_ref(), &cwd)
+            });
         let bash_command = tool_input
             .as_ref()
             .and_then(|value| {
@@ -371,6 +378,41 @@ mod tests {
             }
             _ => panic!("Expected PreFileEdit"),
         }
+    }
+
+    #[test]
+    fn test_kilo_prefers_plugin_scoped_git_paths_over_mixed_tool_input() {
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "kilo-mixed",
+            "cwd": "/workspace",
+            "tool_name": "apply_patch",
+            "tool_use_id": "call-mixed",
+            "git_ai_file_paths": [
+                "/workspace/repo-a/src/main.rs",
+                "/workspace/repo-b/src/lib.rs"
+            ],
+            "tool_input": {
+                "file_paths": [
+                    "/workspace/repo-a/src/main.rs",
+                    "/workspace/repo-b/src/lib.rs",
+                    "/tmp/outside.txt"
+                ]
+            }
+        })
+        .to_string();
+
+        let events = KiloPreset.parse(&input, "t_test").unwrap();
+        let ParsedHookEvent::PostFileEdit(event) = &events[0] else {
+            panic!("Expected PostFileEdit");
+        };
+        assert_eq!(
+            event.file_paths,
+            vec![
+                PathBuf::from("/workspace/repo-a/src/main.rs"),
+                PathBuf::from("/workspace/repo-b/src/lib.rs"),
+            ]
+        );
     }
 
     #[test]

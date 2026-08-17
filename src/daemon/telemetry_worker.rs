@@ -13,15 +13,17 @@ use crate::api::types::{
 };
 use crate::api::{ApiClient, ApiContext, CasObject, CasUploadRequest};
 use crate::authorship::authorship_log_serialization::GIT_AI_VERSION;
-use crate::config::{Config, REPORTING_PROFILE_VERSION_ATTRIBUTE, get_or_create_distinct_id};
+use crate::config::{Config, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::error::GitAiError;
-use crate::metrics::db::{METADATA_BACKFILL_BATCH_SIZE, MetricRecord, MetricsDatabase};
+use crate::metrics::db::{
+    METADATA_BACKFILL_BATCH_SIZE, MetricRecord, MetricsDatabase, MetricsStatus,
+};
 use crate::metrics::session_compaction::SessionObservation;
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
@@ -34,7 +36,7 @@ const MAX_DAEMON_LOG_BUFFER_EVENTS: usize = 5000;
 
 static METRICS_UPLOAD_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static METRICS_METADATA_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
-static TOKEN_IDENTITY_REHYDRATION_STARTED: AtomicBool = AtomicBool::new(false);
+static TOKEN_BUCKET_REPAIR_STARTED: AtomicBool = AtomicBool::new(false);
 static DAEMON_LOG_UPLOAD_IN_FLIGHT: std::sync::OnceLock<Arc<AtomicBool>> =
     std::sync::OnceLock::new();
 
@@ -49,6 +51,17 @@ pub struct FlushStatus {
 
 struct FlushRequest {
     completion: tokio::sync::oneshot::Sender<FlushStatus>,
+}
+
+fn complete_flush_requests(requests: &mut Vec<FlushRequest>, status: Option<FlushStatus>) {
+    for request in requests.drain(..) {
+        // `None` means the blocking flush panicked or was cancelled. Dropping
+        // the sender closes the oneshot so `flush_and_wait` returns an error;
+        // it must never be converted into the all-zero success status.
+        if let Some(status) = status {
+            let _ = request.completion.send(status);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -483,7 +496,7 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
     let daemon_id = crate::uuid::generate_v4();
 
     spawn_metrics_metadata_backfill();
-    spawn_token_identity_rehydration();
+    spawn_token_bucket_repair();
 
     tokio::spawn(async move {
         telemetry_flush_loop(buffer, daemon_id, flush_rx).await;
@@ -504,44 +517,24 @@ fn spawn_metrics_metadata_backfill() {
     }));
 }
 
-fn spawn_token_identity_rehydration() {
-    if TOKEN_IDENTITY_REHYDRATION_STARTED.swap(true, Ordering::Relaxed) {
+fn spawn_token_bucket_repair() {
+    if TOKEN_BUCKET_REPAIR_STARTED.swap(true, Ordering::Relaxed) {
         return;
     }
 
     std::mem::drop(tokio::task::spawn_blocking(|| {
-        if let Err(e) = rehydrate_unknown_token_identity() {
-            tracing::warn!(%e, "telemetry: failed to rehydrate token reporting identity");
+        if let Err(e) = repair_daily_token_buckets() {
+            tracing::warn!(%e, "telemetry: failed to repair compact token buckets");
         }
     }));
 }
 
-fn rehydrate_unknown_token_identity() -> Result<usize, GitAiError> {
-    let config = Config::fresh();
-    let reporting_attributes = reporting_identity_attributes(config.metrics_custom_attributes());
+fn repair_daily_token_buckets() -> Result<usize, GitAiError> {
     let db = MetricsDatabase::global()?;
     let mut db_lock = db
         .lock()
         .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
-    db_lock
-        .rehydrate_unknown_daily_token_identity(&reporting_attributes)
-        .map(|ids| ids.len())
-}
-
-fn reporting_identity_attributes(
-    metrics_custom_attributes: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    metrics_custom_attributes
-        .iter()
-        .filter(|(key, _)| {
-            key.as_str() == REPORTING_PROFILE_VERSION_ATTRIBUTE
-                || matches!(
-                    key.as_str(),
-                    "department_name" | "office_name" | "team_name" | "user_name" | "user_email"
-                )
-        })
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
+    db_lock.repair_daily_token_buckets().map(|ids| ids.len())
 }
 
 fn backfill_metrics_event_metadata() -> Result<(), GitAiError> {
@@ -578,9 +571,9 @@ async fn telemetry_flush_loop(
     let mut next_heartbeat_at = started_at + DAEMON_LOG_HEARTBEAT_INTERVAL;
     let mut flush_requests: Vec<FlushRequest> = Vec::new();
 
-    // Reclaim durable post-commit work immediately after a daemon restart.
-    // Periodic passes handle the remaining queue and `await` drains a larger
-    // bounded batch.
+    // Reclaim telemetry-owned durable queues immediately after restart.
+    // Durable checkpoints are actor-owned and are recovered separately through
+    // the repository-family sequencer.
     let _ = tokio::task::spawn_blocking(|| {
         crate::metrics::deferred_commit_jobs::process_periodic_jobs();
         crate::metrics::deferred_lifecycle_jobs::process_periodic_jobs();
@@ -658,9 +651,7 @@ async fn telemetry_flush_loop(
 
         let (requeue_daemon_logs, await_status) = flush_result;
 
-        for request in flush_requests.drain(..) {
-            let _ = request.completion.send(await_status.unwrap_or_default());
-        }
+        complete_flush_requests(&mut flush_requests, await_status);
 
         if !requeue_daemon_logs.is_empty() {
             buffer
@@ -761,6 +752,10 @@ fn count_pending_metrics_for_await() -> usize {
     .saturating_add(pending_count_or_unknown(
         "deferred lifecycle metrics",
         crate::metrics::deferred_lifecycle_jobs::count_outstanding(),
+    ))
+    .saturating_add(pending_count_or_unknown(
+        "deferred checkpoint metrics",
+        crate::metrics::deferred_checkpoint_jobs::count_outstanding(),
     ));
     if !METRICS_UPLOAD_AVAILABLE.load(Ordering::Relaxed) {
         return deferred;
@@ -771,9 +766,17 @@ fn count_pending_metrics_for_await() -> usize {
             db.lock()
                 .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))
         })
-        .and_then(|db| db.count_retryable());
+        .and_then(|db| db.status())
+        .map(|status| uploadable_metrics_remaining(&status));
     let retryable = pending_count_or_unknown("metrics outbox", retryable);
     deferred.saturating_add(retryable)
+}
+
+fn uploadable_metrics_remaining(status: &MetricsStatus) -> usize {
+    status
+        .pending_retryable
+        .saturating_add(status.waiting_retry)
+        .saturating_add(status.processing)
 }
 
 /// An unreadable durable queue is not an empty queue. Returning one keeps
@@ -818,8 +821,8 @@ fn flush_metrics(events: &[MetricEvent]) {
 }
 
 fn flush_pending_metrics() {
-    if let Err(e) = rehydrate_unknown_token_identity() {
-        tracing::warn!(%e, "telemetry: failed to rehydrate token reporting identity");
+    if let Err(e) = repair_daily_token_buckets() {
+        tracing::warn!(%e, "telemetry: failed to repair compact token buckets");
     }
 
     let context = ApiContext::for_metrics();
@@ -1685,36 +1688,6 @@ mod tests {
     }
 
     #[test]
-    fn token_identity_rehydration_keeps_profile_provenance_marker_only() {
-        let attributes = HashMap::from([
-            ("department_name".to_string(), "云计算研发部".to_string()),
-            ("office_name".to_string(), "研发四处".to_string()),
-            ("team_name".to_string(), "研发一组".to_string()),
-            ("user_name".to_string(), "Alice".to_string()),
-            ("user_email".to_string(), "alice@example.com".to_string()),
-            (
-                REPORTING_PROFILE_VERSION_ATTRIBUTE.to_string(),
-                "1".to_string(),
-            ),
-            ("email".to_string(), "alias@example.com".to_string()),
-            ("project_key".to_string(), "repo".to_string()),
-        ]);
-
-        let reporting = reporting_identity_attributes(&attributes);
-
-        assert_eq!(
-            reporting.get(REPORTING_PROFILE_VERSION_ATTRIBUTE),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            reporting.get("user_email"),
-            Some(&"alice@example.com".to_string())
-        );
-        assert!(!reporting.contains_key("email"));
-        assert!(!reporting.contains_key("project_key"));
-    }
-
-    #[test]
     fn empty_periodic_flush_preserves_pending_metrics_only_fast_path() {
         let mut buffer = TelemetryBuffer::new();
 
@@ -1753,12 +1726,57 @@ mod tests {
     }
 
     #[test]
+    fn missing_await_flush_status_cancels_waiter_instead_of_reporting_empty_queues() {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let mut requests = vec![FlushRequest { completion }];
+
+        complete_flush_requests(&mut requests, None);
+
+        assert!(requests.is_empty());
+        assert!(
+            receiver.blocking_recv().is_err(),
+            "a panicked or cancelled blocking flush must close the completion channel"
+        );
+    }
+
+    #[test]
+    fn completed_await_flush_delivers_the_measured_status() {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let mut requests = vec![FlushRequest { completion }];
+        let expected = FlushStatus {
+            metrics_remaining: 3,
+            notes_remaining: 4,
+        };
+
+        complete_flush_requests(&mut requests, Some(expected));
+
+        assert_eq!(receiver.blocking_recv().unwrap(), expected);
+    }
+
+    #[test]
     fn unreadable_durable_queue_is_never_reported_as_empty() {
         assert_eq!(pending_count_or_unknown("test", Ok(0)), 0);
         assert_eq!(
             pending_count_or_unknown("test", Err(GitAiError::Generic("locked".to_string()))),
             1
         );
+    }
+
+    #[test]
+    fn await_counts_backoff_and_processing_metrics_as_remaining_work() {
+        let status = crate::metrics::db::MetricsStatus {
+            total: 10,
+            delivered: 5,
+            not_delivered: 5,
+            pending_retryable: 1,
+            waiting_retry: 2,
+            processing: 1,
+            stopped_after_errors: 1,
+            rows_with_errors: 3,
+            latest_error: Some("backend unavailable".to_string()),
+        };
+
+        assert_eq!(uploadable_metrics_remaining(&status), 4);
     }
 
     fn now_ts() -> u32 {
@@ -2584,5 +2602,21 @@ mod tests {
         );
         assert!(event.fields.contains_key("os"));
         assert!(event.fields.contains_key("arch"));
+    }
+
+    #[test]
+    fn telemetry_worker_never_executes_durable_checkpoint_processors() {
+        let source = include_str!("telemetry_worker.rs");
+        for forbidden in [
+            concat!("deferred_checkpoint_jobs::", "process_specific_job"),
+            concat!("deferred_checkpoint_jobs::", "process_claimed"),
+            concat!("deferred_checkpoint_jobs::", "process_periodic_jobs"),
+            concat!("deferred_checkpoint_jobs::", "process_jobs_for_await"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "telemetry worker must not claim/apply durable checkpoints via {forbidden}"
+            );
+        }
     }
 }

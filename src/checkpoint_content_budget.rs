@@ -11,6 +11,54 @@ pub(crate) struct CheckpointContentBudget {
     used_lines: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointContentBudgetError {
+    FileSize {
+        size_bytes: usize,
+        max_bytes: usize,
+    },
+    TotalSize {
+        size_bytes: usize,
+        used_bytes: usize,
+        max_bytes: usize,
+    },
+    TotalLines {
+        line_count: usize,
+        used_lines: usize,
+        max_lines: usize,
+    },
+}
+
+impl Display for CheckpointContentBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileSize {
+                size_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "file has {size_bytes} bytes, exceeding the per-file checkpoint limit of {max_bytes} bytes"
+            ),
+            Self::TotalSize {
+                size_bytes,
+                used_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "file has {size_bytes} bytes and would exceed the total checkpoint byte budget ({used_bytes} bytes already used, {max_bytes} bytes max)"
+            ),
+            Self::TotalLines {
+                line_count,
+                used_lines,
+                max_lines,
+            } => write!(
+                f,
+                "file has {line_count} lines and would exceed the total checkpoint line budget ({used_lines} lines already used, {max_lines} lines max)"
+            ),
+        }
+    }
+}
+
 impl CheckpointContentBudget {
     pub(crate) fn from_config(config: &config::Config) -> Self {
         Self {
@@ -27,6 +75,14 @@ impl CheckpointContentBudget {
     }
 
     pub(crate) fn reserve(&mut self, path: impl Display, content: &str) -> bool {
+        self.try_reserve(path, content).is_ok()
+    }
+
+    pub(crate) fn try_reserve(
+        &mut self,
+        path: impl Display,
+        content: &str,
+    ) -> Result<(), CheckpointContentBudgetError> {
         let size_bytes = content.len();
         if size_bytes > self.max_file_size_bytes {
             tracing::warn!(
@@ -34,7 +90,10 @@ impl CheckpointContentBudget {
                 path,
                 size_bytes,
             );
-            return false;
+            return Err(CheckpointContentBudgetError::FileSize {
+                size_bytes,
+                max_bytes: self.max_file_size_bytes,
+            });
         }
 
         let line_count = checkpoint_content_line_count(content);
@@ -46,7 +105,11 @@ impl CheckpointContentBudget {
                 self.used_size_bytes,
                 self.max_total_size_bytes,
             );
-            return false;
+            return Err(CheckpointContentBudgetError::TotalSize {
+                size_bytes,
+                used_bytes: self.used_size_bytes,
+                max_bytes: self.max_total_size_bytes,
+            });
         }
         if self.used_lines.saturating_add(line_count) > self.max_total_lines {
             tracing::warn!(
@@ -56,12 +119,31 @@ impl CheckpointContentBudget {
                 self.used_lines,
                 self.max_total_lines,
             );
-            return false;
+            return Err(CheckpointContentBudgetError::TotalLines {
+                line_count,
+                used_lines: self.used_lines,
+                max_lines: self.max_total_lines,
+            });
         }
 
         self.used_size_bytes += size_bytes;
         self.used_lines += line_count;
-        true
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(
+        max_file_size_bytes: usize,
+        max_total_size_bytes: usize,
+        max_total_lines: usize,
+    ) -> Self {
+        Self {
+            max_file_size_bytes,
+            max_total_size_bytes,
+            max_total_lines,
+            used_size_bytes: 0,
+            used_lines: 0,
+        }
     }
 }
 

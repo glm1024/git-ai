@@ -220,7 +220,7 @@ Here is a full breakdown of what is supported today:
 | Capability                                                      | Status | Notes                                                                        |
 | --------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------- |
 | Edit / Write / Patch tools                                      | ✅      | Line-level attribution recorded automatically.                               |
-| Files created via Bash                                          | ✅      | May not work if the agent is not operating from the repository root.         |
+| Files created via Bash                                          | ✅      | Tracks changes observed inside the command's repository scope; unexposed paths remain unknown. |
 | Git worktrees                                                   | ✅      | Attribution maintained across linked worktrees.                              |
 | Background Agents                                               | ✅      | See docs for [Claude Web](https://usegitai.com/docs/cli/claude-web), [Codex Cloud](https://usegitai.com/docs/cli/codex-cloud), [Cursor Agent](https://usegitai.com/docs/cli/cursor-agent), and [Devin](https://usegitai.com/docs/cli/devin). |
 | Attribute lines from multiple Agent Sessions in the same commit | ✅      |                                                                              |
@@ -231,7 +231,7 @@ Here is a full breakdown of what is supported today:
 | Tool-call level attribution                                     | ✅      | Resolves attributed lines to the tool call that generated them.              |
 | Tokens and cost per commit and PR                               | ✅      | Aggregates token usage and cost across the sessions behind each commit/PR.   |
 | Formatters                                                      | ✅      | Formatting will not change attribution to human.                             |
-| Multi-repo root                                                 | ⚠️     | If you run an agent that edits multiple repos, Bash attributions only work when the agent runs each command with its cwd inside that repo. |
+| Multi-repo root                                                 | ⚠️     | Run each Bash command with its cwd inside the target repo. A single command that writes across repos leaves unobserved repos unknown by design. |
 
 Git Rewrite Operations:
 
