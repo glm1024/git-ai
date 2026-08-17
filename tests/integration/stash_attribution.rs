@@ -1436,15 +1436,13 @@ fn test_partial_stash_truncates_oversized_live_checkpoints_before_filtering() {
         .find(|line| !line.trim().is_empty())
         .expect("checkpoint fixture should contain one line")
         .to_string();
-    fs::write(
-        &checkpoints_file,
-        (0..8)
-            .map(|_| checkpoint_line.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
-    )
-    .expect("inflate checkpoint file above test limit");
+    let oversized_contents = (0..8)
+        .map(|_| checkpoint_line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&checkpoints_file, &oversized_contents)
+        .expect("inflate checkpoint file above test limit");
     assert!(
         fs::metadata(&checkpoints_file).unwrap().len() > 64,
         "test setup should exceed the daemon's test checkpoint size limit"
@@ -1460,6 +1458,26 @@ fn test_partial_stash_truncates_oversized_live_checkpoints_before_filtering() {
     assert_eq!(
         reset_size, 0,
         "oversized live checkpoints file should be reset before path filtering"
+    );
+    let quarantined = fs::read_dir(working_log.dir.clone())
+        .expect("working log directory should remain readable")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("checkpoints.jsonl.oversized-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "oversized evidence should be quarantined once"
+    );
+    assert_eq!(
+        fs::read_to_string(&quarantined[0]).expect("quarantined evidence should be readable"),
+        oversized_contents,
+        "stash recovery must preserve the original oversized checkpoint bytes"
     );
     assert!(
         repo.current_working_logs()

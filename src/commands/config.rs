@@ -4,7 +4,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Read;
 
-use crate::config::{AuthorConfig, CodexHooksFormat, NotesBackendKind, ReportingProfile};
+use crate::config::{
+    AuthorConfig, CodexHooksFormat, MAX_DAEMON_MEMORY_LIMIT_MB, NotesBackendKind, ReportingProfile,
+};
 use crate::git::repository::find_repository_in_path;
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +133,7 @@ fn print_config_help() {
     println!("  max_checkpoint_file_size_bytes      Per-file checkpoint content limit in bytes");
     println!("  max_checkpoint_total_size_bytes     Per-checkpoint content limit in bytes");
     println!("  max_checkpoint_total_lines          Per-checkpoint content limit in lines");
+    println!("  daemon_memory_limit_mb               Daemon peak-RSS limit in MiB");
     println!("  custom_attributes            Custom telemetry attributes, string->string (object)");
     println!("  reporting_profile            Enterprise metrics identity (object)");
     println!("  git_ai_hooks                 Hook name -> shell commands map (object)");
@@ -166,6 +169,7 @@ fn print_config_help() {
     println!("  git-ai config set codex_hooks_format hooks_json");
     println!("  git-ai config set allow_superuser true");
     println!("  git-ai config set transcript_streaming_lookback_days 1");
+    println!("  git-ai config set daemon_memory_limit_mb 1024");
     println!("  git-ai config set custom_attributes '{{\"team\":\"platform\"}}'");
     println!("  git-ai config reporting-profile set --stdin");
     println!("  git-ai config --add custom_attributes.team platform");
@@ -238,7 +242,9 @@ pub fn handle_config(args: &[String]) {
             }
             if key == "feature_flags.transcript_streaming"
                 || key == "feature_flags.transcript_sweep"
+                || key == "feature_flags.lite_mode"
                 || key == "transcript_streaming_lookback_days"
+                || key == "daemon_memory_limit_mb"
             {
                 println!("Run `git-ai bg restart` for changes to take effect.");
             }
@@ -253,6 +259,9 @@ pub fn handle_config(args: &[String]) {
             if let Err(e) = unset_config_value(key) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
+            }
+            if key == "daemon_memory_limit_mb" {
+                println!("Run `git-ai bg restart` for changes to take effect.");
             }
         }
         key => {
@@ -420,6 +429,13 @@ fn show_all_config() -> Result<(), String> {
     effective_config.insert(
         "max_checkpoint_total_lines".to_string(),
         Value::Number(runtime_config.max_checkpoint_total_lines().into()),
+    );
+    effective_config.insert(
+        "daemon_memory_limit_mb".to_string(),
+        runtime_config
+            .daemon_memory_limit_mb()
+            .map(|limit| Value::Number(limit.into()))
+            .unwrap_or(Value::Null),
     );
 
     effective_config.insert(
@@ -608,6 +624,10 @@ fn get_config_value(key: &str) -> Result<(), String> {
             "max_checkpoint_total_lines" => {
                 Value::Number(runtime_config.max_checkpoint_total_lines().into())
             }
+            "daemon_memory_limit_mb" => runtime_config
+                .daemon_memory_limit_mb()
+                .map(|limit| Value::Number(limit.into()))
+                .unwrap_or(Value::Null),
             "custom_attributes" => serde_json::to_value(runtime_config.custom_attributes())
                 .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
             "reporting_profile" => serde_json::to_value(runtime_config.reporting_profile())
@@ -956,6 +976,23 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 file_config.max_checkpoint_total_lines = Some(lines);
                 file_config.commit()?;
                 println!("[max_checkpoint_total_lines]: {}", lines);
+            }
+            "daemon_memory_limit_mb" => {
+                let limit_mb = value.trim().parse::<u64>().map_err(|_| {
+                    format!(
+                        "Invalid daemon_memory_limit_mb value '{}'. Expected a positive integer in MiB",
+                        value
+                    )
+                })?;
+                if limit_mb == 0 || limit_mb > MAX_DAEMON_MEMORY_LIMIT_MB {
+                    return Err(format!(
+                        "Invalid daemon_memory_limit_mb value '{}'. Expected an integer between 1 and {} MiB",
+                        value, MAX_DAEMON_MEMORY_LIMIT_MB
+                    ));
+                }
+                file_config.daemon_memory_limit_mb = Some(limit_mb);
+                crate::config::save_file_config(&file_config)?;
+                println!("[daemon_memory_limit_mb]: {}", limit_mb);
             }
             "custom_attributes" => {
                 if add_mode {
@@ -1334,6 +1371,13 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                 file_config.commit()?;
                 if let Some(v) = old_value {
                     println!("- [max_checkpoint_total_lines]: {}", v);
+                }
+            }
+            "daemon_memory_limit_mb" => {
+                let old_value = file_config.daemon_memory_limit_mb.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    println!("- [daemon_memory_limit_mb]: {}", v);
                 }
             }
             "custom_attributes" => {

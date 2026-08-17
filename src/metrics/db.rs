@@ -35,6 +35,7 @@ const SCHEMA_VERSION: usize = 15;
 const MAX_METRIC_UPLOAD_ATTEMPTS: u32 = 6;
 const METRIC_PROCESSING_LOCK_TIMEOUT_SECS: u64 = 10 * 60;
 pub(crate) const METADATA_BACKFILL_BATCH_SIZE: usize = 1000;
+const EVENT_METADATA_BACKFILL_COMPLETED_KEY: &str = "event_metadata_backfill_completed";
 const NS_PER_SECOND: u128 = 1_000_000_000;
 /// Leave one MiB for the request envelope below the server's 8 MiB limit.
 pub(crate) const MAX_METRICS_UPLOAD_BODY_BYTES: usize = 7 * 1024 * 1024;
@@ -1367,6 +1368,43 @@ impl MetricsDatabase {
         Ok(metric_ids)
     }
 
+    /// Insert a content-free session recovery marker for integration tests.
+    ///
+    /// The test-support API deliberately accepts only compact attributes and
+    /// identifiers so tests cannot bypass the raw transcript content guard.
+    #[cfg(feature = "test-support")]
+    pub fn insert_session_recovery_observation_for_test(
+        &mut self,
+        timestamp: u32,
+        attrs: SparseArray,
+        external_event_id: Option<String>,
+        external_parent_event_id: Option<String>,
+        external_tool_use_id: Option<String>,
+    ) -> Result<Vec<i64>, GitAiError> {
+        self.insert_session_observations(&[SessionObservation {
+            timestamp,
+            attrs,
+            external_event_id,
+            external_parent_event_id,
+            external_tool_use_id,
+            token: None,
+        }])
+    }
+
+    /// Report whether compact, content-free activity exists for a session.
+    #[cfg(feature = "test-support")]
+    pub fn has_compact_session_activity_for_test(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, GitAiError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_activity WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Repair legacy project/source-key shape without guessing historical
     /// reporting identity from the process's current configuration.
     ///
@@ -2460,6 +2498,39 @@ impl MetricsDatabase {
     ) -> Result<MetricMetadataBackfillSummary, GitAiError> {
         self.backfill_event_metadata_batch_after(0, limit)
             .map(|(summary, _)| summary)
+    }
+
+    pub(crate) fn event_metadata_backfill_completed(&self) -> Result<bool, GitAiError> {
+        let completed: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = ?1",
+                params![EVENT_METADATA_BACKFILL_COMPLETED_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(completed.as_deref() == Some("1"))
+    }
+
+    /// Backfill one bounded batch, permanently marking the one-time migration complete
+    /// after a successful scan reaches the end of the table.
+    pub(crate) fn backfill_event_metadata_batch_once(
+        &mut self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<(MetricMetadataBackfillSummary, Option<i64>), GitAiError> {
+        if limit == 0 || self.event_metadata_backfill_completed()? {
+            return Ok((MetricMetadataBackfillSummary::default(), None));
+        }
+
+        let result = self.backfill_event_metadata_batch_after(after_id, limit)?;
+        if result.0.scanned < limit {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO schema_metadata (key, value) VALUES (?1, '1')",
+                params![EVENT_METADATA_BACKFILL_COMPLETED_KEY],
+            )?;
+        }
+        Ok(result)
     }
 
     /// Backfill cached event metadata for all currently eligible legacy rows.
@@ -6729,6 +6800,55 @@ mod tests {
             .unwrap();
         assert_eq!(empty_summary, MetricMetadataBackfillSummary::default());
         assert_eq!(empty_last_id, None);
+    }
+
+    #[test]
+    fn test_backfill_event_metadata_batch_once_marks_completion() {
+        let (mut db, temp_dir) = create_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO metrics (event_json) VALUES (?1), (?2)",
+                params![event_json(days_ago(2)), event_json(days_ago(1))],
+            )
+            .unwrap();
+
+        let (first_summary, last_id) = db.backfill_event_metadata_batch_once(0, 1).unwrap();
+        assert_eq!(first_summary.scanned, 1);
+        assert!(!db.event_metadata_backfill_completed().unwrap());
+
+        let (second_summary, _) = db
+            .backfill_event_metadata_batch_once(last_id.unwrap(), 2)
+            .unwrap();
+        assert_eq!(second_summary.scanned, 1);
+        assert!(db.event_metadata_backfill_completed().unwrap());
+
+        drop(db);
+        let conn = crate::sqlite::open_with_memory_limits(temp_dir.path().join("test-metrics.db"))
+            .unwrap();
+        let mut db = MetricsDatabase { conn };
+        db.initialize_schema().unwrap();
+        assert!(db.event_metadata_backfill_completed().unwrap());
+
+        db.conn
+            .execute(
+                "INSERT INTO metrics (event_json) VALUES (?1)",
+                params![event_json(days_ago(0))],
+            )
+            .unwrap();
+        let inserted_after_completion = db.conn.last_insert_rowid();
+
+        let skipped = db.backfill_event_metadata_batch_once(0, 100).unwrap();
+        assert_eq!(skipped, (MetricMetadataBackfillSummary::default(), None));
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT event_ts FROM metrics WHERE id = ?1",
+                    params![inserted_after_completion],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

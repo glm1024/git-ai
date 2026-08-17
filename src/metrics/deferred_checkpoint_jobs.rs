@@ -217,6 +217,15 @@ pub(crate) enum DeferredCheckpointJobStatus {
     ManuallyAbandoned(String),
 }
 
+type DeferredCheckpointJobStatusRow = (
+    String,
+    bool,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum DeferredCheckpointPathScope {
@@ -947,6 +956,11 @@ pub(crate) fn enqueue_on_connection(
 ) -> Result<bool, GitAiError> {
     let tx = conn.transaction()?;
     if spec.phase == "post" {
+        // Admission may run ahead of family side effects. A pending or
+        // processing pre is sufficient evidence to admit its post because the
+        // repository FIFO in claim_on_connection prevents that post from ever
+        // executing until every prior row is done. If the pre becomes evidence
+        // blocked, the post remains blocked behind it as well.
         let pre_scope_json: Option<Option<String>> = tx
             .query_row(
                 r#"
@@ -957,7 +971,6 @@ pub(crate) fn enqueue_on_connection(
               AND external_session_id = ?3
               AND external_tool_use_id = ?4
               AND phase = 'pre'
-              AND state = 'done'
               AND blocked_evidence = 0
             ORDER BY id DESC
             LIMIT 1
@@ -973,7 +986,7 @@ pub(crate) fn enqueue_on_connection(
             .optional()?;
         let Some(pre_scope_json) = pre_scope_json else {
             return Err(GitAiError::Generic(format!(
-                "durable post checkpoint {} has no completed pre checkpoint for the same repository/session/call",
+                "durable post checkpoint {} has no admitted pre checkpoint for the same repository/session/call",
                 spec.job_key
             )));
         };
@@ -1896,14 +1909,7 @@ pub(crate) fn status_on_connection(
     conn: &mut Connection,
     job_key: &str,
 ) -> Result<Option<DeferredCheckpointJobStatus>, GitAiError> {
-    let state: Option<(
-        String,
-        bool,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-    )> = conn
+    let state: Option<DeferredCheckpointJobStatusRow> = conn
         .query_row(
             "SELECT state, blocked_evidence, blocked_reason, terminal_resolution, repair_id, repair_backup_path FROM deferred_checkpoint_jobs WHERE job_key = ?1",
             params![job_key],
@@ -2262,18 +2268,34 @@ mod tests {
     }
 
     #[test]
-    fn post_requires_completed_pre_for_same_repository_session_and_call() {
+    fn post_requires_admitted_pre_for_same_repository_session_and_call() {
         let mut conn = setup();
         let post = spec("repo", "call-1", "post", "post");
         let error = enqueue_on_connection(&mut conn, &post, 10).unwrap_err();
-        assert!(error.to_string().contains("no completed pre checkpoint"));
+        assert!(error.to_string().contains("no admitted pre checkpoint"));
 
         complete_pre(&mut conn, "other-repo", "call-1");
         let error = enqueue_on_connection(&mut conn, &post, 11).unwrap_err();
-        assert!(error.to_string().contains("no completed pre checkpoint"));
+        assert!(error.to_string().contains("no admitted pre checkpoint"));
 
         complete_pre(&mut conn, "repo", "call-1");
         assert!(enqueue_on_connection(&mut conn, &post, 12).unwrap());
+    }
+
+    #[test]
+    fn post_can_be_admitted_behind_pending_pre_but_cannot_overtake_it() {
+        let mut conn = setup();
+        let pre = spec("repo", "call-1", "pre", "pre");
+        let post = spec("repo", "call-1", "post", "post");
+
+        assert!(enqueue_on_connection(&mut conn, &pre, 10).unwrap());
+        assert!(enqueue_on_connection(&mut conn, &post, 11).unwrap());
+        assert!(
+            claim_specific_on_connection(&mut conn, &post.job_key, 12, 60)
+                .unwrap()
+                .is_none(),
+            "repository FIFO must keep post behind its pending pre"
+        );
     }
 
     #[test]

@@ -1912,7 +1912,10 @@ mod tests {
         unsafe {
             std::env::remove_var("GIT_AI_TEST_CACHE_CLEAR_FAILURE");
         }
-        assert!(matches!(result, UpgradeReceiptFileResult::Blocked { .. }));
+        let UpgradeReceiptFileResult::Blocked { reason } = result else {
+            panic!("cache clear failure must block receipt reconciliation");
+        };
+        assert!(!reason.is_empty());
         assert!(receipt_path.exists());
         assert!(read_update_cache().is_some_and(|cache| cache.update_available()));
         clear_test_cache_dir();
@@ -1967,13 +1970,15 @@ mod tests {
 
         let result = reconcile_upgrade_receipt_files(UpdateChannel::Latest, Some(&cache), "2.3.4");
 
-        assert!(matches!(
-            result,
-            UpgradeReceiptFileResult::Completed {
-                cleanup_error: None,
-                ..
-            }
-        ));
+        let UpgradeReceiptFileResult::Completed {
+            receipt,
+            cleanup_error,
+        } = result
+        else {
+            panic!("valid receipt must complete reconciliation");
+        };
+        assert!(cleanup_error.is_none());
+        assert_eq!(receipt.installed_version, "2.3.4");
         assert!(!receipt_path.exists());
         assert!(read_update_cache().is_some_and(|cache| {
             cache.matches_channel(UpdateChannel::Latest) && !cache.update_available()

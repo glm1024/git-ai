@@ -3,7 +3,7 @@ use git_ai::authorship::working_log::AgentId;
 use git_ai::daemon::bash_history_db::{BashCallEnd, BashCallStart, BashHistoryDatabase};
 
 use crate::repos::test_file::ExpectedLineExt;
-use crate::repos::test_repo::{DaemonTestScope, TestRepo};
+use crate::repos::test_repo::{DaemonTestScope, TestRepo, real_git_executable};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -101,7 +101,13 @@ struct DivergentPullTestSetup {
 /// - local has diverged from upstream (initial + ai_commit)
 /// - `git pull --rebase` will rebase the AI commit onto the upstream commit
 fn setup_divergent_pull_test() -> DivergentPullTestSetup {
-    let (local, upstream) = TestRepo::new_with_remote();
+    setup_divergent_pull_test_with_daemon_scope(DaemonTestScope::Shared)
+}
+
+fn setup_divergent_pull_test_with_daemon_scope(
+    daemon_scope: DaemonTestScope,
+) -> DivergentPullTestSetup {
+    let (local, upstream) = TestRepo::new_with_remote_with_daemon_scope(daemon_scope);
 
     // Make initial commit and push
     let mut readme = local.filename("README.md");
@@ -536,6 +542,212 @@ fn test_pull_rebase_preserves_committed_ai_authorship() {
         "AI generated feature line 1".ai(),
         "AI generated feature line 2".ai(),
     ]);
+}
+
+#[test]
+fn test_pull_rebase_preserves_authorship_when_range_diff_ignores_no_abbrev() {
+    let setup = setup_divergent_pull_test_with_daemon_scope(DaemonTestScope::Dedicated);
+    let mut local = setup.local;
+
+    assert!(
+        local
+            .read_authorship_note(&setup.local_ai_commit_sha)
+            .is_some(),
+        "precondition: original local AI commit should have an authorship note"
+    );
+
+    let shim_binary = env!("CARGO_BIN_EXE_git-ai-test-git-shim");
+    let shim_path = local.test_home_path().join(if cfg!(windows) {
+        "legacy-git-shim.exe"
+    } else {
+        "legacy-git-shim"
+    });
+    std::fs::copy(shim_binary, &shim_path).expect("legacy Git shim should be copied");
+    let shim_path = shim_path.to_str().expect("shim path should be utf-8");
+    let real_git = real_git_executable();
+    local.patch_git_ai_config(|patch| patch.git_path = Some(shim_path.to_string()));
+    local.restart_dedicated_daemon_with_env_for_test(&[
+        ("GIT_AI_TEST_GIT_SHIM_TARGET", real_git),
+        ("GIT_AI_TEST_GIT_SHIM_FALLBACK_TARGET", real_git),
+        ("GIT_AI_TEST_GIT_SHIM_ABBREVIATE_RANGE_DIFF", "1"),
+    ]);
+
+    local
+        .git(&["pull", "--rebase"])
+        .expect("pull --rebase should succeed");
+
+    let rebased_head = local
+        .git(&["rev-parse", "HEAD"])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string();
+    assert_ne!(rebased_head, setup.local_ai_commit_sha);
+    assert!(
+        local.read_authorship_note(&rebased_head).is_some(),
+        "rebased local AI commit should retain its authorship note even when Git ignores --no-abbrev"
+    );
+
+    local.patch_git_ai_config(|patch| patch.git_path = Some(real_git.to_string()));
+    let mut ai_file = local.filename("ai_feature.txt");
+    ai_file.assert_committed_lines(crate::lines![
+        "AI generated feature line 1".ai(),
+        "AI generated feature line 2".ai(),
+    ]);
+}
+
+#[test]
+#[ignore = "temporarily restored by the stacked transport-aware notes sync follow-up"]
+fn test_pull_rebase_force_pushed_target_preserves_remote_authorship_note() {
+    // Model a clone that still has an old PR head while another clone force-pushes
+    // a rewritten head with its own complete authorship note. Pull processes the
+    // non-fast-forward branch update before its post-pull notes fetch, so rewrite
+    // handling must fetch the target note before shifting the stale source note.
+    let (local, upstream) = TestRepo::new_with_remote();
+    let file_path = local.path().join("feature.txt");
+
+    std::fs::write(&file_path, "base\n").unwrap();
+    local.stage_all_and_commit("initial").unwrap();
+    let mut local_file = local.filename("feature.txt");
+    local_file.assert_committed_lines(crate::lines!["base".unattributed_human()]);
+
+    local
+        .git_ai(&["checkpoint", "human", "feature.txt"])
+        .unwrap();
+    std::fs::write(&file_path, "base\nold AI line\n").unwrap();
+    local
+        .git_ai(&["checkpoint", "mock_ai", "feature.txt"])
+        .unwrap();
+    let old_commit = local.stage_all_and_commit("old feature version").unwrap();
+    local_file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "old AI line".ai(),
+    ]);
+    local.git(&["push", "-u", "origin", "main"]).unwrap();
+
+    let contributor_parent = tempfile::tempdir().expect("contributor temp dir");
+    let contributor_path = contributor_parent.path().join("contributor");
+    local
+        .git_og(&[
+            "clone",
+            upstream.path().to_str().unwrap(),
+            contributor_path.to_str().unwrap(),
+        ])
+        .unwrap();
+    let contributor =
+        TestRepo::new_at_path_with_daemon_scope(&contributor_path, DaemonTestScope::Shared);
+    contributor
+        .git(&["reset", "--hard", &format!("{}^", old_commit.commit_sha)])
+        .unwrap();
+
+    let contributor_file_path = contributor.path().join("feature.txt");
+    contributor
+        .git_ai(&["checkpoint", "human", "feature.txt"])
+        .unwrap();
+    std::fs::write(
+        &contributor_file_path,
+        "base\nold AI line\nremote AI line\n",
+    )
+    .unwrap();
+    contributor
+        .git_ai(&["checkpoint", "mock_ai", "feature.txt"])
+        .unwrap();
+    let remote_commit = contributor
+        .stage_all_and_commit("force-pushed feature version")
+        .unwrap();
+    let mut contributor_file = contributor.filename("feature.txt");
+    contributor_file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "old AI line".ai(),
+        "remote AI line".ai(),
+    ]);
+
+    contributor
+        .git(&["push", "--force", "origin", "HEAD:main"])
+        .unwrap();
+    contributor.sync_daemon_force();
+    contributor
+        .git_og(&["push", "--force", "origin", "refs/notes/ai:refs/notes/ai"])
+        .unwrap();
+
+    assert!(
+        upstream
+            .read_authorship_note(&remote_commit.commit_sha)
+            .is_some(),
+        "precondition: force-pushed target note must exist on the remote"
+    );
+    assert!(
+        local
+            .read_authorship_note(&remote_commit.commit_sha)
+            .is_none(),
+        "precondition: local clone must not have fetched the force-pushed target note"
+    );
+
+    local.git(&["pull", "--rebase"]).unwrap();
+    assert_eq!(
+        local.git(&["rev-parse", "HEAD"]).unwrap().trim(),
+        remote_commit.commit_sha,
+        "pull should accept the force-pushed remote target without replaying a local commit"
+    );
+    local_file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "old AI line".ai(),
+        "remote AI line".ai(),
+    ]);
+}
+
+#[test]
+fn test_local_rebase_does_not_fetch_notes_for_fresh_destinations() {
+    let (repo, _upstream) = TestRepo::new_with_remote();
+    let file_path = repo.path().join("feature.txt");
+
+    std::fs::write(&file_path, "base\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+    let main_branch = repo.current_branch();
+    let mut file = repo.filename("feature.txt");
+    file.assert_committed_lines(crate::lines!["base".unattributed_human()]);
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    repo.git_ai(&["checkpoint", "human", "feature.txt"])
+        .unwrap();
+    std::fs::write(&file_path, "base\nAI feature line\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "feature.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("AI feature").unwrap();
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "AI feature line".ai(),
+    ]);
+    repo.git_og(&["push", "origin", "refs/notes/ai:refs/notes/ai"])
+        .unwrap();
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    std::fs::write(repo.path().join("main.txt"), "main change\n").unwrap();
+    repo.stage_all_and_commit("advance main").unwrap();
+    file.assert_committed_lines(crate::lines!["base".unattributed_human()]);
+    let mut main_file = repo.filename("main.txt");
+    main_file.assert_committed_lines(crate::lines!["main change".unattributed_human()]);
+
+    repo.git(&["checkout", "feature"]).unwrap();
+    let tracking_ref = "refs/notes/ai-remote/origin";
+    repo.git_og(&["update-ref", "-d", tracking_ref]).unwrap();
+    assert!(
+        repo.git_og(&["show-ref", "--verify", "--quiet", tracking_ref])
+            .is_err(),
+        "precondition: the remote notes tracking ref should be absent"
+    );
+
+    repo.git(&["rebase", &main_branch]).unwrap();
+    repo.sync_daemon_force();
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "AI feature line".ai(),
+    ]);
+    main_file.assert_committed_lines(crate::lines!["main change".unattributed_human()]);
+    assert!(
+        repo.git_og(&["show-ref", "--verify", "--quiet", tracking_ref])
+            .is_err(),
+        "a local rebase with locally noted sources must not fetch remote notes"
+    );
 }
 
 #[test]
@@ -1980,6 +2192,7 @@ crate::reuse_tests_in_worktree!(
     test_fast_forward_pull_preserves_ai_attribution,
     test_fast_forward_pull_without_local_changes,
     test_pull_rebase_preserves_committed_ai_authorship,
+    test_local_rebase_does_not_fetch_notes_for_fresh_destinations,
     test_pull_rebase_via_git_config_preserves_committed_ai_authorship,
     test_pull_rebase_via_zero_arg_alias_and_git_config_preserves_committed_ai_authorship,
     test_pull_rebase_autostash_preserves_uncommitted_ai_attribution,
@@ -1997,4 +2210,9 @@ crate::reuse_tests_in_worktree!(
     test_regular_rebase_conflict_keep_both_sides_preserves_each_original_source,
     test_regular_rebase_conflict_keep_main_side_preserves_main_attribution,
     test_regular_rebase_with_conflict_abort_preserves_original_notes,
+);
+
+crate::reuse_tests_in_worktree_with_attrs!(
+    (#[ignore = "temporarily restored by the stacked transport-aware notes sync follow-up"])
+    test_pull_rebase_force_pushed_target_preserves_remote_authorship_note,
 );

@@ -465,7 +465,80 @@ impl RefCursor {
             .head_expected_transition(cmd, state)
             .without_old_oid_constraint()
             .with_reflog_messages(commit_reflog_messages(&args, amend));
-        self.consume_head_transition_for_command(cmd, state, prefixes, expected)
+        let entry = self.find_commit_head_entry(cmd, prefixes, expected.clone())?;
+        crate::wltrace::wltrace(
+            "ref_cursor.commit_entry",
+            cmd.worktree.as_deref().unwrap_or(Path::new("")),
+            || {
+                let cursor = cmd
+                    .worktree
+                    .as_deref()
+                    .and_then(git_dir_for_worktree)
+                    .map(|git_dir| head_key(&git_dir))
+                    .map(|key| {
+                        format!(
+                            "offset={:?} hint={:?} consumed={:?}",
+                            self.offsets.get(&key),
+                            self.command_start_hints.get(&key),
+                            self.consumed_offsets.get(&key),
+                        )
+                    })
+                    .unwrap_or_else(|| "no-key".to_string());
+                format!(
+                    "sid={} exit={} entry={} expected_new={:?} messages={:?} {cursor}",
+                    cmd.root_sid,
+                    cmd.exit_code,
+                    entry
+                        .as_ref()
+                        .map(|entry| format!(
+                            "{}->{}@{} msg={}",
+                            &entry.old[..8.min(entry.old.len())],
+                            &entry.new[..8.min(entry.new.len())],
+                            entry.start_offset,
+                            entry.message.chars().take(40).collect::<String>()
+                        ))
+                        .unwrap_or_else(|| "NONE".to_string()),
+                    expected
+                        .new_oid
+                        .as_ref()
+                        .map(|oid| &oid[..8.min(oid.len())]),
+                    expected.messages,
+                )
+            },
+        );
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+
+        self.consume_head_entry_for_command(cmd, entry)
+    }
+
+    fn find_commit_head_entry(
+        &mut self,
+        cmd: &NormalizedCommand,
+        message_prefixes: &[&str],
+        expected: ExpectedTransition,
+    ) -> Result<Option<CursorEntry>, GitAiError> {
+        // Prefer the exact argv-derived reflog message when possible: it is the
+        // strongest discriminator for untraced duplicate commit entries. A
+        // commit-msg hook can rewrite the subject after argv is fixed, though, and
+        // git records that final subject in the reflog. In that case fall back to a
+        // command-window match below instead of dropping the HEAD transition.
+        if let Some(entry) =
+            self.find_head_entry(cmd.worktree.as_deref(), message_prefixes, expected.clone())?
+        {
+            return Ok(Some(entry));
+        }
+
+        if expected.messages.is_empty() {
+            return Ok(None);
+        }
+
+        self.find_head_entry_in_command_window(
+            cmd,
+            message_prefixes,
+            expected.without_reflog_message_constraint(),
+        )
     }
 
     fn enrich_cherry_pick(
@@ -1001,13 +1074,72 @@ impl RefCursor {
             return Ok(());
         }
 
+        // A failed control-mode rebase (--continue/--skip that stopped on a
+        // later conflict) may have produced no reflog entry of its own (e.g.
+        // an empty resolution git skipped). Because trace processing is
+        // asynchronous, the entry written by the EVENTUAL successful continue
+        // can already be in the reflog by the time this command is enriched;
+        // consuming it here starves that final continue of its evidence and
+        // loses the rebased-branch transition (and with it the migration of
+        // conflict-resolution working logs). Failed commands take no side
+        // effects, so their ref evidence is never used: consume nothing. Any
+        // entry this command did create is picked up by the successful
+        // continue's chain walk below.
+        if cmd.exit_code != 0 && summarize_rebase_args(&rebase_command_args(cmd)).is_control_mode {
+            return Ok(());
+        }
+
         let expected = self.head_expected_transition(cmd, state);
         let first = match self.find_rebase_start_entry(cmd, expected.clone())? {
             Some(entry) => Some(entry),
-            None => {
-                self.find_head_entry_without_hint(cmd.worktree.as_deref(), &["rebase"], expected)?
-            }
+            None => self.find_head_entry_without_hint(
+                cmd.worktree.as_deref(),
+                &["rebase"],
+                expected.clone(),
+            )?,
         };
+        crate::wltrace::wltrace(
+            "ref_cursor.rebase_first_entry",
+            cmd.worktree.as_deref().unwrap_or(std::path::Path::new("")),
+            || {
+                let cursor = cmd
+                    .worktree
+                    .as_deref()
+                    .and_then(git_dir_for_worktree)
+                    .map(|git_dir| head_key(&git_dir))
+                    .map(|key| {
+                        format!(
+                            "offset={:?} hint={:?}",
+                            self.offsets.get(&key),
+                            self.command_start_hints.get(&key)
+                        )
+                    })
+                    .unwrap_or_else(|| "no-key".to_string());
+                format!(
+                    "sid={} exit={} first={} expected_old={:?} expected_new={:?} {cursor}",
+                    cmd.root_sid,
+                    cmd.exit_code,
+                    first
+                        .as_ref()
+                        .map(|entry| format!(
+                            "{}->{} msg={}",
+                            &entry.old[..8.min(entry.old.len())],
+                            &entry.new[..8.min(entry.new.len())],
+                            entry.message.chars().take(40).collect::<String>()
+                        ))
+                        .unwrap_or_else(|| "NONE".to_string()),
+                    expected
+                        .old_oids
+                        .iter()
+                        .map(|oid| oid.chars().take(8).collect::<String>())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .new_oid
+                        .as_ref()
+                        .map(|oid| &oid[..8.min(oid.len())]),
+                )
+            },
+        );
         let Some(first) = first else {
             return Ok(());
         };
@@ -1158,6 +1290,21 @@ impl RefCursor {
         cmd: &mut NormalizedCommand,
         entry: CursorEntry,
     ) -> Result<(), GitAiError> {
+        crate::wltrace::wltrace(
+            "ref_cursor.consume_head_entry",
+            cmd.worktree.as_deref().unwrap_or(Path::new("")),
+            || {
+                format!(
+                    "sid={} cmd={} entry={}->{}@{} msg={}",
+                    cmd.root_sid,
+                    cmd.primary_command.as_deref().unwrap_or("unknown"),
+                    &entry.old[..8.min(entry.old.len())],
+                    &entry.new[..8.min(entry.new.len())],
+                    entry.start_offset,
+                    entry.message.chars().take(40).collect::<String>(),
+                )
+            },
+        );
         self.consume_entry(&entry)?;
         let old = entry.old.clone();
         let new = entry.new.clone();
@@ -1379,6 +1526,43 @@ impl RefCursor {
         }
 
         Ok(latest_before_hint)
+    }
+
+    fn find_head_entry_in_command_window(
+        &mut self,
+        cmd: &NormalizedCommand,
+        message_prefixes: &[&str],
+        expected: ExpectedTransition,
+    ) -> Result<Option<CursorEntry>, GitAiError> {
+        let Some(worktree) = cmd.worktree.as_deref() else {
+            return Ok(None);
+        };
+        let Some(git_dir) = git_dir_for_worktree(worktree) else {
+            return Ok(None);
+        };
+        let key = head_key(&git_dir);
+        let path = git_dir.join("logs").join("HEAD");
+        let start = self.reflog_start_offset(&key, &path)?;
+        let command_window = reflog_timestamp_window(cmd);
+        let candidates = read_reflog_entries(key.clone(), &path, "HEAD", start)?
+            .into_iter()
+            .filter(|entry| {
+                !self.entry_consumed(entry)
+                    && expected.matches(entry)
+                    && message_matches(&entry.message, message_prefixes)
+                    && entry
+                        .timestamp_secs
+                        .is_some_and(|timestamp| command_window.contains(timestamp))
+            })
+            .collect::<Vec<_>>();
+
+        if self.command_start_hints.contains_key(&key) {
+            return Ok(self.select_candidate_with_hint(&key, candidates));
+        }
+        Ok(match candidates.as_slice() {
+            [entry] => Some(entry.clone()),
+            _ => None,
+        })
     }
 
     fn find_head_entry(
@@ -2271,6 +2455,11 @@ fn current_worktree_branch_ref<'a>(
 impl ExpectedTransition {
     fn with_reflog_messages(mut self, messages: HashSet<String>) -> Self {
         self.messages = messages;
+        self
+    }
+
+    fn without_reflog_message_constraint(mut self) -> Self {
+        self.messages.clear();
         self
     }
 
@@ -3669,6 +3858,13 @@ mod tests {
     const F: &str = "6666666666666666666666666666666666666666";
     const G: &str = "7777777777777777777777777777777777777777";
 
+    fn create_git_dir(worktree: &Path) -> PathBuf {
+        let git_dir = worktree.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        git_dir
+    }
+
     #[test]
     fn commit_subject_matches_git_reflog_trailing_whitespace_cleanup() {
         assert_eq!(commit_subject("subject \t"), Some("subject".to_string()));
@@ -3783,7 +3979,7 @@ mod tests {
         // silently lost.
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
 
@@ -3837,7 +4033,7 @@ mod tests {
         // branch transition is then never found.
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let reference = "refs/heads/feature";
         let head_log = git_dir.join("logs/HEAD");
         let branch_log = git_dir.join("logs").join(reference);
@@ -3893,7 +4089,7 @@ mod tests {
         // match — this commit's own entry. The commit keeps its attribution.
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
 
@@ -3952,7 +4148,7 @@ mod tests {
         // entry. The hint must be honored, not ignored.
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
 
@@ -4008,7 +4204,7 @@ mod tests {
         // than the older untraced duplicate.
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
 
@@ -4053,10 +4249,88 @@ mod tests {
     }
 
     #[test]
+    fn commit_reflog_subject_rewritten_by_hook_falls_back_to_hinted_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = create_git_dir(&worktree);
+        let head_log = git_dir.join("logs/HEAD");
+        fs::create_dir_all(head_log.parent().unwrap()).unwrap();
+
+        let base_line =
+            format!("{A} {B} Test User <test@example.com> 0 +0000\tcommit: traced base\n");
+        let untraced_line =
+            format!("{B} {C} Test User <test@example.com> 0 +0000\tcommit: untraced\n");
+        let hooked_line =
+            format!("{C} {D} Test User <test@example.com> 0 +0000\tcommit: hooked: raw subject\n");
+        let in_order_offset = base_line.len() as u64;
+        let hint_offset = (base_line.len() + untraced_line.len()) as u64;
+        fs::write(
+            &head_log,
+            format!("{base_line}{untraced_line}{hooked_line}"),
+        )
+        .unwrap();
+
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let mut state = family_state(&family);
+        state.refs.insert("HEAD".to_string(), B.to_string());
+        let mut cursor = RefCursor::new(family.clone());
+        cursor
+            .initialize_reflog_cursor(&head_key(&git_dir), in_order_offset)
+            .unwrap();
+
+        let mut cmd =
+            command_with_worktree(&family, Some(worktree), &["commit", "-m", "raw subject"]);
+        cmd.reflog_start_offsets
+            .insert(head_key(&git_dir), hint_offset);
+
+        cursor.enrich_command(&mut cmd, &state).unwrap();
+
+        assert_eq!(
+            cmd.ref_changes,
+            vec![RefChange {
+                reference: "HEAD".to_string(),
+                old: C.to_string(),
+                new: D.to_string(),
+            }],
+            "commit-msg hooks may rewrite the final subject used by git's reflog"
+        );
+    }
+
+    #[test]
+    fn commit_reflog_subject_rewrite_fallback_does_not_guess_without_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = create_git_dir(&worktree);
+        let head_log = git_dir.join("logs/HEAD");
+        fs::create_dir_all(head_log.parent().unwrap()).unwrap();
+
+        append_reflog(
+            &git_dir,
+            "HEAD",
+            &[
+                (A, B, "commit: untraced"),
+                (B, C, "commit: hooked: raw subject"),
+            ],
+        );
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let state = family_state(&family);
+        let mut cursor = RefCursor::new(family.clone());
+        let mut cmd =
+            command_with_worktree(&family, Some(worktree), &["commit", "-m", "raw subject"]);
+
+        cursor.enrich_command(&mut cmd, &state).unwrap();
+
+        assert!(
+            cmd.ref_changes.is_empty(),
+            "without an exact message or command-start hint, multiple commit entries are ambiguous"
+        );
+    }
+
+    #[test]
     fn amend_without_message_does_not_match_plain_commit_reflog_entry() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs")).unwrap();
         append_reflog(
             &git_dir,
@@ -4088,7 +4362,7 @@ mod tests {
     fn commit_with_exact_reflog_message_ignores_stale_daemon_head() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
 
@@ -4126,7 +4400,7 @@ mod tests {
     fn commit_reflog_boundary_skips_untraced_duplicate_message() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
 
@@ -4164,7 +4438,7 @@ mod tests {
     fn first_observed_head_boundary_skips_prior_reset_history() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
 
@@ -4199,7 +4473,7 @@ mod tests {
     fn reset_late_reflog_offset_uses_command_message_not_stale_state() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
 
@@ -4266,7 +4540,7 @@ mod tests {
     fn direct_branch_update_ref_uses_argv_transition_when_reflog_cursor_starts_too_late() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let reference = "refs/heads/feature";
         fs::create_dir_all(git_dir.join("logs").join("refs/heads")).unwrap();
         fs::create_dir_all(git_dir.join("logs")).unwrap();
@@ -4311,7 +4585,7 @@ mod tests {
     fn direct_branch_update_ref_does_not_treat_stale_head_reflog_match_as_current_head_move() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let reference = "refs/heads/feature";
         fs::create_dir_all(git_dir.join("logs").join("refs/heads")).unwrap();
         fs::create_dir_all(git_dir.join("logs")).unwrap();
@@ -4380,7 +4654,7 @@ mod tests {
     fn direct_branch_update_ref_consumes_head_mirror_before_later_unstructured_update_ref() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let reference = "refs/heads/feature";
         append_reflog(&git_dir, reference, &[(A, B, "")]);
         append_reflog(&git_dir, "HEAD", &[(A, B, "")]);
@@ -4477,7 +4751,7 @@ mod tests {
     fn direct_head_update_ref_uses_argv_and_late_cursor_branch_mirror_once() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let reference = "refs/heads/feature";
         append_reflog(&git_dir, reference, &[(A, B, "")]);
         append_reflog(&git_dir, "HEAD", &[(A, B, "")]);
@@ -4533,7 +4807,7 @@ mod tests {
     fn direct_head_update_ref_uses_known_worktree_branch_when_other_branch_matches_same_second() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let current = "refs/heads/main";
         let other = "refs/heads/other";
         append_reflog(&git_dir, current, &[(A, B, "")]);
@@ -4592,7 +4866,7 @@ mod tests {
     fn direct_head_update_ref_without_known_branch_does_not_guess_ambiguous_branch_mirror() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         append_reflog(&git_dir, "refs/heads/main", &[(A, B, "")]);
         append_reflog(&git_dir, "refs/heads/other", &[(A, B, "")]);
         append_reflog(&git_dir, "HEAD", &[(A, B, "")]);
@@ -4618,7 +4892,7 @@ mod tests {
     fn direct_branch_update_ref_does_not_attach_head_when_state_names_different_branch() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let current = "refs/heads/main";
         let updated = "refs/heads/feature";
         append_reflog(&git_dir, updated, &[(A, B, "")]);
@@ -4728,7 +5002,7 @@ mod tests {
     fn rebase_span_stops_at_new_rebase_start_before_finish() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs")).unwrap();
         append_reflog(
             &git_dir,
@@ -4768,7 +5042,7 @@ mod tests {
     fn rebase_span_continuation_skips_stale_abort_before_selected_start() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         let head_log = git_dir.join("logs/HEAD");
         let branch_log = git_dir.join("logs/refs/heads/feature");
         fs::create_dir_all(head_log.parent().unwrap()).unwrap();
@@ -5018,7 +5292,7 @@ mod tests {
     fn rebase_does_not_consume_adjacent_checkout_head_entry() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs")).unwrap();
         append_reflog(
             &git_dir,
@@ -5067,7 +5341,7 @@ mod tests {
     fn failed_explicit_branch_rebase_consumes_noop_start_marker_before_continue() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs")).unwrap();
         append_reflog(
             &git_dir,
@@ -5140,10 +5414,90 @@ mod tests {
     }
 
     #[test]
+    fn failed_rebase_continue_does_not_steal_final_continue_entry() {
+        // Two-conflict rebase: the FIRST `rebase --continue` resolves conflict
+        // one with an empty/kept-side resolution and stops again on conflict
+        // two (exit != 0). Its only reflog evidence so far is the start entry
+        // (already consumed by the initial failed `rebase <branch>`); the
+        // continue entry that later appears belongs to the SECOND, successful
+        // `rebase --continue`. The failed continue must not consume it — doing
+        // so leaves the final continue with no entry, no ref_changes, and the
+        // conflict-resolution working log is never attributed (the
+        // two-conflicts attribution flake).
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = create_git_dir(&worktree);
+        fs::create_dir_all(git_dir.join("logs")).unwrap();
+        append_reflog(
+            &git_dir,
+            "HEAD",
+            &[
+                (A, B, "rebase (start): checkout main"),
+                (B, C, "rebase (continue): Add Rust joke"),
+                (C, C, "rebase (finish): returning to refs/heads/topic"),
+            ],
+        );
+        append_reflog(
+            &git_dir,
+            "refs/heads/topic",
+            &[(D, C, "rebase (finish): refs/heads/topic onto main")],
+        );
+
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let state = family_state(&family);
+        let mut cursor = RefCursor::new(family.clone());
+
+        // Initial rebase stops on the first conflict: consumes the start entry.
+        let mut initial =
+            command_with_worktree(&family, Some(worktree.clone()), &["rebase", "main"]);
+        initial.exit_code = 1;
+        cursor.enrich_command(&mut initial, &state).unwrap();
+        assert_eq!(
+            initial.ref_changes,
+            vec![RefChange {
+                reference: "HEAD".to_string(),
+                old: A.to_string(),
+                new: B.to_string(),
+            }],
+            "initial failed rebase should consume only the start entry"
+        );
+
+        // First --continue resolves conflict one and stops on conflict two.
+        // It produced no reflog entry of its own and must consume nothing.
+        let mut stopped_continue =
+            command_with_worktree(&family, Some(worktree.clone()), &["rebase", "--continue"]);
+        stopped_continue.exit_code = 1;
+        cursor
+            .enrich_command(&mut stopped_continue, &state)
+            .unwrap();
+        assert_eq!(
+            stopped_continue.ref_changes,
+            Vec::<RefChange>::new(),
+            "a --continue that stops on the next conflict must not steal the final continue's entry"
+        );
+
+        // Final --continue finishes the rebase: its continue + finish entries
+        // must still be available so the branch transition is established.
+        let mut final_continue =
+            command_with_worktree(&family, Some(worktree), &["rebase", "--continue"]);
+        cursor.enrich_command(&mut final_continue, &state).unwrap();
+        assert!(
+            final_continue
+                .ref_changes
+                .iter()
+                .any(|change| change.reference == "refs/heads/topic"
+                    && change.old == D
+                    && change.new == C),
+            "final --continue must recover the branch transition; got {:?}",
+            final_continue.ref_changes
+        );
+    }
+
+    #[test]
     fn cold_rebase_late_ingress_offset_still_recovers_start_and_branch_finish() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs/refs/heads")).unwrap();
 
         let start_line = format!(
@@ -5209,7 +5563,7 @@ mod tests {
     fn cold_rebase_true_boundary_does_not_replay_older_rebase_span() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs/refs/heads")).unwrap();
 
         let old_start = format!(
@@ -5293,7 +5647,7 @@ mod tests {
     fn rebase_span_stops_before_later_rebase_after_checkout() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs")).unwrap();
         append_reflog(
             &git_dir,
@@ -5349,7 +5703,7 @@ mod tests {
     fn rebase_does_not_attach_unrelated_branch_with_same_new_tip() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs/refs/heads")).unwrap();
         append_reflog(
             &git_dir,
@@ -5402,7 +5756,7 @@ mod tests {
     fn rebase_prefers_start_entry_when_expected_state_matches_pick() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs")).unwrap();
         append_reflog(
             &git_dir,
@@ -5455,7 +5809,7 @@ mod tests {
     fn cherry_pick_span_starts_at_first_pick_when_expected_state_matches_second_pick() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs")).unwrap();
         append_reflog(
             &git_dir,
@@ -5499,7 +5853,7 @@ mod tests {
     fn revert_span_starts_at_first_revert_when_expected_state_matches_second_revert() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs")).unwrap();
         append_reflog(
             &git_dir,
@@ -5552,7 +5906,7 @@ mod tests {
     fn pull_rebase_span_starts_at_start_entry_when_expected_state_matches_pick() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs/refs/heads")).unwrap();
         append_reflog(
             &git_dir,
@@ -5621,7 +5975,7 @@ mod tests {
     fn cold_pull_rebase_late_ingress_offset_still_recovers_start_and_branch_finish() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs/refs/heads")).unwrap();
 
         let start_line = format!(
@@ -5688,7 +6042,7 @@ mod tests {
     fn cold_pull_rebase_true_boundary_does_not_replay_older_pull_span() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
-        let git_dir = worktree.join(".git");
+        let git_dir = create_git_dir(&worktree);
         fs::create_dir_all(git_dir.join("logs/refs/heads")).unwrap();
 
         let old_start = format!(

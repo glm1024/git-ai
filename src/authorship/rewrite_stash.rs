@@ -134,6 +134,11 @@ pub fn handle_stash_create(
 ) -> Result<(), GitAiError> {
     cleanup_legacy_stashes_dir(repo);
 
+    if repo.storage.has_working_log(head_sha) {
+        let working_log = repo.storage.working_log_for_base_commit(head_sha)?;
+        working_log.quarantine_oversized_checkpoints_for_stash()?;
+    }
+
     let metadata = StashMetadata {
         base_commit: head_sha.to_string(),
         timestamp: SystemTime::now()

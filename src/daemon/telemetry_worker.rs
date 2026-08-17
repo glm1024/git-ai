@@ -16,10 +16,13 @@ use crate::authorship::authorship_log_serialization::GIT_AI_VERSION;
 use crate::config::{Config, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::error::GitAiError;
+use crate::metrics::attrs::attr_pos;
 use crate::metrics::db::{
     METADATA_BACKFILL_BATCH_SIZE, MetricRecord, MetricsDatabase, MetricsStatus,
 };
+use crate::metrics::pos_encoded::sparse_get_string;
 use crate::metrics::session_compaction::SessionObservation;
+use crate::metrics::types::MetricEventId;
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use serde_json::{Value, json};
@@ -37,6 +40,7 @@ const MAX_DAEMON_LOG_BUFFER_EVENTS: usize = 5000;
 static METRICS_UPLOAD_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static METRICS_METADATA_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
 static TOKEN_BUCKET_REPAIR_STARTED: AtomicBool = AtomicBool::new(false);
+static DAEMON_RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static DAEMON_LOG_UPLOAD_IN_FLIGHT: std::sync::OnceLock<Arc<AtomicBool>> =
     std::sync::OnceLock::new();
 
@@ -493,7 +497,7 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
         buffer: buffer.clone(),
         flush_tx,
     };
-    let daemon_id = crate::uuid::generate_v4();
+    let daemon_id = daemon_run_id().to_string();
 
     spawn_metrics_metadata_backfill();
     spawn_token_bucket_repair();
@@ -546,7 +550,7 @@ fn backfill_metrics_event_metadata() -> Result<(), GitAiError> {
             let mut db_lock = db
                 .lock()
                 .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
-            db_lock.backfill_event_metadata_batch_after(after_id, METADATA_BACKFILL_BATCH_SIZE)?
+            db_lock.backfill_event_metadata_batch_once(after_id, METADATA_BACKFILL_BATCH_SIZE)?
         };
 
         let Some(id) = last_id else {
@@ -943,6 +947,7 @@ where
     UploadBatch: FnMut(&MetricsBatch) -> Result<MetricsUploadResponse, GitAiError>,
 {
     let mut result = PendingMetricsFlushResult::default();
+    let config = Config::fresh();
 
     while std::time::Instant::now() < deadline {
         let batch = dequeue_batch(max_batch_size)?;
@@ -953,13 +958,15 @@ where
         let mut events = Vec::new();
         let mut record_ids = Vec::new();
         let mut invalid_records = Vec::new();
+        let mut skipped_ids = Vec::new();
 
         for record in &batch {
             match serde_json::from_str::<MetricEvent>(&record.event_json) {
-                Ok(event) => {
+                Ok(event) if should_deliver_metric_event(&config, &event) => {
                     events.push(event);
                     record_ids.push(record.id);
                 }
+                Ok(_) => skipped_ids.push(record.id),
                 Err(error) => {
                     invalid_records
                         .push((record.id, format!("invalid local metric JSON: {error}")));
@@ -974,6 +981,9 @@ where
         if !invalid_records.is_empty() {
             result.invalid_records += invalid_records.len();
             mark_undeliverable(&invalid_records)?;
+        }
+        if !skipped_ids.is_empty() {
+            mark_delivered(&skipped_ids)?;
         }
 
         if events.is_empty() {
@@ -1054,6 +1064,17 @@ where
     Ok(result)
 }
 
+fn should_deliver_metric_event(config: &Config, event: &MetricEvent) -> bool {
+    if event.event_id != MetricEventId::SessionEvent as u16 {
+        return true;
+    }
+
+    let remotes = sparse_get_string(&event.attrs, attr_pos::REPO_URL)
+        .flatten()
+        .map(|url| vec![(String::new(), url)]);
+    config.is_allowed_repository_with_remotes(remotes.as_ref())
+}
+
 fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1063,6 +1084,10 @@ fn current_unix_ts() -> u64 {
 
 fn daemon_log_upload_enabled() -> bool {
     Config::fresh().get_feature_flags().daemon_log_upload
+}
+
+fn daemon_run_id() -> &'static str {
+    DAEMON_RUN_ID.get_or_init(crate::uuid::generate_v4).as_str()
 }
 
 fn daemon_heartbeat_event(uptime: std::time::Duration) -> DaemonLogEvent {
@@ -1184,6 +1209,58 @@ fn flush_daemon_logs(events: Vec<DaemonLogEvent>, daemon_id: &str, install_id: &
     upload_daemon_log_chunk(events, daemon_id, install_id, |request| {
         client.upload_daemon_logs(request).map(|_| ())
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EmergencyLogUploadStatus {
+    Completed,
+    TimedOut,
+    ThreadUnavailable,
+}
+
+/// Give one emergency diagnostic a bounded chance to reach the log endpoint.
+///
+/// Normal daemon-log delivery is deliberately fire-and-forget. Memory-limit
+/// shutdown cannot rely on that worker surviving process exit, so this path
+/// waits briefly for its own upload without allowing a stuck network request to
+/// keep an unhealthy daemon alive.
+pub(super) fn upload_emergency_daemon_log(
+    event: DaemonLogEvent,
+    timeout: std::time::Duration,
+) -> EmergencyLogUploadStatus {
+    upload_emergency_daemon_log_with(event, timeout, |event| {
+        let install_id = get_or_create_distinct_id();
+        let _ = flush_daemon_logs(vec![event], daemon_run_id(), &install_id);
+    })
+}
+
+fn upload_emergency_daemon_log_with<Upload>(
+    event: DaemonLogEvent,
+    timeout: std::time::Duration,
+    upload: Upload,
+) -> EmergencyLogUploadStatus
+where
+    Upload: FnOnce(DaemonLogEvent) + Send + 'static,
+{
+    let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(0);
+    let spawn_result = std::thread::Builder::new()
+        .name("git-ai-emergency-log-upload".to_string())
+        .spawn(move || {
+            upload(event);
+            let _ = completion_tx.send(());
+        });
+
+    if spawn_result.is_err() {
+        return EmergencyLogUploadStatus::ThreadUnavailable;
+    }
+
+    match completion_rx.recv_timeout(timeout) {
+        Ok(()) => EmergencyLogUploadStatus::Completed,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => EmergencyLogUploadStatus::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            EmergencyLogUploadStatus::ThreadUnavailable
+        }
+    }
 }
 
 fn upload_daemon_log_chunk<Upload>(
@@ -1393,7 +1470,7 @@ fn flush_sentry_and_posthog(
             let agent = crate::http::build_agent(Some(30));
             let request = agent
                 .post(&endpoint)
-                .set("Content-Type", "application/json");
+                .header("Content-Type", "application/json");
             let _ = crate::http::send_with_body(
                 request,
                 &serde_json::to_string(&ph_event).unwrap_or_default(),
@@ -1645,8 +1722,8 @@ impl SentryClient {
         let agent = crate::http::build_agent(Some(30));
         let request = agent
             .post(&self.endpoint)
-            .set("X-Sentry-Auth", &auth_header)
-            .set("Content-Type", "application/json");
+            .header("X-Sentry-Auth", &auth_header)
+            .header("Content-Type", "application/json");
         let response = crate::http::send_with_body(request, &body)?;
 
         let status = response.status_code;
@@ -2541,6 +2618,45 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(!in_flight.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn emergency_daemon_log_upload_waits_for_completion() {
+        let (uploaded_tx, uploaded_rx) = std::sync::mpsc::channel();
+
+        let status = upload_emergency_daemon_log_with(
+            sample_daemon_log_event("memory emergency"),
+            Duration::from_secs(1),
+            move |event| uploaded_tx.send(event.message).unwrap(),
+        );
+
+        assert_eq!(status, EmergencyLogUploadStatus::Completed);
+        assert_eq!(uploaded_rx.recv().unwrap(), "memory emergency");
+    }
+
+    #[test]
+    fn emergency_daemon_log_upload_reuses_the_daemon_run_id() {
+        let run_id = daemon_run_id().to_string();
+
+        assert_eq!(daemon_run_id(), run_id);
+    }
+
+    #[test]
+    fn emergency_daemon_log_upload_has_a_hard_wait_bound() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let started_at = std::time::Instant::now();
+
+        let status = upload_emergency_daemon_log_with(
+            sample_daemon_log_event("memory emergency"),
+            Duration::from_millis(10),
+            move |_event| {
+                let _ = release_rx.recv_timeout(Duration::from_secs(1));
+            },
+        );
+
+        assert_eq!(status, EmergencyLogUploadStatus::TimedOut);
+        assert!(started_at.elapsed() < Duration::from_millis(500));
+        release_tx.send(()).unwrap();
     }
 
     #[test]

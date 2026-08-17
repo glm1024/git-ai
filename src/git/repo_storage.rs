@@ -119,6 +119,7 @@ impl RepoStorage {
 
     pub fn delete_working_log_for_base_commit(&self, sha: &str) -> Result<(), GitAiError> {
         let working_log_dir = self.working_logs.join(sha);
+        crate::wltrace::wltrace("working_log.delete", &working_log_dir, String::new);
         if working_log_dir.exists() {
             // Both debug and release: move to old-{sha} for retention
             let old_dir = self.working_logs.join(format!("old-{}", sha));
@@ -197,6 +198,9 @@ impl RepoStorage {
     /// If the destination already has checkpoints, preserve the old-base entries first and
     /// append the destination entries after them.
     pub fn rename_working_log(&self, old_sha: &str, new_sha: &str) -> Result<(), GitAiError> {
+        if old_sha == new_sha {
+            return Ok(());
+        }
         let old_dir = self.working_logs.join(old_sha);
         let new_dir = self.working_logs.join(new_sha);
         if !old_dir.exists() {
@@ -209,10 +213,16 @@ impl RepoStorage {
             return Ok(());
         }
         if !new_dir.exists() {
+            crate::wltrace::wltrace("working_log.rename", &old_dir, || {
+                format!("to={}", new_dir.display())
+            });
             fs::rename(&old_dir, &new_dir)?;
             sync_working_log_parent_directory(&self.working_logs)?;
             tracing::debug!("Renamed working log from {} to {}", old_sha, new_sha);
         } else {
+            crate::wltrace::wltrace("working_log.merge", &old_dir, || {
+                format!("to={}", new_dir.display())
+            });
             self.merge_working_log_dirs(old_sha, new_sha, &old_dir, &new_dir)?;
             fs::remove_dir_all(&old_dir)?;
             sync_working_log_parent_directory(&self.working_logs)?;
@@ -390,6 +400,7 @@ impl PersistedWorkingLog {
     }
 
     pub fn reset_working_log(&self) -> Result<(), GitAiError> {
+        crate::wltrace::wltrace("working_log.reset", &self.dir, String::new);
         // Clear all blobs by removing the blobs directory
         let blobs_dir = self.dir.join("blobs");
         if blobs_dir.exists() {
@@ -634,20 +645,30 @@ impl PersistedWorkingLog {
             return Ok(false);
         }
 
-        // Create a copy, potentially without transcript to reduce storage size.
-        //
-        // Tools that DON'T support refetch (transcript must be kept):
-        // - "mock_ai" - test preset, transcript not stored externally
-        // - Any other agent-v1 custom tools (detected by lack of tool-specific metadata)
-        checkpoints.push(checkpoint.clone());
+        self.append_checkpoint_to(&mut checkpoints, checkpoint.clone())?;
+        Ok(true)
+    }
+
+    /// Append to a checkpoint collection that the caller has already loaded.
+    ///
+    /// Checkpoint execution needs the prior collection to calculate attribution.
+    /// Reusing it here avoids deserializing the entire working log a second time
+    /// and avoids cloning the new checkpoint's attribution payload.
+    pub fn append_checkpoint_to(
+        &self,
+        checkpoints: &mut Vec<Checkpoint>,
+        checkpoint: Checkpoint,
+    ) -> Result<(), GitAiError> {
+        crate::wltrace::wltrace("working_log.append_checkpoint", &self.dir, String::new);
+
+        checkpoints.push(checkpoint);
 
         // Prune char-level attributions from older checkpoints for the same files
         // Only the most recent checkpoint per file needs char-level precision
-        self.prune_old_char_attributions(&mut checkpoints);
+        self.prune_old_char_attributions(checkpoints);
 
         // Write all checkpoints back
-        self.write_all_checkpoints(&checkpoints)?;
-        Ok(true)
+        self.write_all_checkpoints(checkpoints)
     }
 
     pub fn read_all_checkpoints(&self) -> Result<Vec<Checkpoint>, GitAiError> {
@@ -666,10 +687,76 @@ impl PersistedWorkingLog {
         self.reject_oversized_checkpoints_file(Self::checkpoints_file_size_limit_bytes())
     }
 
+    /// Preserve an oversized live checkpoints file for forensic recovery while
+    /// allowing a stash operation to continue from an empty checkpoint log.
+    /// Ordinary reads and writes remain fail-closed and never call this path.
+    pub fn quarantine_oversized_checkpoints_for_stash(
+        &self,
+    ) -> Result<Option<PathBuf>, GitAiError> {
+        self.quarantine_oversized_checkpoints_for_stash_with_limit(
+            Self::checkpoints_file_size_limit_bytes(),
+        )
+    }
+
+    fn quarantine_oversized_checkpoints_for_stash_with_limit(
+        &self,
+        max_bytes: u64,
+    ) -> Result<Option<PathBuf>, GitAiError> {
+        let checkpoints_file = self.checkpoints_file();
+        let metadata = match fs::metadata(&checkpoints_file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let size_bytes = metadata.len();
+        if size_bytes <= max_bytes {
+            return Ok(None);
+        }
+
+        let parent = checkpoints_file.parent().ok_or_else(|| {
+            GitAiError::Generic(format!(
+                "working-log file has no parent directory: {}",
+                checkpoints_file.display()
+            ))
+        })?;
+        let quarantine_path = parent.join(format!(
+            "checkpoints.jsonl.oversized-{}",
+            crate::uuid::generate_v4()
+        ));
+        fs::rename(&checkpoints_file, &quarantine_path)?;
+        sync_working_log_parent_directory(parent)?;
+        self.write_all_checkpoints(&[])?;
+
+        tracing::warn!(
+            base_commit = %self.base_commit,
+            path = %checkpoints_file.display(),
+            quarantine_path = %quarantine_path.display(),
+            size_bytes,
+            max_bytes,
+            "oversized checkpoints.jsonl quarantined before stash"
+        );
+        crate::observability::log_error(
+            &GitAiError::Generic(format!(
+                "oversized checkpoints.jsonl was quarantined before stash: {}",
+                quarantine_path.display()
+            )),
+            Some(serde_json::json!({
+                "event": "checkpoints_jsonl_oversized_quarantined_for_stash",
+                "base_commit": self.base_commit,
+                "path": checkpoints_file.to_string_lossy(),
+                "quarantine_path": quarantine_path.to_string_lossy(),
+                "size_bytes": size_bytes,
+                "max_bytes": max_bytes,
+            })),
+        );
+        Ok(Some(quarantine_path))
+    }
+
     fn read_all_checkpoints_with_size_limit(
         &self,
         max_bytes: u64,
     ) -> Result<Vec<Checkpoint>, GitAiError> {
+        crate::wltrace::wltrace("working_log.read_checkpoints", &self.dir, String::new);
         let checkpoints_file = self.checkpoints_file();
 
         if !checkpoints_file.exists() {
@@ -688,8 +775,12 @@ impl PersistedWorkingLog {
                 continue;
             }
 
-            let checkpoint: Checkpoint = serde_json::from_str(&line)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let checkpoint: Checkpoint = serde_json::from_str(&line).map_err(|e| {
+                crate::wltrace::wltrace("working_log.read_checkpoints.TORN", &self.dir, || {
+                    format!("err={e} line_len={}", line.len())
+                });
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?;
 
             if checkpoint.api_version != CHECKPOINT_API_VERSION {
                 tracing::debug!(
@@ -832,6 +923,9 @@ impl PersistedWorkingLog {
     /// by post-commit after transcripts have been refetched and need to be preserved
     /// for from_just_working_log() to read them.
     pub fn write_all_checkpoints(&self, checkpoints: &[Checkpoint]) -> Result<(), GitAiError> {
+        crate::wltrace::wltrace("working_log.write_all_checkpoints.begin", &self.dir, || {
+            format!("count={}", checkpoints.len())
+        });
         let checkpoints_file = self.checkpoints_file();
         let parent = checkpoints_file.parent().ok_or_else(|| {
             GitAiError::Generic(format!(
@@ -864,6 +958,11 @@ impl PersistedWorkingLog {
         // portable durability boundary available after MoveFileExW replacement.
         persisted.sync_all()?;
         sync_working_log_parent_directory(parent)?;
+        crate::wltrace::wltrace(
+            "working_log.write_all_checkpoints.end",
+            &self.dir,
+            String::new,
+        );
         Ok(())
     }
 
@@ -972,6 +1071,7 @@ impl PersistedWorkingLog {
 
     /// Write a fully-formed INITIAL state, preserving any persisted blob references.
     pub fn write_initial(&self, initial: InitialAttributions) -> Result<(), GitAiError> {
+        crate::wltrace::wltrace("working_log.write_initial", &self.dir, String::new);
         let filtered_files: HashMap<String, Vec<LineAttribution>> = initial
             .files
             .into_iter()
@@ -1226,6 +1326,31 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(log.checkpoints_file()).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn stash_quarantine_preserves_oversized_bytes_and_resets_live_log() {
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path().join("workdir");
+        fs::create_dir_all(&workdir).unwrap();
+        let storage = RepoStorage::for_repo_path(&tmp.path().join("repo"), &workdir).unwrap();
+        let log = storage.working_log_for_base_commit("base").unwrap();
+        let oversized = b"forensic checkpoint bytes\n";
+        fs::write(log.checkpoints_file(), oversized).unwrap();
+
+        let quarantine = log
+            .quarantine_oversized_checkpoints_for_stash_with_limit(8)
+            .unwrap()
+            .expect("oversized file should be quarantined");
+
+        assert_eq!(fs::read(quarantine).unwrap(), oversized);
+        assert_eq!(fs::read(log.checkpoints_file()).unwrap(), b"");
+        assert!(
+            log.quarantine_oversized_checkpoints_for_stash_with_limit(8)
+                .unwrap()
+                .is_none(),
+            "empty live log should make quarantine idempotent"
+        );
     }
 
     #[test]
@@ -1487,5 +1612,37 @@ mod tests {
         // Both sides' unique entries survive.
         assert!(merged.files.contains_key("old_only.txt"));
         assert!(merged.files.contains_key("new_only.txt"));
+    }
+
+    #[test]
+    fn test_rename_working_log_to_same_sha_preserves_log() {
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path().join("workdir");
+        fs::create_dir_all(&workdir).unwrap();
+        let ai_dir = tmp.path().join("ai");
+        let storage = RepoStorage::for_repo_path(&ai_dir, &workdir).unwrap();
+        let sha = "1111111111111111111111111111111111111111";
+
+        let log = storage.working_log_for_base_commit(sha).unwrap();
+        let mut initial = InitialAttributions::default();
+        initial
+            .files
+            .insert("pending.txt".into(), attr("ai_PENDING"));
+        log.write_initial(initial).unwrap();
+
+        storage.rename_working_log(sha, sha).unwrap();
+
+        let preserved = storage
+            .working_log_for_base_commit(sha)
+            .unwrap()
+            .read_initial_attributions()
+            .unwrap();
+        assert_eq!(
+            preserved
+                .files
+                .get("pending.txt")
+                .map(|attrs| attrs[0].author_id.as_str()),
+            Some("ai_PENDING")
+        );
     }
 }
