@@ -1065,6 +1065,16 @@ where
 }
 
 fn should_deliver_metric_event(config: &Config, event: &MetricEvent) -> bool {
+    let requires_remote = event.event_id == MetricEventId::Committed as u16
+        || event.event_id == MetricEventId::Checkpoint as u16
+        || event.event_id == MetricEventId::RewriteCommitted as u16
+        || event.event_id == MetricEventId::LifecycleTransition as u16;
+    if requires_remote {
+        return sparse_get_string(&event.attrs, attr_pos::REPO_URL)
+            .flatten()
+            .is_some_and(|url| crate::repo_url::normalize_repo_url(&url).is_ok());
+    }
+
     if event.event_id != MetricEventId::SessionEvent as u16 {
         return true;
     }
@@ -1744,7 +1754,28 @@ mod tests {
     use std::sync::Arc;
 
     fn event_json(ts: u32) -> String {
-        format!(r#"{{"t":{ts},"e":1,"v":{{}},"a":{{}}}}"#)
+        format!(r#"{{"t":{ts},"e":1,"v":{{}},"a":{{"1":"https://gitlab.example.com/team/repo"}}}}"#)
+    }
+
+    fn event_json_without_remote(ts: u32, event_id: u16) -> String {
+        format!(r#"{{"t":{ts},"e":{event_id},"v":{{}},"a":{{}}}}"#)
+    }
+
+    fn metric_event_with_remote(event_id: MetricEventId, repo_url: Option<&str>) -> MetricEvent {
+        let mut attrs = crate::metrics::types::SparseArray::new();
+        if let Some(repo_url) = repo_url {
+            attrs.insert(
+                attr_pos::REPO_URL.to_string(),
+                serde_json::Value::String(repo_url.to_string()),
+            );
+        }
+        MetricEvent {
+            timestamp: now_ts(),
+            event_id: event_id as u16,
+            instance_id: None,
+            values: Default::default(),
+            attrs,
+        }
     }
 
     fn unix_now() -> u64 {
@@ -1752,6 +1783,56 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    #[test]
+    fn project_code_metrics_require_a_valid_remote_url_for_delivery() {
+        let config = Config::get();
+        let project_event_ids = [
+            MetricEventId::Committed,
+            MetricEventId::Checkpoint,
+            MetricEventId::RewriteCommitted,
+            MetricEventId::LifecycleTransition,
+        ];
+
+        for event_id in project_event_ids {
+            assert!(!should_deliver_metric_event(
+                config,
+                &metric_event_with_remote(event_id, None)
+            ));
+            assert!(!should_deliver_metric_event(
+                config,
+                &metric_event_with_remote(event_id, Some(""))
+            ));
+            assert!(!should_deliver_metric_event(
+                config,
+                &metric_event_with_remote(event_id, Some("not-a-remote"))
+            ));
+            assert!(should_deliver_metric_event(
+                config,
+                &metric_event_with_remote(
+                    event_id,
+                    Some("git@gitlab.example.com:team/new-project.git")
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn non_project_metrics_do_not_require_a_remote_url_for_delivery() {
+        let config = Config::get();
+
+        for event_id in [
+            MetricEventId::AgentUsage,
+            MetricEventId::InstallHooks,
+            MetricEventId::OtelTrace,
+            MetricEventId::SessionTokenUsage,
+        ] {
+            assert!(should_deliver_metric_event(
+                config,
+                &metric_event_with_remote(event_id, None)
+            ));
+        }
     }
 
     #[test]
@@ -2001,6 +2082,63 @@ mod tests {
         assert_eq!(
             db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
             2
+        );
+    }
+
+    #[test]
+    fn flush_marks_project_metrics_without_remote_as_local_only_without_upload_retry() {
+        let (metrics_db, _metrics_db_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
+        let db = Rc::new(RefCell::new(metrics_db));
+        let ts = now_ts();
+        db.borrow_mut()
+            .insert_events(&[event_json_without_remote(
+                ts,
+                MetricEventId::Committed as u16,
+            )])
+            .unwrap();
+
+        let upload_attempts = Rc::new(RefCell::new(0usize));
+        let result = flush_pending_metric_records_with(
+            {
+                let db = Rc::clone(&db);
+                move |limit| db.borrow_mut().dequeue_pending_batch(limit)
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids| db.borrow_mut().mark_records_delivered(ids, unix_now())
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids, err| {
+                    db.borrow_mut()
+                        .mark_records_failed(ids, &err.to_string(), unix_now())
+                }
+            },
+            {
+                let db = Rc::clone(&db);
+                move |records| {
+                    db.borrow_mut()
+                        .mark_records_undeliverable(records, unix_now())
+                }
+            },
+            {
+                let upload_attempts = Rc::clone(&upload_attempts);
+                move |_batch| {
+                    *upload_attempts.borrow_mut() += 1;
+                    Ok(MetricsUploadResponse { errors: vec![] })
+                }
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(result, PendingMetricsFlushResult::default());
+        assert_eq!(*upload_attempts.borrow(), 0);
+        assert_eq!(db.borrow().status().unwrap().not_delivered, 0);
+        assert_eq!(
+            db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
+            1
         );
     }
 
