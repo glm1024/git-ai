@@ -1,0 +1,27 @@
+src/daemon/telemetry_worker.rs
+  s_2b513b96c8922d::t_4bf8b88a5590b9 1758,1836,2089-2137,2139-2144
+  s_2b513b96c8922d::t_dc13445bc6e02e 1068-1072,1757
+  s_2b513b96c8922d::t_9258fb4c64bc7e 1760-1764,1766-1778,1788-1835,2088
+  s_2b513b96c8922d::t_d9a59720ceb68d 1765,2138
+  s_2b513b96c8922d::t_5ad30c8ef5c868 1073-1077
+  s_2b513b96c8922d::t_ffadaeddae4db1 1759
+  s_2b513b96c8922d::t_fc0c6af20cf547 1837
+产品业务.md
+  s_2b513b96c8922d::t_d855768d7d9210 34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.23",
+  "base_commit_sha": "d0b969d3927d71910164ac7c79c53b3ce628194d",
+  "prompts": {},
+  "sessions": {
+    "s_2b513b96c8922d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a012ba-2e42-7ac2-a441-afbc8f2d3b2b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
