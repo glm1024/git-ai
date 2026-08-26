@@ -100,12 +100,19 @@ fn test_daemon_reports_post_commit_side_effect_error() {
             overrode: None,
         }],
     );
-    working_log
-        .write_initial(InitialAttributions {
+    // Bypass the validated writer to model a malformed legacy/on-disk
+    // baseline. Production writes must reject this state; the behavior under
+    // test is that a daemon post-commit read reports the preserved evidence
+    // failure through sync instead of silently accepting the commit.
+    fs::write(
+        &working_log.initial_file,
+        serde_json::to_string_pretty(&InitialAttributions {
             files,
             ..InitialAttributions::default()
         })
-        .unwrap();
+        .unwrap(),
+    )
+    .unwrap();
 
     fs::write(repo.path().join("broken.txt"), "broken\n").unwrap();
     repo.git(&["add", "broken.txt"]).unwrap();

@@ -218,7 +218,7 @@ fn test_kilo_checkpoint_metric_precedes_token_snapshot_for_backend_context() {
         // The shared fixture intentionally uses fixed 2024 timestamps. Token
         // compaction prunes facts outside its retention window, so refresh only
         // this copied database to exercise the live Kilo ordering contract.
-        let conn = rusqlite::Connection::open(storage.join("kilo.db")).unwrap();
+        let conn = git_ai::sqlite::open_with_memory_limits(storage.join("kilo.db")).unwrap();
         let now_millis = Utc::now().timestamp_millis();
         conn.execute(
             "UPDATE message SET time_created = ?1, time_updated = ?1 WHERE id = 'msg-user-sql-001'",
@@ -272,7 +272,7 @@ fn test_kilo_checkpoint_metric_precedes_token_snapshot_for_backend_context() {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let rows = loop {
-            let conn = rusqlite::Connection::open(&metrics_path).unwrap();
+            let conn = git_ai::sqlite::open_with_memory_limits(&metrics_path).unwrap();
             let mut statement = conn
                 .prepare(
                     "SELECT id, event_kind FROM metrics \

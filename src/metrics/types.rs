@@ -26,6 +26,11 @@ pub enum MetricEventId {
     LifecycleTransition = 8,
     /// Content-free cumulative daily token snapshot derived from agent transcripts.
     SessionTokenUsage = 9,
+    /// Daemon-local loss counters for telemetry and trace ingestion.
+    ///
+    /// IDs 8 and 9 are already part of this fork's wire contract, so the
+    /// upstream anomaly event takes the next unused value.
+    DaemonIngestAnomaly = 10,
 }
 
 /// Trait for event-specific values.
@@ -236,7 +241,9 @@ mod tests {
         assert_eq!(MetricEventId::InstallHooks as u16, 3);
         assert_eq!(MetricEventId::Checkpoint as u16, 4);
         assert_eq!(MetricEventId::RewriteCommitted as u16, 7);
+        assert_eq!(MetricEventId::LifecycleTransition as u16, 8);
         assert_eq!(MetricEventId::SessionTokenUsage as u16, 9);
+        assert_eq!(MetricEventId::DaemonIngestAnomaly as u16, 10);
     }
 
     #[test]

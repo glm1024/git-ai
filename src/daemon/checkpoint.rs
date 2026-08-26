@@ -388,7 +388,7 @@ pub fn execute_resolved_checkpoint_from_daemon(
 ) -> Result<(), GitAiError> {
     let checkpoint_start = Instant::now();
     tracing::debug!("[BENCHMARK] Starting daemon replay checkpoint");
-    let prepared = prepare_resolved_checkpoint(
+    let mut prepared = prepare_resolved_checkpoint(
         repo,
         author,
         kind,
@@ -397,7 +397,11 @@ pub fn execute_resolved_checkpoint_from_daemon(
         checkpoint_start,
         None,
     )?;
-    apply_prepared_checkpoint_from_daemon(repo, &prepared.application)?;
+    apply_prepared_checkpoint_from_loaded(
+        repo,
+        &prepared.application,
+        &mut prepared.prior_checkpoints,
+    )?;
     crate::observability::log_metrics(prepared.metric_events)?;
     Ok(())
 }
@@ -411,6 +415,7 @@ pub(crate) struct PreparedCheckpointApplication {
 struct PreparedCheckpointSideEffect {
     application: PreparedCheckpointApplication,
     metric_events: Vec<crate::metrics::MetricEvent>,
+    prior_checkpoints: Vec<Checkpoint>,
 }
 
 pub(crate) fn prepare_resolved_checkpoint_from_daemon(
@@ -454,6 +459,21 @@ pub(crate) fn apply_prepared_checkpoint_from_daemon(
     // job retryable instead of marking a broken reference done.
     working_log.validate_checkpoint_blob_references(checkpoint)?;
     working_log.append_checkpoint_idempotent(checkpoint)
+}
+
+fn apply_prepared_checkpoint_from_loaded(
+    repo: &Repository,
+    prepared: &PreparedCheckpointApplication,
+    prior_checkpoints: &mut Vec<Checkpoint>,
+) -> Result<bool, GitAiError> {
+    let Some(checkpoint) = prepared.checkpoint.as_ref() else {
+        return Ok(false);
+    };
+    let working_log = repo
+        .storage
+        .working_log_for_base_commit(&prepared.base_commit)?;
+    working_log.validate_checkpoint_blob_references(checkpoint)?;
+    working_log.append_checkpoint_idempotent_to(prior_checkpoints, checkpoint)
 }
 
 fn prepare_resolved_checkpoint(
@@ -514,6 +534,7 @@ fn prepare_resolved_checkpoint(
                     checkpoint: None,
                 },
                 metric_events: Vec::new(),
+                prior_checkpoints: checkpoints,
             });
         }
     }
@@ -680,6 +701,7 @@ fn prepare_resolved_checkpoint(
             checkpoint: prepared_checkpoint,
         },
         metric_events,
+        prior_checkpoints: checkpoints,
     })
 }
 

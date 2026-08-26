@@ -1740,7 +1740,7 @@ fn test_diff_json_blame_deletions_rename_with_edit_uses_old_path() {
         .expect("diff --json --blame-deletions should succeed");
     let json: Value = serde_json::from_str(&output).expect("diff JSON should parse");
 
-    let deletion_hunks = parse_json_hunks(&json, "rename_blame_new.txt", "deletion");
+    let deletion_hunks = parse_json_hunks(&json, "rename_blame_old.txt", "deletion");
     assert_eq!(
         deletion_hunks,
         vec![JsonHunk {
@@ -1750,7 +1750,7 @@ fn test_diff_json_blame_deletions_rename_with_edit_uses_old_path() {
             original_commit_sha: Some(base_commit.commit_sha.clone()),
             start_line: 2,
             end_line: 2,
-            file_path: "rename_blame_new.txt".to_string(),
+            file_path: "rename_blame_old.txt".to_string(),
             session_id: session_id_from_prompt(&old_line_prompt),
             prompt_id: Some(old_line_prompt),
         }],

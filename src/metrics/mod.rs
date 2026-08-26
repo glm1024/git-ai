@@ -12,6 +12,7 @@ pub(crate) mod deferred_commit_jobs;
 pub(crate) mod deferred_lifecycle_jobs;
 pub mod events;
 pub mod local_stats;
+pub mod model_pricing;
 pub mod pos_encoded;
 pub(crate) mod session_compaction;
 pub mod types;

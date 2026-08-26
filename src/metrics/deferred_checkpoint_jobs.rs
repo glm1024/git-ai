@@ -2031,7 +2031,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn setup() -> Connection {
-        let conn = Connection::open_in_memory().expect("sqlite");
+        let conn = crate::sqlite::open_in_memory_with_memory_limits().expect("sqlite");
         conn.execute_batch(
             r#"
             CREATE TABLE metrics (
@@ -2678,7 +2678,7 @@ mod tests {
         let path = temp.path().join("jobs.db");
         let spec = spec("repo", "call", "post", "evidence");
         {
-            let mut conn = Connection::open(&path).unwrap();
+            let mut conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
             conn.execute_batch(
                 r#"
                 CREATE TABLE metrics (
@@ -2720,7 +2720,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut reopened = Connection::open(&path).unwrap();
+        let mut reopened = crate::sqlite::open_with_memory_limits(&path).unwrap();
         let reclaimed = claim_due_on_connection(&mut reopened, 80, 60)
             .unwrap()
             .unwrap();

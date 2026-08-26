@@ -4,7 +4,7 @@ use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_prese
 use git_ai::error::GitAiError;
 use git_ai::streams::agent::Agent;
 use git_ai::streams::agents::CodexAgent;
-use git_ai::streams::watermark::ByteOffsetWatermark;
+use git_ai::streams::watermark::CodexByteOffsetWatermark;
 use serde_json::json;
 use std::fs;
 
@@ -16,7 +16,7 @@ fn parse_codex(hook_input: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
 fn test_codex_raw_event_fidelity() {
     let fixture = fixture_path("codex-session-simple.jsonl");
     let agent = CodexAgent::new();
-    let watermark = Box::new(ByteOffsetWatermark::new(0));
+    let watermark = Box::new(CodexByteOffsetWatermark::initial());
     let result = agent
         .read_incremental(fixture.as_path(), watermark, "test")
         .expect("Should parse codex JSONL");

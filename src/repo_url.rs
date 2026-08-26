@@ -16,6 +16,13 @@ pub fn normalize_repo_url(url_str: &str) -> Result<String, String> {
         return normalize_ssh_url(host, path);
     }
 
+    // A filesystem remote is not a server repository identity. In particular,
+    // do not let the scheme-less compatibility path turn `/tmp/repo.git` into
+    // a plausible-looking `https://tmp/repo` URL that could leak local paths.
+    if is_local_repository_path(url_str) {
+        return Err("Local repository paths cannot be normalized as remote URLs".to_string());
+    }
+
     // Older clients and server-facing records may already use the canonical
     // scheme-less `host[:port]/path` form. Treat it as HTTPS input.
     let parse_input = if url_str.contains("://") {
@@ -48,6 +55,18 @@ pub fn normalize_repo_url(url_str: &str) -> Result<String, String> {
     validate_normalized_url(&canonical)?;
 
     Ok(canonical)
+}
+
+fn is_local_repository_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
 }
 
 /// Validate that normalized URL is a proper HTTPS URL
@@ -410,5 +429,26 @@ mod tests {
         assert!(normalize_repo_url("ftp://example.com/repo").is_err());
         assert!(normalize_repo_url("file:///local/path").is_err());
         assert!(normalize_repo_url("svn://example.com/repo").is_err());
+    }
+
+    #[test]
+    fn test_normalize_repo_url_rejects_local_paths() {
+        for local_path in [
+            "/tmp/repo.git",
+            "./repo.git",
+            "../repo.git",
+            r"C:\\work\\repo.git",
+            r"\\server\share\repo.git",
+        ] {
+            assert!(
+                normalize_repo_url(local_path).is_err(),
+                "local path must not be normalized as a remote URL: {local_path}"
+            );
+        }
+
+        assert_eq!(
+            normalize_repo_url("github.com/org/repo.git").unwrap(),
+            "https://github.com/org/repo"
+        );
     }
 }

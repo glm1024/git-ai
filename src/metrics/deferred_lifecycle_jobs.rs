@@ -701,7 +701,7 @@ mod tests {
     use super::*;
 
     fn setup() -> Connection {
-        let conn = Connection::open_in_memory().expect("sqlite");
+        let conn = crate::sqlite::open_in_memory_with_memory_limits().expect("sqlite");
         conn.execute_batch(
             r#"
             CREATE TABLE metrics (

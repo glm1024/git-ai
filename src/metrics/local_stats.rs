@@ -10,6 +10,7 @@ use crate::metrics::db::{
     CompactSessionRecord, CompactTokenRecord, MetricHistoryRecord, MetricsDatabase,
 };
 use crate::metrics::events::{checkpoint_pos, committed_pos, session_event_pos};
+use crate::metrics::model_pricing::{ModelPricing, pricing_for};
 use crate::metrics::pos_encoded::{
     sparse_get_string, sparse_get_u32, sparse_get_vec_string, sparse_get_vec_u32,
 };
@@ -659,54 +660,6 @@ impl CodexSessionAccum {
     }
 }
 
-/// Per-million-token pricing for a model (USD).
-struct ModelPricing {
-    input: f64,
-    output: f64,
-    cache_write: f64,
-    cache_read: f64,
-}
-
-/// Built-in pricing estimate, matched by substring of the model id.
-/// Rates are public Anthropic list prices (USD per million tokens) and are
-/// only an estimate — they go stale as pricing changes.
-fn pricing_for(model: &str) -> Option<ModelPricing> {
-    let m = model.to_lowercase();
-    if m.contains("opus") {
-        Some(ModelPricing {
-            input: 15.0,
-            output: 75.0,
-            cache_write: 18.75,
-            cache_read: 1.5,
-        })
-    } else if m.contains("sonnet") {
-        Some(ModelPricing {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 3.75,
-            cache_read: 0.3,
-        })
-    } else if m.contains("haiku") {
-        Some(ModelPricing {
-            input: 0.8,
-            output: 4.0,
-            cache_write: 1.0,
-            cache_read: 0.08,
-        })
-    } else if m.contains("gpt") {
-        // OpenAI GPT-5 family estimate; cache_write unused (codex reports no
-        // cache-creation tokens).
-        Some(ModelPricing {
-            input: 1.25,
-            output: 10.0,
-            cache_write: 1.25,
-            cache_read: 0.125,
-        })
-    } else {
-        None
-    }
-}
-
 fn estimate_cost(acc: &TokenAccum, pricing: &ModelPricing) -> f64 {
     (acc.input as f64 * pricing.input
         + acc.output as f64 * pricing.output
@@ -739,7 +692,7 @@ fn cost_for_message_slice(entries: impl Iterator<Item = (String, TokenAccum)>) -
     }
     model_totals
         .iter()
-        .filter_map(|(model, acc)| pricing_for(model).map(|p| estimate_cost(acc, &p)))
+        .filter_map(|(model, acc)| pricing_for(model).map(|p| estimate_cost(acc, p)))
         .sum()
 }
 
@@ -776,7 +729,7 @@ fn build_token_summary(
         if let Some(pricing) = pricing_for(&short) {
             *cost_by_day
                 .entry(ts_to_local(ts).date_naive())
-                .or_insert(0.0) += estimate_cost(&acc, &pricing);
+                .or_insert(0.0) += estimate_cost(&acc, pricing);
         }
 
         let entry = model_tokens.entry(short.clone()).or_default();
@@ -814,7 +767,7 @@ fn build_token_summary(
         if let Some(pricing) = pricing_for(&short) {
             *cost_by_day
                 .entry(ts_to_local(acc.last_usage_ts).date_naive())
-                .or_insert(0.0) += estimate_cost(&mapped, &pricing);
+                .or_insert(0.0) += estimate_cost(&mapped, pricing);
         }
 
         let entry = model_tokens.entry(short.clone()).or_default();
@@ -870,7 +823,7 @@ fn build_token_summary(
         summary.cache_read += acc.cache_read;
         summary.cache_creation += acc.cache_creation;
 
-        let cost = pricing_for(&model).map(|p| estimate_cost(&acc, &p));
+        let cost = pricing_for(&model).map(|p| estimate_cost(&acc, p));
         if let Some(c) = cost {
             summary.estimated_cost_usd += c;
         }
@@ -1490,6 +1443,15 @@ mod tests {
         claude_session_usage(ts, repo_url, session_id, "msg-1", (100, 50, 20, 10))
     }
 
+    fn claude_session_with_model(
+        ts: u32,
+        repo_url: Option<&str>,
+        session_id: &str,
+        model: &str,
+    ) -> MetricHistoryRecord {
+        claude_session_usage_with_model(ts, repo_url, session_id, "msg-1", model, (100, 50, 20, 10))
+    }
+
     fn claude_session_usage(
         ts: u32,
         repo_url: Option<&str>,
@@ -1497,12 +1459,30 @@ mod tests {
         message_id: &str,
         usage: (u64, u64, u64, u64),
     ) -> MetricHistoryRecord {
+        claude_session_usage_with_model(
+            ts,
+            repo_url,
+            session_id,
+            message_id,
+            "claude-sonnet-4-6-20250101",
+            usage,
+        )
+    }
+
+    fn claude_session_usage_with_model(
+        ts: u32,
+        repo_url: Option<&str>,
+        session_id: &str,
+        message_id: &str,
+        model: &str,
+        usage: (u64, u64, u64, u64),
+    ) -> MetricHistoryRecord {
         let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) = usage;
         let values = SessionEventValues::new(json!({
             "message": {
                 "id": message_id,
                 "role": "assistant",
-                "model": "claude-sonnet-4-6-20250101",
+                "model": model,
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -1658,6 +1638,46 @@ mod tests {
 
         assert_eq!(stats.tokens.input, 30);
         assert_eq!(stats.tokens.output, 15);
+    }
+
+    #[test]
+    fn token_costs_come_from_models_dev_catalog() {
+        let now = now_ts();
+        let repo = "github.com/acme/project";
+        // A date-suffixed model id that only the models.dev catalog can price
+        // (the id resolves to "claude-fable-5" after the date suffix is stripped).
+        let records = [claude_session_with_model(
+            now.saturating_sub(600),
+            Some(repo),
+            "session-1",
+            "claude-fable-5-20260607",
+        )];
+        let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
+
+        let stats = compute_activity_from_records(
+            &refs,
+            now.saturating_sub(24 * 3600),
+            "last 1 day".to_string(),
+            BucketGranularity::Daily,
+        )
+        .unwrap();
+
+        let pricing = crate::metrics::model_pricing::pricing_for("claude-fable-5")
+            .expect("models.dev catalog must price claude-fable-5");
+        // Token counts from claude_session_with_model: 100 input, 50 output,
+        // 20 cache read, 10 cache creation.
+        let expected = (100.0 * pricing.input
+            + 50.0 * pricing.output
+            + 20.0 * pricing.cache_read
+            + 10.0 * pricing.cache_write)
+            / 1_000_000.0;
+        assert!(expected > 0.0);
+        assert!((stats.tokens.estimated_cost_usd - expected).abs() < 1e-12);
+        assert_eq!(stats.tokens.by_model[0].model, "claude-fable-5");
+        assert_eq!(
+            stats.tokens.by_model[0].estimated_cost_usd,
+            Some(stats.tokens.estimated_cost_usd)
+        );
     }
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {

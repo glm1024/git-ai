@@ -1142,7 +1142,7 @@ mod tests {
         let initial_bytes = fs::read(&working_log.initial_file).unwrap();
         assert!(working_log.read_initial_attributions().is_err());
 
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = crate::sqlite::open_in_memory_with_memory_limits().unwrap();
         conn.execute_batch(DEFERRED_CHECKPOINT_JOBS_SCHEMA_SQL)
             .unwrap();
         let repo_identity = "repo-identity";
@@ -1357,7 +1357,7 @@ mod tests {
         DeferredCheckpointJobSpec,
         ManualCheckpointRepairPlan,
     ) {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = crate::sqlite::open_in_memory_with_memory_limits().unwrap();
         conn.execute_batch(DEFERRED_CHECKPOINT_JOBS_SCHEMA_SQL)
             .unwrap();
         let blocked = repair_spec('d', repo_identity, workdir, &"2".repeat(40), "call-blocked");
@@ -1471,6 +1471,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let occupied = temp.path().join("occupied-worktree");
         fs::create_dir_all(occupied.join(".git")).unwrap();
+        fs::write(occupied.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(occupied.join("keep.txt"), "do not modify\n").unwrap();
         let (_conn, _blocked, plan) =
             blocked_repair_plan(&occupied, "frozen-different-repository-identity");

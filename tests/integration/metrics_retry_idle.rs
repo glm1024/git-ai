@@ -70,7 +70,7 @@ fn seed_version_4_metrics_db(path: &Path) {
     .unwrap();
 }
 
-fn wait_for_schema_migration(path: &Path) {
+fn wait_for_retryable_index_migration(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let conn = open_with_memory_limits(path).unwrap();
@@ -81,12 +81,15 @@ fn wait_for_schema_migration(path: &Path) {
                 |row| row.get(0),
             )
             .unwrap();
-        if version == "5" {
+        let version_number = version
+            .parse::<usize>()
+            .expect("metrics schema version must be numeric");
+        if version_number >= 5 {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "metrics database did not migrate to schema v5"
+            "metrics database did not migrate through schema v5; last version was {version}"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -103,7 +106,7 @@ fn daemon_remains_responsive_after_exhausted_metrics_migration() {
         "GIT_AI_TEST_METRICS_DB_PATH",
         metrics_path_str.as_str(),
     )]);
-    wait_for_schema_migration(&metrics_path);
+    wait_for_retryable_index_migration(&metrics_path);
 
     let file_path = repo.path().join("example.md");
     fs::write(&file_path, "Untracked line\n").unwrap();

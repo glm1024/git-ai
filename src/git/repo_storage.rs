@@ -634,9 +634,24 @@ impl PersistedWorkingLog {
         &self,
         checkpoint: &Checkpoint,
     ) -> Result<bool, GitAiError> {
-        // Read existing checkpoints
         let mut checkpoints = self.read_all_checkpoints()?;
 
+        self.append_checkpoint_idempotent_to(&mut checkpoints, checkpoint)
+    }
+
+    /// Idempotently append using a checkpoint collection the caller has
+    /// already loaded.
+    ///
+    /// The checkpoint preparation path needs the prior collection to derive
+    /// attribution. Reusing that same collection for the immediate publish
+    /// avoids deserializing the working log a second time, while durable replay
+    /// can continue to call [`Self::append_checkpoint_idempotent`] and refresh
+    /// the collection at its separate publication boundary.
+    pub fn append_checkpoint_idempotent_to(
+        &self,
+        checkpoints: &mut Vec<Checkpoint>,
+        checkpoint: &Checkpoint,
+    ) -> Result<bool, GitAiError> {
         if let Some(request_id) = checkpoint.trace_id.as_deref()
             && checkpoints
                 .iter()
@@ -645,7 +660,7 @@ impl PersistedWorkingLog {
             return Ok(false);
         }
 
-        self.append_checkpoint_to(&mut checkpoints, checkpoint.clone())?;
+        self.append_checkpoint_to(checkpoints, checkpoint.clone())?;
         Ok(true)
     }
 
@@ -1628,6 +1643,8 @@ mod tests {
         initial
             .files
             .insert("pending.txt".into(), attr("ai_PENDING"));
+        let pending_sha = log.persist_file_version("pending\n").unwrap();
+        initial.file_blobs.insert("pending.txt".into(), pending_sha);
         log.write_initial(initial).unwrap();
 
         storage.rename_working_log(sha, sha).unwrap();

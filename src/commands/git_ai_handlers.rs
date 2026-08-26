@@ -200,6 +200,9 @@ pub fn handle_git_ai(args: &[String]) {
                 std::process::exit(1);
             }
         }
+        "reingest" => {
+            commands::reingest::handle_reingest(&args[1..]);
+        }
         "await" => {
             commands::r#await::handle_await(&args[1..]);
         }
@@ -381,7 +384,13 @@ fn print_help() {
     eprintln!("    checkpoint-baseline --job-key <key>");
     eprintln!("                         Preview a blocked checkpoint baseline repair");
     eprintln!("  bg                 Run and control git-ai background service");
-    eprintln!("  install-hooks      Install git hooks for AI authorship tracking");
+    eprintln!("  install, install-hooks  Install hooks for AI authorship tracking");
+    eprintln!(
+        "    --env                  Also add git-ai to shell PATH configs (used by the install scripts)"
+    );
+    eprintln!(
+        "    --wsl                  Also install git-ai in eligible WSL distributions (Windows only)"
+    );
     eprintln!("    --skills               Also install agent skill files");
     eprintln!("    --visual-studio-extension");
     eprintln!("                           Also install the Visual Studio extension on Windows");
@@ -391,6 +400,10 @@ fn print_help() {
     eprintln!("  git-path           Print the path to the underlying git executable");
     eprintln!("  await [beta]       Wait for the background service to finish all work");
     eprintln!("    --timeout <seconds>    Maximum time to wait (default: 30)");
+    eprintln!("  reingest           Redeliver locally stored metric events");
+    eprintln!("    --all                  Reingest all retained events");
+    eprintln!("    --from <time> --to <time>  Reingest an RFC3339 [from, to) range");
+    eprintln!("    --since <duration>      Reingest a recent s/m/h/d/w duration");
     eprintln!("  upgrade            Check for updates and install if available");
     eprintln!("    --force               Reinstall latest version even if already up to date");
     eprintln!("  fetch-notes [remote] Synchronously fetch AI authorship notes");
@@ -1132,8 +1145,8 @@ fn handle_stats(args: &[String]) {
                         if parts.len() == 2 {
                             match CommitRange::new_infer_refname(
                                 &repo,
-                                normalize_head_rev(parts[0]),
-                                normalize_head_rev(parts[1]),
+                                commands::revision::normalize_head_rev(parts[0]),
+                                commands::revision::normalize_head_rev(parts[1]),
                                 // @todo this is probably fine, but we might want to give users an option to override from this command.
                                 None,
                             ) {
@@ -1150,7 +1163,7 @@ fn handle_stats(args: &[String]) {
                             std::process::exit(1);
                         }
                     } else {
-                        commit_sha = Some(normalize_head_rev(arg));
+                        commit_sha = Some(commands::revision::normalize_head_rev(arg));
                     }
                     i += 1;
                 } else {
@@ -1198,30 +1211,6 @@ fn handle_stats(args: &[String]) {
         }
         std::process::exit(1);
     }
-}
-
-/// Normalise a revision token that the user may have typed with a lowercase
-/// "head" prefix.  On case-insensitive file systems (macOS) git accepts both
-/// "head" and "HEAD", but in a linked worktree "head" can resolve to the
-/// *main* repository's HEAD file rather than the worktree's own HEAD, so the
-/// wrong commit is used.  On case-sensitive file systems (Linux) "head"
-/// simply fails with "Not a valid revision".  Normalising to uppercase "HEAD"
-/// before passing to git fixes both issues.
-///
-/// Only the four-character prefix is replaced; suffixes like `~2`, `^1` or
-/// `@{0}` are preserved verbatim.
-fn normalize_head_rev(rev: &str) -> String {
-    if rev.len() >= 4 && rev[..4].eq_ignore_ascii_case("head") {
-        let suffix = &rev[4..];
-        if suffix.is_empty()
-            || suffix.starts_with('~')
-            || suffix.starts_with('^')
-            || suffix.starts_with('@')
-        {
-            return format!("HEAD{}", suffix);
-        }
-    }
-    rev.to_string()
 }
 
 fn handle_git_hooks(args: &[String]) {

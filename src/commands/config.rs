@@ -991,7 +991,7 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                     ));
                 }
                 file_config.daemon_memory_limit_mb = Some(limit_mb);
-                crate::config::save_file_config(&file_config)?;
+                file_config.commit()?;
                 println!("[daemon_memory_limit_mb]: {}", limit_mb);
             }
             "custom_attributes" => {
@@ -1123,13 +1123,13 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 backend.kind = kind;
                 file_config.notes_backend = Some(backend);
                 file_config.commit()?;
-                eprintln!("[notes_backend.kind]: {}", kind.as_str());
+                println!("[notes_backend.kind]: {}", kind.as_str());
             }
             "backend_url" => {
                 backend.backend_url = Some(value.to_string());
                 file_config.notes_backend = Some(backend);
                 file_config.commit()?;
-                eprintln!("[notes_backend.backend_url]: {}", value);
+                println!("[notes_backend.backend_url]: {}", value);
             }
             other => return Err(format!("Unknown notes_backend field: {}", other)),
         }
@@ -1375,7 +1375,7 @@ fn unset_config_value(key: &str) -> Result<(), String> {
             }
             "daemon_memory_limit_mb" => {
                 let old_value = file_config.daemon_memory_limit_mb.take();
-                crate::config::save_file_config(&file_config)?;
+                file_config.commit()?;
                 if let Some(v) = old_value {
                     println!("- [daemon_memory_limit_mb]: {}", v);
                 }
@@ -1499,7 +1499,7 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                 backend.kind = NotesBackendKind::GitNotes; // reset to default
                 file_config.notes_backend = Some(backend);
                 file_config.commit()?;
-                eprintln!("- [notes_backend.kind]: {}", old.as_str());
+                println!("- [notes_backend.kind]: {}", old.as_str());
             }
             "backend_url" => {
                 if let Some(old_url) = backend.backend_url.take() {
@@ -1509,7 +1509,7 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                         Some(backend)
                     };
                     file_config.commit()?;
-                    eprintln!("- [notes_backend.backend_url]: {}", old_url);
+                    println!("- [notes_backend.backend_url]: {}", old_url);
                 }
             }
             other => return Err(format!("Unknown notes_backend field: {}", other)),

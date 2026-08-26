@@ -1633,7 +1633,7 @@ mod tests {
     use rusqlite::Connection;
 
     fn test_connection(path: &Path) -> Connection {
-        let conn = Connection::open(path).unwrap();
+        let conn = crate::sqlite::open_with_memory_limits(path).unwrap();
         conn.execute_batch(
             r#"
             CREATE TABLE metrics (
@@ -1770,7 +1770,7 @@ mod tests {
             assert_eq!(metrics, 0, "claiming never exposes an incomplete event");
         }
 
-        let mut reopened = Connection::open(&path).unwrap();
+        let mut reopened = crate::sqlite::open_with_memory_limits(&path).unwrap();
         let reclaimed = claim_due_on_connection(&mut reopened, 80, 60)
             .unwrap()
             .unwrap();

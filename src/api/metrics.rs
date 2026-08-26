@@ -1,6 +1,6 @@
 //! Metrics API endpoints
 
-use crate::api::client::ApiClient;
+use crate::api::client::{ApiClient, MetricsEndpointMode};
 use crate::api::types::ApiErrorResponse;
 use crate::error::GitAiError;
 use crate::metrics::MetricsBatch;
@@ -188,10 +188,27 @@ fn parse_metrics_upload_response(
     body: &str,
     batch_size: usize,
     expected_payload_sha256: &str,
+    endpoint_mode: MetricsEndpointMode,
 ) -> Result<MetricsUploadResponse, GitAiError> {
-    let response: MetricsUploadWireResponse =
+    let response_value: serde_json::Value =
         serde_json::from_str(body).map_err(GitAiError::JsonError)?;
-    validate_metrics_upload_response(response, batch_size, expected_payload_sha256)
+    let acknowledgement_present = response_value.as_object().is_some_and(|response| {
+        ["accepted", "kind", "itemCount", "payloadSha256"]
+            .iter()
+            .any(|field| response.contains_key(*field))
+    });
+    let response: MetricsUploadWireResponse =
+        serde_json::from_value(response_value).map_err(GitAiError::JsonError)?;
+
+    if endpoint_mode == MetricsEndpointMode::DedicatedAnonymous || acknowledgement_present {
+        return validate_metrics_upload_response(response, batch_size, expected_payload_sha256);
+    }
+
+    let response = MetricsUploadResponse {
+        errors: response.errors,
+    };
+    response.validate_error_indices(batch_size)?;
+    Ok(response)
 }
 
 fn parse_metrics_upload_error_message(body: &str) -> String {
@@ -295,9 +312,12 @@ impl ApiClient {
             .map_err(|e| GitAiError::Generic(format!("Failed to read response body: {}", e)))?;
 
         match status_code {
-            200 => {
-                parse_metrics_upload_response(body, batch.events.len(), &prepared.payload_sha256)
-            }
+            200 => parse_metrics_upload_response(
+                body,
+                batch.events.len(),
+                &prepared.payload_sha256,
+                self.context().metrics_endpoint_mode,
+            ),
             _ => Err(GitAiError::HttpStatusError {
                 status: status_code,
                 message: parse_metrics_upload_error_message(body),
@@ -309,7 +329,7 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::client::{ApiContext, MetricsEndpointMode};
+    use crate::api::client::ApiContext;
     use sha2::{Digest, Sha256};
     use std::cell::{Cell, RefCell};
 
@@ -607,9 +627,14 @@ mod tests {
     }
 
     #[test]
-    fn parsing_a_forged_legacy_200_response_fails_closed() {
-        let error = parse_metrics_upload_response(r#"{"errors":[]}"#, 0, "expected-sha")
-            .expect_err("legacy 200 must not delete local facts");
+    fn dedicated_metrics_endpoint_fails_closed_on_a_legacy_200_response() {
+        let error = parse_metrics_upload_response(
+            r#"{"errors":[]}"#,
+            0,
+            "expected-sha",
+            MetricsEndpointMode::DedicatedAnonymous,
+        )
+        .expect_err("legacy 200 must not delete enterprise facts");
 
         assert!(
             error.to_string().contains("accepted=true"),
@@ -619,6 +644,49 @@ mod tests {
             !metrics_upload_error_is_permanent(&error),
             "protocol failures must retain local facts for retry"
         );
+    }
+
+    #[test]
+    fn standard_metrics_endpoint_accepts_the_upstream_errors_only_response() {
+        let response = parse_metrics_upload_response(
+            r#"{"errors":[]}"#,
+            2,
+            "unused-sha",
+            MetricsEndpointMode::Standard,
+        )
+        .expect("hosted upstream response must remain compatible");
+
+        assert!(response.errors.is_empty());
+    }
+
+    #[test]
+    fn standard_metrics_endpoint_strictly_validates_any_present_acknowledgement() {
+        let partial = parse_metrics_upload_response(
+            r#"{"accepted":true,"errors":[]}"#,
+            1,
+            "expected-sha",
+            MetricsEndpointMode::Standard,
+        )
+        .expect_err("a partial acknowledgement must fail closed");
+        assert!(partial.to_string().contains("kind=git_ai_metrics"));
+
+        let mismatched = parse_metrics_upload_response(
+            r#"{"accepted":true,"kind":"git_ai_metrics","itemCount":1,"payloadSha256":"wrong","errors":[]}"#,
+            1,
+            "expected-sha",
+            MetricsEndpointMode::Standard,
+        )
+        .expect_err("a forged acknowledgement must fail closed");
+        assert!(mismatched.to_string().contains("payloadSha256"));
+
+        let valid = parse_metrics_upload_response(
+            r#"{"accepted":true,"kind":"git_ai_metrics","itemCount":1,"payloadSha256":"expected-sha","errors":[]}"#,
+            1,
+            "expected-sha",
+            MetricsEndpointMode::Standard,
+        )
+        .expect("a complete standard-endpoint receipt must be honored");
+        assert!(valid.errors.is_empty());
     }
 
     #[test]
