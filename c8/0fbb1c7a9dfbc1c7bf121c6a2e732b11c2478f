@@ -1,0 +1,83 @@
+src/feature_flags.rs
+  s_446c1e2e45b4ad::t_da2ce374981923 89,147,159,281,293,307,318
+agent-support/vscode/package.json
+  s_446c1e2e45b4ad::t_da2ce374981923 44,80-81
+tests/integration/rewrite_ops_attribution.rs
+  s_446c1e2e45b4ad::t_7b62e50246a303 704-707
+tests/daemon_mode.rs
+  s_446c1e2e45b4ad::t_f7c4e12de51aed 26,8009-8075,8162-8312
+  s_446c1e2e45b4ad::t_c1d72597db9d2e 8313
+src/daemon.rs
+  s_446c1e2e45b4ad::t_8c2cc24739062a 77,3295,3297-3299,3432,3434,3751-3753,8024-8048,10207-10217,10230-10256,10261,10265,10269-10271
+src/metrics/mod.rs
+  s_446c1e2e45b4ad::t_e01addcfaf519d 25
+tests/integration/token_usage.rs
+  s_446c1e2e45b4ad::t_9d3088a5e8759e 1-853
+src/daemon/telemetry_worker.rs
+  s_446c1e2e45b4ad::t_8c2cc24739062a 1387-1391
+docs/token-usage-events-spec.md
+  s_446c1e2e45b4ad::t_9d3088a5e8759e 1-171
+src/metrics/types.rs
+  s_446c1e2e45b4ad::t_e01addcfaf519d 31-36,250
+src/daemon/token_usage_worker.rs
+  s_446c1e2e45b4ad::t_9d3088a5e8759e 1-1053,1058-2230
+  s_446c1e2e45b4ad::t_6a97e191afa482 1054-1057
+src/metrics/events.rs
+  s_446c1e2e45b4ad::t_9d3088a5e8759e 4-6,2895-3183
+agent-support/vscode/src/blame-lens-manager.ts
+  s_446c1e2e45b4ad::t_61367b75d5768a 16
+agent-support/vscode/src/test/extension.test.ts
+  s_446c1e2e45b4ad::t_fcb54287fc97f2 15-20
+agent-support/vscode/src/utils/config.ts
+  s_446c1e2e45b4ad::t_fc8963da4cf804 23
+src/commands/git_ai_handlers.rs
+  s_446c1e2e45b4ad::t_aa018d7022fac4 56,178-179,399-400
+src/daemon/stream_worker.rs
+  s_446c1e2e45b4ad::t_ebf180c81c5238 328-330,345,363,1005-1006,1385-1387,1392-1403,1436,1453,1572,1750
+src/lib.rs
+  s_446c1e2e45b4ad::t_5ab68edfe1ff47 24
+src/main.rs
+  s_446c1e2e45b4ad::t_004d085eb19632 30
+src/token_usage/claude.rs
+  s_446c1e2e45b4ad::t_bd93cf5bdf6895 1-729
+src/token_usage/codex.rs
+  s_446c1e2e45b4ad::t_abd094bb4c8f26 1-1217
+src/token_usage/cost.rs
+  s_446c1e2e45b4ad::t_bcf9148f1fde29 1-194
+src/token_usage/db.rs
+  s_446c1e2e45b4ad::t_a62c01e0c16491 1-1449
+src/token_usage/extractor.rs
+  s_446c1e2e45b4ad::t_646acc1f2b6050 1-55
+src/token_usage/mod.rs
+  s_446c1e2e45b4ad::t_f2e6af5d4055c9 1-20
+src/token_usage/snapshots/git_ai__token_usage__claude__tests__golden_fixture_extraction_is_pinned.snap
+  s_446c1e2e45b4ad::t_e24f17d57323d6 1-18
+src/token_usage/snapshots/git_ai__token_usage__codex__tests__golden_codex_token_count_extraction_is_pinned.snap
+  s_446c1e2e45b4ad::t_e994dfa950296f 1-18
+src/token_usage/types.rs
+  s_446c1e2e45b4ad::t_fc1aeb6bb17ae6 1-98
+tests/fixtures/codex-session-token-count.jsonl
+  s_446c1e2e45b4ad::t_56ca5636406f9a 1-10
+tests/integration/install_hooks_comprehensive.rs
+  s_446c1e2e45b4ad::t_0fb5d14e848aeb 561-576
+tests/integration/main.rs
+  s_446c1e2e45b4ad::t_270ff41b46dc4c 152
+tests/integration/performance.rs
+  s_446c1e2e45b4ad::t_151eedbcf1b4ca 26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.23",
+  "base_commit_sha": "c80fbb1c7a9dfbc1c7bf121c6a2e732b11c2478f",
+  "prompts": {},
+  "sessions": {
+    "s_446c1e2e45b4ad": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a038a2-232e-7611-be07-faf6a4ec1106",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
