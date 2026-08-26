@@ -701,7 +701,10 @@ base joke,base punchline
 
 #[test]
 fn test_cherry_pick_conflict_ai_rewrite_resolution_is_attributed() {
-    let repo = TestRepo::new();
+    // This scenario depends on strict ordering between the conflict-resolution
+    // checkpoints and the cherry-pick ref transition. Keep it off the shared
+    // daemon pool so parallel rewrite tests cannot interleave that sequence.
+    let repo = TestRepo::new_dedicated_daemon();
     let file_path = repo.path().join("conflict.csv");
 
     let base = "id,value\nbase,seed\n";

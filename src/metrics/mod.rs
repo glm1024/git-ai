@@ -22,7 +22,7 @@ pub use attrs::EventAttributes;
 pub use events::{
     AgentUsageValues, CheckpointValues, CommittedValues, InstallHooksValues,
     LifecycleTransitionValues, OtelTraceValues, RewriteCommittedValues, SessionEventValues,
-    SessionTokenUsageValues,
+    SessionTokenUsageValues, TokenUsageValues,
 };
 pub use pos_encoded::PosEncoded;
 pub use types::{EventValues, METRICS_API_VERSION, MetricEvent, MetricsBatch};

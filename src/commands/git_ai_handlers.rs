@@ -53,6 +53,7 @@ pub fn handle_git_ai(args: &[String]) {
             | "upgrade"
             | "install-hooks"
             | "install"
+            | "uninstall"
             | "uninstall-hooks"
             | "usage"
     );
@@ -174,7 +175,8 @@ pub fn handle_git_ai(args: &[String]) {
                 std::process::exit(1);
             }
         },
-        "uninstall-hooks" => match commands::install_hooks::run_uninstall(&args[1..]) {
+        "uninstall" | "uninstall-hooks" => match commands::install_hooks::run_uninstall(&args[1..])
+        {
             Ok(statuses) => {
                 if let Ok(statuses_value) = serde_json::to_value(&statuses) {
                     log_message("uninstall-hooks", "info", Some(statuses_value));
@@ -394,7 +396,8 @@ fn print_help() {
     eprintln!("    --skills               Also install agent skill files");
     eprintln!("    --visual-studio-extension");
     eprintln!("                           Also install the Visual Studio extension on Windows");
-    eprintln!("  uninstall-hooks    Remove git-ai hooks from all detected tools");
+    eprintln!("  uninstall, uninstall-hooks");
+    eprintln!("                       Remove git-ai hooks from all detected tools");
     eprintln!("  ci                 Continuous integration utilities");
     eprintln!("    github                 GitHub CI helpers");
     eprintln!("  git-path           Print the path to the underlying git executable");

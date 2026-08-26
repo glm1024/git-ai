@@ -1384,8 +1384,11 @@ fn should_deliver_metric_event(config: &Config, event: &MetricEvent) -> bool {
         || event.event_id == MetricEventId::Checkpoint as u16
         || event.event_id == MetricEventId::RewriteCommitted as u16
         || event.event_id == MetricEventId::LifecycleTransition as u16;
-    let repository_scoped = requires_remote || event.event_id == MetricEventId::SessionEvent as u16;
-    if !repository_scoped {
+    // Transcript-derived events keep flowing for sessions tracked before a
+    // repo was excluded, so they get the same upload-time repo gate.
+    let transcript_derived = event.event_id == MetricEventId::SessionEvent as u16
+        || event.event_id == MetricEventId::TokenUsage as u16;
+    if !requires_remote && !transcript_derived {
         return true;
     }
 

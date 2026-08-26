@@ -41,7 +41,7 @@
             "line",
             "all"
           ],
-          "default": "line",
+          "default": "off",
           "scope": "application",
           "enumDescriptions": [
             "Disable gutter decorations",
@@ -77,8 +77,8 @@
         {
           "id": "git-ai",
           "title": "Git AI",
-        "icon": "media/git-ai-activity-light.png",
-        "darkIcon": "media/git-ai-activity-dark.png"
+          "icon": "media/git-ai-activity-light.png",
+          "darkIcon": "media/git-ai-activity-dark.png"
         }
       ]
     },

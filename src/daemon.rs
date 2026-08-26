@@ -74,6 +74,7 @@ pub mod sweep_coordinator;
 pub mod telemetry_handle;
 pub mod telemetry_worker;
 pub mod test_sync;
+pub mod token_usage_worker;
 pub mod trace_normalizer;
 pub mod transcript_redaction;
 
@@ -3291,7 +3292,11 @@ pub struct ActorDaemonCoordinator {
     trace_ingest_tx: std::sync::OnceLock<mpsc::Sender<Value>>,
     telemetry_worker: Option<crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle>,
     stream_worker: Option<crate::daemon::stream_worker::StreamWorkerHandle>,
+    token_usage_worker: Option<crate::daemon::token_usage_worker::TokenUsageWorkerHandle>,
     transcript_shutdown_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
+    // Separate from the transcript worker's Notify: notify_one wakes exactly
+    // one waiter, so each worker needs its own.
+    token_usage_shutdown_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     streams_db: Option<Arc<crate::streams::db::StreamsDatabase>>,
     next_trace_ingest_seq: AtomicUsize,
     queued_trace_payloads: AtomicUsize,
@@ -3424,7 +3429,9 @@ impl ActorDaemonCoordinator {
             trace_ingest_tx: std::sync::OnceLock::new(),
             telemetry_worker: None,
             stream_worker: None,
+            token_usage_worker: None,
             transcript_shutdown_notify: std::sync::OnceLock::new(),
+            token_usage_shutdown_notify: std::sync::OnceLock::new(),
             streams_db: None,
             next_trace_ingest_seq: AtomicUsize::new(0),
             queued_trace_payloads: AtomicUsize::new(0),
@@ -3740,6 +3747,9 @@ impl ActorDaemonCoordinator {
         self.shutdown_notify.notify_waiters();
         if let Some(transcript_shutdown) = self.transcript_shutdown_notify.get() {
             transcript_shutdown.notify_one();
+        }
+        if let Some(token_usage_shutdown) = self.token_usage_shutdown_notify.get() {
+            token_usage_shutdown.notify_one();
         }
         // Hold the condvar mutex so notify_all cannot race with the
         // check-then-wait sequence in daemon_update_check_loop.
@@ -8011,7 +8021,31 @@ impl ActorDaemonCoordinator {
             }
         }
 
-        // Phase 4: flush telemetry and wait for the worker to finish.
+        // Phase 4: drain the token-usage worker. It is fed by stream-worker
+        // completions, so this must run after the transcript drain above.
+        if !result.timed_out
+            && let Some(worker) = &self.token_usage_worker
+        {
+            let now = Instant::now();
+            if now < deadline {
+                let remaining = deadline - now;
+                maybe_log("token-usage processing");
+                match timeout(remaining, worker.drain()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "await: token-usage drain failed");
+                        record_await_phase_error(&mut result, "token-usage processing", e);
+                    }
+                    Err(_) => {
+                        result.timed_out = true;
+                    }
+                }
+            } else {
+                result.timed_out = true;
+            }
+        }
+
+        // Phase 5: flush telemetry and wait for the worker to finish.
         if !result.timed_out
             && let Some(worker) = &self.telemetry_worker
         {
@@ -10170,6 +10204,17 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     crate::daemon::telemetry_worker::set_daemon_internal_telemetry(telemetry_handle.clone());
     coordinator_inner.telemetry_worker = Some(telemetry_handle.clone());
 
+    // With the token-usage flag off, previously collected data is deleted
+    // regardless of the streaming gate below (the spec's "no collected data
+    // is retained" holds even when transcript_streaming is also off).
+    let token_usage_db_path = config.internal_dir.join("token-usage-db");
+    let token_usage_enabled = config::Config::get()
+        .get_feature_flags()
+        .token_usage_metrics;
+    if !token_usage_enabled {
+        crate::token_usage::db::TokenUsageDatabase::remove_database_files(&token_usage_db_path);
+    }
+
     // Spawn the transcript worker BEFORE wrapping coordinator in Arc
     if config::Config::get()
         .get_feature_flags()
@@ -10182,16 +10227,48 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
             Ok(streams_db) => {
                 let streams_db = std::sync::Arc::new(streams_db);
                 let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+                // Each worker needs its own shutdown Notify: request_shutdown
+                // uses notify_one, which wakes exactly one waiter.
+                let token_usage_shutdown_notify = Arc::new(tokio::sync::Notify::new());
+                // The token-usage worker is fed by stream-worker completions,
+                // so it lives inside the transcript_streaming gate, behind
+                // its own startup flag (like transcript_streaming itself).
+                // When the flag is off, nothing runs and no database is
+                // created (deletion of old data happens above, outside this
+                // gate).
+                let token_usage_handle = if token_usage_enabled {
+                    match crate::token_usage::db::TokenUsageDatabase::open(&token_usage_db_path) {
+                        Ok(token_db) => {
+                            Some(crate::daemon::token_usage_worker::spawn_token_usage_worker(
+                                streams_db.clone(),
+                                std::sync::Arc::new(token_db),
+                                telemetry_handle.clone(),
+                                token_usage_shutdown_notify.clone(),
+                            ))
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to open token-usage database, token-usage worker not started");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let transcript_handle = crate::daemon::stream_worker::spawn_stream_worker(
                     streams_db.clone(),
                     telemetry_handle.clone(),
                     shutdown_notify.clone(),
+                    token_usage_handle.clone(),
                 );
                 coordinator_inner.streams_db = Some(streams_db);
                 coordinator_inner.stream_worker = Some(transcript_handle);
+                coordinator_inner.token_usage_worker = token_usage_handle;
                 let _ = coordinator_inner
                     .transcript_shutdown_notify
                     .set(shutdown_notify);
+                let _ = coordinator_inner
+                    .token_usage_shutdown_notify
+                    .set(token_usage_shutdown_notify);
                 tracing::info!("transcript worker spawned");
             }
             Err(e) => {
