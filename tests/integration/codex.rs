@@ -49,6 +49,9 @@ fn test_codex_preset_structured_hook_input() {
             "input_messages": ["Refactor src/main.rs"],
             "last_assistant_message": "Done."
         },
+        "tool_input": {
+            "patch": "*** Update File: /Users/test/projects/git-ai/src/main.rs\n@@ old\n+new\n"
+        },
         "transcript_path": fixture.to_str().unwrap()
     })
     .to_string();
@@ -878,6 +881,140 @@ fn test_codex_e2e_apply_patch_file_edit_full_cycle() {
         "fn new_func() {}".ai(),
         "fn helper() {}".ai(),
     ]);
+}
+
+#[test]
+fn test_codex_apply_patch_during_conflicted_merge_only_attributes_tool_delta() {
+    use crate::repos::test_repo::TestRepo;
+
+    let repo = TestRepo::new();
+    let repo_root = repo.canonical_path();
+    let conflict_path = repo_root.join("conflict.txt");
+    let upstream_file_path = repo_root.join("upstream.txt");
+
+    fs::write(&conflict_path, "base\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let main_branch = repo.current_branch();
+
+    repo.git_og(&["checkout", "-b", "upstream-branch"]).unwrap();
+    let upstream_content = (1..=120)
+        .map(|line| format!("upstream line {line}\n"))
+        .collect::<String>();
+    fs::write(&upstream_file_path, &upstream_content).unwrap();
+    fs::write(&conflict_path, "upstream\n").unwrap();
+    repo.git_og(&["add", "upstream.txt", "conflict.txt"])
+        .unwrap();
+    repo.git_og(&["commit", "-m", "Upstream changes"]).unwrap();
+
+    repo.git_og(&["checkout", &main_branch]).unwrap();
+    fs::write(&conflict_path, "local\n").unwrap();
+    repo.git_og(&["add", "conflict.txt"]).unwrap();
+    repo.git_og(&["commit", "-m", "Local changes"]).unwrap();
+
+    assert!(
+        repo.git_og(&["merge", "upstream-branch"]).is_err(),
+        "merge should remain in progress because conflict.txt conflicts"
+    );
+    assert_eq!(
+        fs::read_to_string(&upstream_file_path).unwrap(),
+        upstream_content,
+        "the second-parent file should already be present before the AI edit"
+    );
+
+    let transcript_path = repo_root.join("codex-merge-apply-patch.jsonl");
+    fs::copy(fixture_path("codex-session-simple.jsonl"), &transcript_path).unwrap();
+    let patch = "*** Update File: upstream.txt\n@@\n-upstream line 60\n+upstream line 60 adjusted by codex\n";
+
+    let pre_hook_input = json!({
+        "session_id": "codex-merge-apply-patch-session",
+        "cwd": repo_root.to_string_lossy().to_string(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "apply_patch",
+        "tool_use_id": "patch-merge-1",
+        "tool_input": { "patch": patch },
+        "transcript_path": transcript_path.to_string_lossy().to_string()
+    })
+    .to_string();
+    repo.git_ai(&["checkpoint", "codex", "--hook-input", &pre_hook_input])
+        .expect("apply_patch pre-hook should capture the merge worktree baseline");
+
+    let pre_checkpoints = repo
+        .current_working_logs()
+        .read_all_checkpoints()
+        .expect("pre-tool checkpoints should be readable");
+    let pre_checkpoint = pre_checkpoints
+        .last()
+        .expect("pre-tool baseline checkpoint should exist");
+    assert_eq!(pre_checkpoint.kind.to_string(), "human");
+    assert!(
+        pre_checkpoint
+            .entries
+            .iter()
+            .any(|entry| entry.file == "upstream.txt"),
+        "pre-tool checkpoint must capture the second-parent file before the AI edit"
+    );
+
+    fs::write(
+        &upstream_file_path,
+        upstream_content.replacen(
+            "upstream line 60\n",
+            "upstream line 60 adjusted by codex\n",
+            1,
+        ),
+    )
+    .unwrap();
+
+    let post_hook_input = json!({
+        "session_id": "codex-merge-apply-patch-session",
+        "cwd": repo_root.to_string_lossy().to_string(),
+        "hook_event_name": "PostToolUse",
+        "tool_name": "apply_patch",
+        "tool_use_id": "patch-merge-1",
+        "tool_input": { "patch": patch },
+        "transcript_path": transcript_path.to_string_lossy().to_string()
+    })
+    .to_string();
+    repo.git_ai(&["checkpoint", "codex", "--hook-input", &post_hook_input])
+        .expect("apply_patch post-hook should record the AI delta");
+
+    let checkpoints = repo
+        .current_working_logs()
+        .read_all_checkpoints()
+        .expect("checkpoints should be readable");
+    let latest = checkpoints.last().expect("AI checkpoint should exist");
+
+    assert!(
+        latest.kind.is_ai(),
+        "latest checkpoint should be the AI edit"
+    );
+    assert_eq!(
+        latest
+            .agent_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("tool_use_id"))
+            .map(String::as_str),
+        Some("patch-merge-1")
+    );
+    assert!(
+        latest
+            .entries
+            .iter()
+            .any(|entry| entry.file == "upstream.txt"),
+        "AI checkpoint should remain scoped to the edited file"
+    );
+    assert_eq!(latest.line_stats.additions, 1);
+    assert_eq!(latest.line_stats.deletions, 1);
+    let ai_attributed_lines: u32 = latest
+        .entries
+        .iter()
+        .flat_map(|entry| entry.line_attributions.iter())
+        .filter(|attribution| attribution.author_id != "human")
+        .map(|attribution| attribution.end_line - attribution.start_line + 1)
+        .sum();
+    assert_eq!(
+        ai_attributed_lines, 1,
+        "only the line changed after the pre-tool snapshot should be attributed to Codex"
+    );
 }
 
 #[test]

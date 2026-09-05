@@ -46,45 +46,23 @@ impl CodexPreset {
         .map(|p| p.to_string_lossy().into_owned())
     }
 
-    fn extract_filepaths_from_tool_response(hook_data: &serde_json::Value) -> Vec<PathBuf> {
-        let Some(tool_response) = hook_data.get("tool_response") else {
-            return vec![];
-        };
-        let output = if let Some(raw) = tool_response.as_str() {
-            serde_json::from_str::<serde_json::Value>(raw)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("output")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| raw.to_string())
-        } else {
-            tool_response
-                .get("output")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        };
-
-        let mut paths = Vec::new();
-        for line in output.lines() {
-            let trimmed = line.trim();
-            if trimmed.len() > 2
-                && trimmed.as_bytes()[1] == b' '
-                && matches!(trimmed.as_bytes()[0], b'A' | b'M' | b'D' | b'R' | b'U')
-            {
-                let path = trimmed[2..].trim();
-                if !path.is_empty() {
-                    let pb = PathBuf::from(path);
-                    if !paths.contains(&pb) {
-                        paths.push(pb);
-                    }
-                }
-            }
+    fn require_filepaths_from_tool_input(
+        hook_data: &serde_json::Value,
+        cwd: &str,
+        phase: &str,
+    ) -> Result<Vec<PathBuf>, GitAiError> {
+        // Pre and post must derive the same bounded scope from tool input. Discovering paths
+        // only after the edit would leave no trustworthy pre-edit snapshot to diff against.
+        let tool_input = hook_data
+            .get("tool_input")
+            .or_else(|| hook_data.get("toolInput"));
+        let file_paths = OpenCodePreset::extract_filepaths_from_tool_input(tool_input, cwd);
+        if file_paths.is_empty() {
+            return Err(GitAiError::PresetError(format!(
+                "No editable file paths found in Codex {phase} tool input; refusing an unbounded file-edit checkpoint"
+            )));
         }
-        paths
+        Ok(file_paths)
     }
 }
 
@@ -161,7 +139,11 @@ impl AgentPreset for CodexPreset {
                 } else if is_file_edit {
                     ParsedHookEvent::PreFileEdit(PreFileEdit {
                         context,
-                        file_paths: vec![],
+                        file_paths: Self::require_filepaths_from_tool_input(
+                            &data,
+                            cwd,
+                            "PreToolUse",
+                        )?,
                         dirty_files: None,
                         tool_use_id: Some(tool_use_id.to_string()),
                     })
@@ -181,17 +163,13 @@ impl AgentPreset for CodexPreset {
                         stream_source,
                     })
                 } else if is_file_edit {
-                    let tool_input = data.get("tool_input").or_else(|| data.get("toolInput"));
-                    let mut file_paths =
-                        OpenCodePreset::extract_filepaths_from_tool_input(tool_input, cwd);
-
-                    if file_paths.is_empty() {
-                        file_paths = Self::extract_filepaths_from_tool_response(&data);
-                    }
-
                     ParsedHookEvent::PostFileEdit(PostFileEdit {
                         context,
-                        file_paths,
+                        file_paths: Self::require_filepaths_from_tool_input(
+                            &data,
+                            cwd,
+                            "PostToolUse",
+                        )?,
                         dirty_files: None,
                         stream_source,
                         tool_use_id: Some(tool_use_id.to_string()),
@@ -364,7 +342,10 @@ mod tests {
                 "hook_event_name": "PostToolUse",
                 "tool_name": tool_name,
                 "session_id": "codex-sess-1",
-                "tool_use_id": "tu-1"
+                "tool_use_id": "tu-1",
+                "tool_input": {
+                    "patch": "*** Update File: /home/user/project/src/main.rs\n@@ old\n+new\n"
+                }
             })
             .to_string();
             let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
@@ -392,6 +373,28 @@ mod tests {
 
     #[test]
     fn test_codex_extracts_patch_file_paths_from_patch_and_command_keys() {
+        let input = json!({
+            "cwd": "/home/user/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "session_id": "codex-sess-1",
+            "tool_use_id": "patch-pre-1",
+            "tool_input": {
+                "patch": "*** Update File: /home/user/project/src/main.rs\n@@ old\n+new\n"
+            }
+        })
+        .to_string();
+        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("/home/user/project/src/main.rs")]
+                );
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+
         let input = json!({
             "cwd": "/home/user/project",
             "hook_event_name": "PostToolUse",
@@ -434,6 +437,28 @@ mod tests {
                 );
             }
             _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_codex_file_edit_without_pre_tool_paths_fails_closed() {
+        for hook_event_name in ["PreToolUse", "PostToolUse"] {
+            let input = json!({
+                "cwd": "/home/user/project",
+                "hook_event_name": hook_event_name,
+                "tool_name": "apply_patch",
+                "session_id": "codex-sess-1",
+                "tool_use_id": "patch-missing-paths",
+                "tool_response": "M src/main.rs\n"
+            })
+            .to_string();
+            let error = CodexPreset
+                .parse(&input, "t_test123456789a")
+                .expect_err("file edits without pre-tool paths must not create a checkpoint");
+            assert!(
+                error.to_string().contains("No editable file paths"),
+                "unexpected error for {hook_event_name}: {error}"
+            );
         }
     }
 
