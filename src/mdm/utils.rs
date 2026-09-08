@@ -392,7 +392,7 @@ fn get_editor_cli_candidates(cli_name: &str) -> Vec<(PathBuf, PathBuf)> {
                             ),
                         ]
                     };
-                    for (dir_name, executable_names) in installs {
+                    for &(dir_name, executable_names) in installs {
                         let base = root.join(dir_name);
                         let cli_js = base
                             .join("resources")
