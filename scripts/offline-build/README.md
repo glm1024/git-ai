@@ -9,10 +9,20 @@ sh scripts/offline-build/build-macos-arm64.sh
 sh scripts/offline-build/build-linux-arm64.sh
 sh scripts/offline-build/build-linux-x64.sh
 sh scripts/offline-build/build-windows-x64.sh
+sh scripts/offline-build/build-win.sh
 sh scripts/offline-build/build-vscode.sh
 sh scripts/offline-build/build-jetbrains.sh
 sh scripts/offline-build/package-offline-dist.sh
 ```
+
+`build-win.sh` 是研发内网 Windows CLI 的统一交付入口。它构建 Windows x64
+exe、生成安装清单并打包，最终只需复制：
+
+```text
+offline-dist/git-ai-windows-v<CLI version>.zip
+```
+
+ZIP 包含 Windows exe、来源元数据、`SHA256SUMS`、可复用的 `install.ps1` 和安装说明。
 
 每个构建脚本都会在产物旁写入 `.build-metadata` 来源文件，记录源码 commit、
 构建时源码是否干净以及产物 SHA-256。`package-offline-dist.sh` 只接受由当前

@@ -17,8 +17,12 @@ assert_contains() {
 }
 
 sh -n "${SCRIPT_DIR}/package-offline-dist.sh"
+sh -n "${SCRIPT_DIR}/build-win.sh"
+sh -n "${SCRIPT_DIR}/test-build-win-package.sh"
 if command -v dash >/dev/null 2>&1; then
     dash -n "${SCRIPT_DIR}/package-offline-dist.sh"
+    dash -n "${SCRIPT_DIR}/build-win.sh"
+    dash -n "${SCRIPT_DIR}/test-build-win-package.sh"
 fi
 bash -n "${REPO_ROOT}/install.sh"
 help_home="$(mktemp -d "${TMPDIR:-/tmp}/git-ai-install-help.XXXXXX")"
@@ -56,6 +60,21 @@ assert_contains "${package_script}" 'GIT_AI_PACKAGED_DIST_UNDER_TEST="${STAGING_
 if grep -Fq 'offline-dist/git-ai-offline-v1.6.16' "${SCRIPT_DIR}/test-install-rollback.sh"; then
     fail 'Source installer regression must not force parity with historical v1.6.16 artifacts'
 fi
+
+windows_build_script="${SCRIPT_DIR}/build-win.sh"
+for marker in \
+    'sh "${SCRIPT_DIR}/build-windows-x64.sh"' \
+    'DIST_NAME="git-ai-windows-v${CLI_VERSION}"' \
+    'DIST_ZIP="${REPO_ROOT}/offline-dist/${DIST_NAME}.zip"' \
+    'validate_artifact_source_metadata' \
+    'shasum -a 256 -c SHA256SUMS' \
+    'unzip -tq "${STAGING_ZIP}"' \
+    'mv -f "${STAGING_ZIP}" "${DIST_ZIP}"'
+do
+    assert_contains "${windows_build_script}" "${marker}"
+done
+assert_contains "${SCRIPT_DIR}/WINDOWS-INSTALL.md" '& .\install.ps1'
+sh "${SCRIPT_DIR}/test-build-win-package.sh"
 
 metadata_line=$(grep -n -F '} > "${STAGING_DIR}/BUILD-METADATA.txt"' "${package_script}" | cut -d: -f1)
 checksums_line=$(grep -n -F 'RAW_SHA256SUMS=' "${package_script}" | cut -d: -f1)
