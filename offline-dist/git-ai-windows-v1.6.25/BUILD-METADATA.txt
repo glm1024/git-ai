@@ -1,0 +1,7 @@
+bundle_format=git-ai-windows-offline-v1
+source_commit=62a01e36aaa27cd4b574733e049778a1964f506f
+source_dirty=false
+artifact_source_gate=verified-local-v1
+cli_version=1.6.25
+built_at_utc=2026-09-08T08:46:26Z
+packaged_at_utc=2026-09-08T08:46:26Z

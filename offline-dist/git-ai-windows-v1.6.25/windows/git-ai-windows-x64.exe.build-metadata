@@ -1,0 +1,6 @@
+format=git-ai-offline-artifact-v1
+artifact_name=git-ai-windows-x64.exe
+artifact_sha256=294fbb7edaf9fb0339c2ba5c8414f2d1a5c86576e7e69cba7a25b3b6d51895bb
+source_commit=62a01e36aaa27cd4b574733e049778a1964f506f
+source_dirty=false
+built_at_utc=2026-09-08T08:46:26Z
