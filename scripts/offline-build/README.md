@@ -40,7 +40,7 @@ sh scripts/offline-build/test-install-rollback.sh
 该测试会在临时 `HOME` 中执行 Unix 安装模板和当前离线包脚本，覆盖旧二进制、
 已有 `git` shim、CLI 链接的成组升级/恢复以及首次失败保留配置、SQLite 和 outbox；
 Windows 脚本在没有 PowerShell 的平台只做事务结构静态门禁，正式分发前仍需在真实
-Windows x64 上执行安装失败与升级回滚测试。
+Windows x64 上执行安装失败与升级回滚测试。有 PowerShell 时还会执行清单校验、连续版本复用、损坏产物和版本冲突测试；可单独运行 `pwsh -NoProfile -File scripts/offline-build/test-windows-offline-manifest.ps1`。
 
 ## 构建完整包
 
@@ -77,7 +77,9 @@ GIT_AI_BUILD_OFFLINE=1 sh scripts/offline-build/build-all.sh
 - Linux x64 和 ARM64 musl 二进制文件。
 - Windows x64 MSVC 可执行文件。
 - VS Code/Cursor VSIX 和 JetBrains ZIP 插件包。
-- 最新的 `SHA256SUMS`、包含匹配内置二进制哈希的重新生成的安装脚本、`INSTALL.md` 以及 `BUILD-METADATA.txt`。
+- 最新的 `SHA256SUMS`、包含匹配内置二进制哈希的 Unix `install.sh`、原样复制的可复用 Windows `install.ps1`、`INSTALL.md` 以及 `BUILD-METADATA.txt`。
+
+Windows 安装脚本不再写入每个 CLI 版本的版本号和哈希。用户可保留同一份脚本，把 `GIT_AI_LOCAL_BINARY` 指向新包的 `windows/git-ai-windows-x64.exe`；脚本从该包读取清单并校验暂存 EXE 和构建元数据。后续升级仍需更新产物和清单；只有安装流程本身需要变更时才更新脚本。历史包不原地重写，旧版内嵌脚本需一次性换成可复用版。
 
 Windows 可执行文件是在本地交叉编译的。在分发之前，请在真实的 Windows x64 机器上运行 Windows 安装、hook 设置以及 commit 归因冒烟测试。
 

@@ -282,6 +282,66 @@ function Wait-ForFileAvailable {
     return $false
 }
 
+function Read-OfflineBundle {
+    param(
+        [Parameter(Mandatory = $true)][string]$BinaryPath,
+        [Parameter(Mandatory = $true)][string]$BinaryName
+    )
+
+    $binaryItem = Get-Item -LiteralPath $BinaryPath -ErrorAction Stop
+    if ($binaryItem.PSIsContainer -or $binaryItem.Name -ne $BinaryName -or
+        $binaryItem.Directory.Name -ne 'windows') {
+        throw 'Offline binary must be windows/<matching Windows binary name> inside its bundle'
+    }
+    $bundleRoot = $binaryItem.Directory.Parent.FullName
+    $checksums = @{}
+    foreach ($line in [IO.File]::ReadAllLines((Join-Path $bundleRoot 'SHA256SUMS'))) {
+        if ($line -notmatch '^([0-9a-fA-F]{64})  (.+)$') {
+            throw 'Invalid SHA256SUMS entry'
+        }
+        $hash = $Matches[1].ToLowerInvariant()
+        $entry = $Matches[2].Replace('\', '/')
+        if ($entry -match '(^/|:|(^|/)\.\.?(/|$))' -or $checksums.ContainsKey($entry)) {
+            throw "Unsafe or duplicate SHA256SUMS entry: $entry"
+        }
+        $checksums[$entry] = $hash
+    }
+    $binaryEntry = "windows/$BinaryName"
+    foreach ($required in @($binaryEntry, 'BUILD-METADATA.txt')) {
+        if (-not $checksums.ContainsKey($required)) {
+            throw "Missing SHA256SUMS entry: $required"
+        }
+    }
+
+    # Parse exactly the bytes we verify; never execute or delete source metadata.
+    $metadataBytes = [IO.File]::ReadAllBytes((Join-Path $bundleRoot 'BUILD-METADATA.txt'))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $metadataHash = ([BitConverter]::ToString($sha256.ComputeHash($metadataBytes))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+    if ($metadataHash -ne $checksums['BUILD-METADATA.txt']) {
+        throw 'Checksum verification failed for BUILD-METADATA.txt'
+    }
+    $metadata = @{}
+    foreach ($line in ([Text.Encoding]::UTF8.GetString($metadataBytes).TrimStart([char]0xFEFF) -split '\r?\n')) {
+        if ($line.Length -eq 0) { continue }
+        if ($line -notmatch '^([a-z_]+)=(.*)$') { throw 'Invalid BUILD-METADATA.txt entry' }
+        $key = $Matches[1]
+        $value = $Matches[2]
+        if ($metadata.ContainsKey($key)) { throw "Duplicate metadata key: $key" }
+        $metadata[$key] = $value
+    }
+    if (-not $metadata.ContainsKey('cli_version') -or $metadata['cli_version'] -notmatch '^\d+\.\d+\.\d+(?:\.\d+)*$') {
+        throw 'Missing or invalid cli_version in BUILD-METADATA.txt'
+    }
+    return [pscustomobject]@{
+        Version = $metadata['cli_version']
+        Checksums = "$($checksums[$binaryEntry])  $BinaryName"
+    }
+}
+
 function Verify-Checksum {
     param(
         [Parameter(Mandatory = $true)][string]$File,
@@ -379,9 +439,29 @@ $os = 'windows'
 # Determine binary name and download URLs
 $binaryName = "git-ai-$os-$arch"
 
+# A reusable offline installer reads release data beside the selected EXE, not
+# beside this script. Keep bare development binaries and online installs intact.
+$localBinaryPath = $env:GIT_AI_LOCAL_BINARY
+if ([string]::IsNullOrWhiteSpace($localBinaryPath) -and
+    -not [string]::IsNullOrWhiteSpace($PSScriptRoot) -and
+    ((Test-Path -LiteralPath (Join-Path $PSScriptRoot 'windows')) -or
+     (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'BUILD-METADATA.txt')))) {
+    $localBinaryPath = Join-Path $PSScriptRoot "windows/$binaryName.exe"
+}
+$offlineBundle = $null
+if (-not [string]::IsNullOrWhiteSpace($localBinaryPath)) {
+    $localItem = Get-Item -LiteralPath $localBinaryPath -ErrorAction Stop
+    if ($localItem.PSIsContainer) { throw 'Local binary must be a file' }
+    $localBinaryPath = $localItem.FullName
+    if ($localItem.Name -like 'git-ai-windows-*.exe' -or $localItem.Directory.Name -eq 'windows') {
+        $offlineBundle = Read-OfflineBundle -BinaryPath $localBinaryPath -BinaryName "$binaryName.exe"
+        $EmbeddedChecksums = $offlineBundle.Checksums
+    }
+}
+
 # Determine release tag
 # Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"
-if (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
+if (-not [string]::IsNullOrWhiteSpace($localBinaryPath)) {
     $releaseTag = 'local'
 } elseif ($PinnedVersion -ne '__VERSION_PLACEHOLDER__') {
     # Version-pinned install script from a release
@@ -587,7 +667,7 @@ function Restore-RecoveredPath {
             Move-Item -LiteralPath $BackupPath -Destination $FinalPath -ErrorAction Stop
         } else {
             throw [System.InvalidOperationException]::new(
-                "Interrupted install is ambiguous for $Label: the recovery journal says an old path existed, but no backup is present. The current path may be either old or newly published."
+                "Interrupted install is ambiguous for ${Label}: the recovery journal says an old path existed, but no backup is present. The current path may be either old or newly published."
             )
         }
     } else {
@@ -957,12 +1037,12 @@ function Try-Download {
 
 # Track which download URL succeeded for checksum verification
 $downloadedBinaryName = $null
-if (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
-    if (-not (Test-Path -LiteralPath $env:GIT_AI_LOCAL_BINARY)) {
+if (-not [string]::IsNullOrWhiteSpace($localBinaryPath)) {
+    if (-not (Test-Path -LiteralPath $localBinaryPath)) {
         Remove-Item -Force -ErrorAction SilentlyContinue $tmpFile
-        Write-ErrorAndExit "Local binary not found at $($env:GIT_AI_LOCAL_BINARY)"
+        Write-ErrorAndExit "Local binary not found at $localBinaryPath"
     }
-    Copy-Item -Force -Path $env:GIT_AI_LOCAL_BINARY -Destination $tmpFile
+    Copy-Item -Force -LiteralPath $localBinaryPath -Destination $tmpFile
     $downloadedBinaryName = "$binaryName.exe"
 } elseif (Try-Download -Url $downloadUrlExe) {
     $downloadedBinaryName = "$binaryName.exe"
@@ -1003,7 +1083,13 @@ if ([string]::IsNullOrWhiteSpace($candidateVersion)) {
 }
 
 $expectedVersionSource = $env:GIT_AI_INSTALL_EXPECTED_VERSION
-if ([string]::IsNullOrWhiteSpace($expectedVersionSource) -and
+if ($null -ne $offlineBundle) {
+    if (-not [string]::IsNullOrWhiteSpace($expectedVersionSource) -and
+        (Get-NormalizedVersion -Text $expectedVersionSource) -ne $offlineBundle.Version) {
+        Write-ErrorAndExit 'Expected version conflicts with offline bundle cli_version'
+    }
+    $expectedVersionSource = $offlineBundle.Version
+} elseif ([string]::IsNullOrWhiteSpace($expectedVersionSource) -and
     $PinnedVersion -ne '__VERSION_PLACEHOLDER__' -and $PinnedVersion -ne 'latest') {
     $expectedVersionSource = $PinnedVersion
 }

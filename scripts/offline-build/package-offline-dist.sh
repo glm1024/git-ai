@@ -146,12 +146,11 @@ awk -v repo="internal/git-ai-offline" -v version="v${OFFLINE_VERSION}" -v checks
 ' "${REPO_ROOT}/install.sh" > "${STAGING_DIR}/install.sh"
 chmod 755 "${STAGING_DIR}/install.sh"
 
-awk -v repo="internal/git-ai-offline" -v version="v${OFFLINE_VERSION}" -v checksums="${EMBEDDED_CHECKSUMS}" '
-    /^\$Repo = / { print "$Repo = \047" repo "\047"; next }
-    /^\$PinnedVersion = / { print "$PinnedVersion = \047" version "\047"; next }
-    /^\$EmbeddedChecksums = / { print "$EmbeddedChecksums = \047" checksums "\047"; next }
-    { print }
-' "${REPO_ROOT}/install.ps1" > "${STAGING_DIR}/install.ps1"
+# Windows offline installs resolve version/checksums from the selected bundle.
+# Changing the CLI release must not rewrite the reusable installer.
+cp "${REPO_ROOT}/install.ps1" "${STAGING_DIR}/install.ps1"
+cmp -s "${REPO_ROOT}/install.ps1" "${STAGING_DIR}/install.ps1" \
+    || fail "Windows offline installer differs from source"
 
 INSTALL_TEMPLATE=${GIT_AI_INSTALL_TEMPLATE:-"${SCRIPT_DIR}/INSTALL.template.md"}
 if [ -z "${INSTALL_TEMPLATE}" ] || [ ! -f "${INSTALL_TEMPLATE}" ]; then

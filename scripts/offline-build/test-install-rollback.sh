@@ -431,6 +431,7 @@ if [ -n "${POWERSHELL_BIN}" ]; then
             || fail "PowerShell parser rejected ${windows_installer}"
     }
     parse_windows_installer "${REPO_ROOT}/install.ps1"
+    "${POWERSHELL_BIN}" -NoProfile -NonInteractive -File "${SCRIPT_DIR}/test-windows-offline-manifest.ps1"
     if [ -n "${PACKAGED_DIST_UNDER_TEST}" ]; then
         parse_windows_installer "${PACKAGED_DIST_UNDER_TEST}/install.ps1"
     fi

@@ -36,7 +36,7 @@ if ($failed) { throw 'Offline bundle verification failed' }
 
 ## 2. 安装 CLI
 
-不要使用旧版本离线包的安装脚本覆盖新版本。安装器会保留本地配置和统计数据库，并在失败或下次运行时按持久化事务日志恢复可执行文件。
+安装器会保留本地配置和统计数据库，并在失败或下次运行时按持久化事务日志恢复可执行文件。macOS/Linux 仍使用新包配套的 `install.sh`。Windows 使用可复用的 `install.ps1`，版本及校验值从选中 EXE 所在包的清单读取，无需随每次 CLI 升级更换脚本。
 
 macOS ARM64：
 
@@ -59,10 +59,14 @@ GIT_AI_LOCAL_BINARY="$PWD/linux/git-ai-linux-arm64" bash ./install.sh
 Windows x64 PowerShell：
 
 ```powershell
-$env:GIT_AI_LOCAL_BINARY = (Resolve-Path .\windows\git-ai-windows-x64.exe).Path
+$env:GIT_AI_LOCAL_BINARY = (Resolve-Path -LiteralPath .\windows\git-ai-windows-x64.exe).Path
 & .\install.ps1
 Remove-Item Env:GIT_AI_LOCAL_BINARY
 ```
+
+也可将本版 `install.ps1` 单独保存在固定目录；后续升级只需将上述变量指向新包中的 EXE，并执行固定目录中的脚本。脚本读取的是 EXE 所在包的 `SHA256SUMS` 和 `BUILD-METADATA.txt`，与当前工作目录和脚本保存位置无关。新 EXE 必须保留在包的 `windows` 目录，清单与元数据也必须随版本更新；不能只换 EXE 而保留旧校验值。包内直接执行 `install.ps1` 时也会自动识别相邻的 Windows 产物，无需设置变量。
+
+历史离线包中已嵌入版本号的旧脚本需一次性换成本版可复用脚本。此后仅安装流程发生兼容性变化或修复时才需要更新脚本，不能承诺脚本永久不变。升级已有客户端会保留原有配置和数据，降级限制仍生效。新脚本要求清单同时覆盖 EXE 和 `BUILD-METADATA.txt`；历史 v1.6.16 包缺少元数据校验项，不能直接交给新脚本，应使用重新发布的完整包，不手改旧清单或跳过校验。
 
 关闭并重新打开终端后确认：
 

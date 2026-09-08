@@ -32,7 +32,8 @@ lock_version=$(awk '
     in_package && /^version = "/ { gsub(/^version = "|"$/, ""); print; exit }
 ' "${REPO_ROOT}/Cargo.lock")
 flake_version=$(awk -F '"' '/^[[:space:]]*version = "/ { print $2; exit }' "${REPO_ROOT}/flake.nix")
-[ "${cli_version}" = 1.6.17 ] || fail "CLI release version must be 1.6.17, got ${cli_version}"
+printf '%s\n' "${cli_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)*$' \
+    || fail "Invalid CLI release version: ${cli_version}"
 [ "${lock_version}" = "${cli_version}" ] || fail "Cargo.lock version does not match Cargo.toml"
 [ "${flake_version}" = "${cli_version}" ] || fail "flake.nix version does not match Cargo.toml"
 
@@ -47,6 +48,10 @@ assert_contains "${package_script}" 'metrics_schema_version=%s'
 assert_contains "${package_script}" 'schema_compatibility=forward-only'
 assert_contains "${package_script}" 'INSTALL.md \'
 assert_contains "${package_script}" 'BUILD-METADATA.txt'
+assert_contains "${package_script}" 'cp "${REPO_ROOT}/install.ps1" "${STAGING_DIR}/install.ps1"'
+if grep -Fq '/^\$PinnedVersion = /' "${package_script}"; then
+    fail 'Windows offline installer must not embed per-release versions'
+fi
 assert_contains "${package_script}" 'GIT_AI_PACKAGED_DIST_UNDER_TEST="${STAGING_DIR}"'
 if grep -Fq 'offline-dist/git-ai-offline-v1.6.16' "${SCRIPT_DIR}/test-install-rollback.sh"; then
     fail 'Source installer regression must not force parity with historical v1.6.16 artifacts'
