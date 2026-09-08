@@ -24,7 +24,9 @@ Write-Output 'test installer'
 EOF
 cat > "${TEST_ROOT}/repo/.gitignore" <<'EOF'
 /build/
-/offline-dist/
+/offline-dist/.git-ai-windows-package-*/
+/offline-dist/.git-ai-windows-package-*.zip
+/offline-dist/git-ai-windows-v*.zip
 EOF
 cat > "${TEST_ROOT}/repo/scripts/offline-build/build-windows-x64.sh" <<'EOF'
 #!/bin/sh

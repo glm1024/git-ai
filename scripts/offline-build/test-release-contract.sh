@@ -74,6 +74,8 @@ do
     assert_contains "${windows_build_script}" "${marker}"
 done
 assert_contains "${SCRIPT_DIR}/WINDOWS-INSTALL.md" '& .\install.ps1'
+assert_contains "${REPO_ROOT}/.gitignore" '/offline-dist/.git-ai-windows-package-*/'
+assert_contains "${REPO_ROOT}/.gitignore" '/offline-dist/git-ai-windows-v*.zip'
 sh "${SCRIPT_DIR}/test-build-win-package.sh"
 
 metadata_line=$(grep -n -F '} > "${STAGING_DIR}/BUILD-METADATA.txt"' "${package_script}" | cut -d: -f1)
