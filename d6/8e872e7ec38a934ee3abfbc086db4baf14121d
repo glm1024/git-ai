@@ -1,0 +1,41 @@
+scripts/offline-build/test-windows-offline-manifest.ps1
+  s_c0bb1745726c1b::t_47055ea09ae02d 1-9,11-14,33-35,37-58,65-67,78,110-124,127-131,134-135
+  s_c0bb1745726c1b::t_19cd551e9e475a 22-25,29-32,59-64,95,100-109,125-126,133
+  s_c0bb1745726c1b::t_e41eaec10967b5 26-28,96-99
+  s_c0bb1745726c1b::t_4a05229b9d4b02 10,15-21,36,68-77,79-94,132
+install.ps1
+  s_c0bb1745726c1b::t_e41eaec10967b5 446
+  s_c0bb1745726c1b::t_2f2b6f003f3831 285-344,442-445,447-461,464,1040-1041,1043,1045,1086-1092
+  s_c0bb1745726c1b::t_4cf2d23f1c9e4f 670
+scripts/offline-build/test-install-rollback.sh
+  s_c0bb1745726c1b::t_4a05229b9d4b02 434
+产品业务.md
+  s_c0bb1745726c1b::t_d1f6c8fdf657bc 51-52
+scripts/offline-build/package-offline-dist.sh
+  s_c0bb1745726c1b::t_2f2b6f003f3831 149-153
+scripts/offline-build/INSTALL.template.md
+  s_c0bb1745726c1b::t_147244b8d68647 69
+  s_c0bb1745726c1b::t_4a05229b9d4b02 39,62,67-68
+  s_c0bb1745726c1b::t_9257f3de962cc1 70
+scripts/offline-build/test-release-contract.sh
+  s_c0bb1745726c1b::t_4a05229b9d4b02 51-54
+  s_c0bb1745726c1b::t_99d2f6201c1cd9 35-36
+scripts/offline-build/README.md
+  s_c0bb1745726c1b::t_e57367fd612507 43,80-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.25",
+  "base_commit_sha": "d68e872e7ec38a934ee3abfbc086db4baf14121d",
+  "prompts": {},
+  "sessions": {
+    "s_c0bb1745726c1b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07f07-3e9d-7910-8324-8e83c2a1ce63",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
