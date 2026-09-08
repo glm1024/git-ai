@@ -1,0 +1,38 @@
+产品业务.md
+  s_24035337048611::t_e591c35af47c29 52
+构建方法.md
+  h_4078690cfc5c9e 20,30
+  s_24035337048611::t_7b7dcec80daa22 33
+  h_4078690cfc5c9e 12,22
+offline-dist/git-ai-windows-v1.6.25/BUILD-METADATA.txt
+  h_4078690cfc5c9e 1-7
+offline-dist/git-ai-windows-v1.6.25/INSTALL.md
+  h_4078690cfc5c9e 1-21
+offline-dist/git-ai-windows-v1.6.25/SHA256SUMS
+  h_4078690cfc5c9e 1-5
+offline-dist/git-ai-windows-v1.6.25/install.ps1
+  h_4078690cfc5c9e 1-1284
+offline-dist/git-ai-windows-v1.6.25/windows/git-ai-windows-x64.exe.build-metadata
+  h_4078690cfc5c9e 1-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.25",
+  "base_commit_sha": "ba80fa9b297aa32560f792858f4a3e2fc0124071",
+  "prompts": {},
+  "humans": {
+    "h_4078690cfc5c9e": {
+      "author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_24035337048611": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "34c05701-b7f8-4e6f-afd2-5ad05b8d6cd7",
+        "model": "grok-4.6"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
