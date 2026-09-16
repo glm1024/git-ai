@@ -1,9 +1,13 @@
 /target
 /build
+/plugins/
 /offline-dist/.git-ai-package-*.staging.*/
 /offline-dist/.git-ai-windows-package-*/
 /offline-dist/.git-ai-windows-package-*.zip
 /offline-dist/git-ai-windows-v*.zip
+/offline-dist/.git-ai-linux-package-*/
+/offline-dist/.git-ai-linux-package-*.tar.gz
+/offline-dist/git-ai-linux-v*.tar.gz
 .DS_Store
 .task/
 .idea/

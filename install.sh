@@ -25,6 +25,7 @@ fi
 
 set -euo pipefail
 IFS=$'\n\t'
+INSTALLER_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 
 print_usage() {
     cat <<'EOF'
@@ -110,6 +111,11 @@ PINNED_VERSION="__VERSION_PLACEHOLDER__"
 # Format: "hash  filename|hash  filename|..." (pipe-separated)
 # When set to __CHECKSUMS_PLACEHOLDER__, checksum verification is skipped
 EMBEDDED_CHECKSUMS="__CHECKSUMS_PLACEHOLDER__"
+
+# Offline package builders can pin this installer to binaries shipped beside
+# it. Source and online-release installers leave these values empty.
+BUNDLED_BINARY_DIR=""
+BUNDLED_TARGET_OS=""
 
 # Function to print error messages
 error() {
@@ -263,6 +269,22 @@ esac
 
 # Determine binary name
 BINARY_NAME="git-ai-${OS}-${ARCH}"
+
+# A packaged Linux installer always uses its adjacent, architecture-matched
+# binary. Fail closed when the package is incomplete instead of falling back to
+# a network download or an environment-provided binary.
+if [ -n "$BUNDLED_BINARY_DIR" ]; then
+    if [ "$BUNDLED_TARGET_OS" != "$OS" ]; then
+        error "This offline package supports ${BUNDLED_TARGET_OS} only; detected ${OS}"
+    fi
+    if [ -n "${GIT_AI_LOCAL_BINARY:-}" ]; then
+        error "GIT_AI_LOCAL_BINARY cannot override a bundled offline package"
+    fi
+    GIT_AI_LOCAL_BINARY="${INSTALLER_DIR}/${BUNDLED_BINARY_DIR}/${BINARY_NAME}"
+    if [ ! -f "$GIT_AI_LOCAL_BINARY" ]; then
+        error "Bundled binary not found for ${OS}/${ARCH}: $GIT_AI_LOCAL_BINARY"
+    fi
+fi
 
 # Determine release tag
 # Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"

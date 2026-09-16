@@ -8,12 +8,16 @@
 sh scripts/offline-build/build-macos-arm64.sh
 sh scripts/offline-build/build-linux-arm64.sh
 sh scripts/offline-build/build-linux-x64.sh
+sh scripts/offline-build/build-linux.sh
 sh scripts/offline-build/build-windows-x64.sh
 sh scripts/offline-build/build-win.sh
 sh scripts/offline-build/build-vscode.sh
 sh scripts/offline-build/build-jetbrains.sh
+sh scripts/offline-build/build-plugins.sh
 sh scripts/offline-build/package-offline-dist.sh
 ```
+
+`build-plugins.sh` 会连续构建 VS Code/Cursor VSIX 和 JetBrains ZIP，并复制到仓库根目录的 `plugins/`，方便本地安装。完整离线发行仍使用上面的单产物脚本和 `build-all.sh`。
 
 `build-win.sh` 是研发内网 Windows CLI 的统一交付入口。它构建 Windows x64
 exe、生成安装清单并打包，最终只需复制：
@@ -23,6 +27,18 @@ offline-dist/git-ai-windows-v<CLI version>.zip
 ```
 
 ZIP 包含 Windows exe、来源元数据、`SHA256SUMS`、可复用的 `install.ps1` 和安装说明。
+
+`build-linux.sh` 是研发内网 Linux CLI 的统一交付入口。它构建 Linux x64 和
+ARM64 两种 CLI，再生成一个同时包含两个架构的压缩包：
+
+```text
+offline-dist/git-ai-linux-v<CLI version>.tar.gz
+```
+
+用户只需解压后执行 `bash ./install.sh`。安装脚本通过 `uname -s` 和 `uname -m`
+确认 Linux 环境并自动选择 x64 或 ARM64 CLI，同时在安装前校验选中的二进制；
+无需用户手动运行 SHA-256 校验。VS Code/JetBrains 插件不在此 Linux CLI 包内，
+仍通过独立插件产物安装。
 
 每个构建脚本都会在产物旁写入 `.build-metadata` 来源文件，记录源码 commit、
 构建时源码是否干净以及产物 SHA-256。`package-offline-dist.sh` 只接受由当前
@@ -45,6 +61,12 @@ sh scripts/offline-build/test-source-metadata.sh
 
 ```sh
 sh scripts/offline-build/test-install-rollback.sh
+```
+
+只运行 Linux 单包打包、架构自动选择和安装器内部校验回归：
+
+```sh
+sh scripts/offline-build/test-linux-offline-package.sh
 ```
 
 该测试会在临时 `HOME` 中执行 Unix 安装模板和当前离线包脚本，覆盖旧二进制、
