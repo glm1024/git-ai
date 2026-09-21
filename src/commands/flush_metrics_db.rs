@@ -8,9 +8,7 @@ use crate::api::{
 };
 use crate::metrics::db::MetricsDatabase;
 use crate::metrics::{MetricEvent, MetricsBatch};
-
-/// Max events per batch upload
-const MAX_BATCH_SIZE: usize = 1000;
+use crate::observability::MAX_METRICS_PER_ENVELOPE;
 
 fn with_locked_state<State, Value, Error>(
     state: &std::sync::Mutex<State>,
@@ -53,7 +51,7 @@ pub fn handle_flush_metrics_db(_args: &[String]) -> Result<(), String> {
     loop {
         // Get batch from DB
         let batch = with_locked_state(db, "failed to read pending batch", |db_lock| {
-            db_lock.dequeue_pending_batch(MAX_BATCH_SIZE)
+            db_lock.dequeue_pending_batch(MAX_METRICS_PER_ENVELOPE)
         })?;
 
         // If batch is empty, we're done

@@ -5,8 +5,9 @@ use crate::metrics::MetricEvent;
 
 pub mod performance_targets;
 
-/// Maximum events per metrics envelope
-pub const MAX_METRICS_PER_ENVELOPE: usize = 1000;
+/// Maximum events per upload transaction. The wire protocol accepts larger
+/// legacy batches, but keeping new batches small bounds server lock lifetime.
+pub const MAX_METRICS_PER_ENVELOPE: usize = 100;
 
 /// Submit telemetry envelopes via the best available path:
 /// 1. In-process daemon telemetry worker (daemon process itself)
@@ -166,6 +167,6 @@ mod tests {
     // Test constants
     #[test]
     fn test_max_metrics_per_envelope() {
-        assert_eq!(MAX_METRICS_PER_ENVELOPE, 1000);
+        assert_eq!(MAX_METRICS_PER_ENVELOPE, 100);
     }
 }
