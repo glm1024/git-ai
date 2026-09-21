@@ -258,11 +258,15 @@ impl AgentPreset for OpenCodePreset {
         let hook_input: OpenCodeHookInput = serde_json::from_str(hook_input)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
-        let is_bash = hook_input
+        let tool_class = hook_input
             .tool_name
             .as_deref()
-            .map(|name| bash_tool::classify_tool(Agent::OpenCode, name) == ToolClass::Bash)
-            .unwrap_or(false);
+            .map(|name| bash_tool::classify_tool(Agent::OpenCode, name))
+            .unwrap_or(ToolClass::Skip);
+        if tool_class == ToolClass::Skip {
+            return Ok(vec![]);
+        }
+        let is_bash = tool_class == ToolClass::Bash;
 
         let is_pre = hook_input.hook_event_name == "PreToolUse";
 
@@ -442,6 +446,16 @@ mod tests {
             }
             _ => panic!("Expected PostBashCall"),
         }
+    }
+
+    #[test]
+    fn test_opencode_unknown_tool_is_skipped() {
+        let input = make_opencode_input("PreToolUse", "read");
+        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
+        assert!(
+            events.is_empty(),
+            "read-only tools must not create checkpoints"
+        );
     }
 
     #[test]

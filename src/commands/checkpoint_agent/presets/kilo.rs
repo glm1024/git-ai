@@ -11,6 +11,7 @@ use super::{
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
+use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::commands::checkpoint_agent::presets::opencode::OpenCodePreset;
 use crate::error::GitAiError;
 use serde::Deserialize;
@@ -204,10 +205,6 @@ impl KiloPreset {
             .or_else(|| candidates.into_iter().next())
     }
 
-    fn is_bash_tool(tool_name: Option<&str>) -> bool {
-        tool_name.is_some_and(|name| matches!(name.to_ascii_lowercase().as_str(), "bash" | "shell"))
-    }
-
     fn insert_metadata(metadata: &mut HashMap<String, String>, key: &str, value: Option<String>) {
         if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
             metadata.insert(key.to_string(), value);
@@ -221,7 +218,15 @@ impl AgentPreset for KiloPreset {
             GitAiError::PresetError(format!("Invalid JSON in hook_input: {error}"))
         })?;
 
-        let is_bash = Self::is_bash_tool(hook_input.tool_name.as_deref());
+        let tool_class = hook_input
+            .tool_name
+            .as_deref()
+            .map(|name| bash_tool::classify_tool(Agent::OpenCode, name))
+            .unwrap_or(ToolClass::Skip);
+        if tool_class == ToolClass::Skip {
+            return Ok(vec![]);
+        }
+        let is_bash = tool_class == ToolClass::Bash;
         let is_pre = hook_input.hook_event_name == "PreToolUse";
 
         let KiloHookInput {
@@ -378,6 +383,49 @@ mod tests {
             }
             _ => panic!("Expected PreFileEdit"),
         }
+    }
+
+    #[test]
+    fn test_kilo_bash_tool_alias_is_not_misclassified_as_a_file_edit() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "kilo-bash-outside-git",
+            "cwd": r"C:\a",
+            "tool_name": "bash_tool",
+            "tool_use_id": "call-bash-1",
+            "tool_input": {
+                "command": "type AGENTS.md",
+                "workdir": r"C:\a",
+                "path": r"C:\a\AGENTS.md"
+            }
+        })
+        .to_string();
+
+        let events = KiloPreset.parse(&input, "t_test").unwrap();
+        let ParsedHookEvent::PreBashCall(event) = &events[0] else {
+            panic!("Expected PreBashCall");
+        };
+        assert_eq!(event.context.cwd, PathBuf::from(r"C:\a"));
+        assert_eq!(event.command.as_deref(), Some("type AGENTS.md"));
+    }
+
+    #[test]
+    fn test_kilo_unknown_tool_is_not_treated_as_a_file_edit() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "kilo-read-outside-git",
+            "cwd": r"C:\a",
+            "tool_name": "read",
+            "tool_use_id": "call-read-1",
+            "tool_input": {"path": r"C:\a\AGENTS.md"}
+        })
+        .to_string();
+
+        let events = KiloPreset.parse(&input, "t_test").unwrap();
+        assert!(
+            events.is_empty(),
+            "read-only tools must not create checkpoints"
+        );
     }
 
     #[test]

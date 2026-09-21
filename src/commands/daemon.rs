@@ -76,7 +76,7 @@ fn handle_start(args: &[String]) -> Result<(), String> {
     ensure_daemon_running_attached(daemon_startup_timeout()).map(|_| ())
 }
 
-fn daemon_startup_timeout() -> Duration {
+pub(crate) fn daemon_startup_timeout() -> Duration {
     #[cfg(windows)]
     {
         if std::env::var_os("GIT_AI_TEST_DB_PATH").is_some()
@@ -103,25 +103,20 @@ fn daemon_startup_timeout() -> Duration {
 /// cause the parent to hang when the daemon outlives it.
 fn ensure_daemon_running_attached(timeout: Duration) -> Result<DaemonConfig, String> {
     let config = daemon_config_from_env_or_default_paths()?;
-    if daemon_is_up(&config) {
-        return Ok(config);
+    let startup_started = Instant::now();
+    let startup_deadline = startup_started + timeout;
+    match wait_for_daemon_ready_or_lock_release(&config, startup_deadline, timeout)? {
+        DaemonStartupAvailability::Ready => return Ok(config),
+        DaemonStartupAvailability::LockAvailable => {}
     }
 
     ensure_daemon_start_allowed()?;
 
     remove_stale_daemon_files(&config);
 
-    if daemon_startup_is_blocked(&config)? {
-        return Err(format!(
-            "daemon startup blocked: lock held at {}",
-            config.lock_path.display()
-        ));
-    }
-
     #[cfg(not(windows))]
     {
         let mut child = spawn_daemon_run_with_piped_stderr(&config)?;
-        let deadline = Instant::now() + timeout;
         loop {
             if daemon_is_up(&config) {
                 return Ok(config);
@@ -138,6 +133,16 @@ fn ensure_daemon_running_attached(timeout: Duration) -> Result<DaemonConfig, Str
                     } else {
                         stderr_buf.trim().to_string()
                     };
+                    if daemon_startup_is_blocked(&config)? {
+                        match wait_for_daemon_ready_or_lock_release(
+                            &config,
+                            startup_deadline,
+                            timeout,
+                        )? {
+                            DaemonStartupAvailability::Ready => return Ok(config),
+                            DaemonStartupAvailability::LockAvailable => {}
+                        }
+                    }
                     return Err(format!("daemon failed to start: {}", detail));
                 }
                 Ok(Some(_)) => {
@@ -145,7 +150,7 @@ fn ensure_daemon_running_attached(timeout: Duration) -> Result<DaemonConfig, Str
                 }
                 _ => {}
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= startup_deadline {
                 return Err(format!(
                     "timed out after {:?} waiting for daemon sockets {} and {}",
                     timeout,
@@ -160,7 +165,8 @@ fn ensure_daemon_running_attached(timeout: Duration) -> Result<DaemonConfig, Str
     #[cfg(windows)]
     {
         spawn_daemon_run_detached(&config)?;
-        if wait_for_daemon_up(&config, timeout) {
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() && wait_for_daemon_up(&config, remaining) {
             return Ok(config);
         }
         Err(format!(
@@ -281,6 +287,37 @@ fn daemon_startup_is_blocked(config: &DaemonConfig) -> Result<bool, String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonStartupAvailability {
+    Ready,
+    LockAvailable,
+}
+
+fn wait_for_daemon_ready_or_lock_release(
+    config: &DaemonConfig,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<DaemonStartupAvailability, String> {
+    loop {
+        if daemon_is_up(config) {
+            return Ok(DaemonStartupAvailability::Ready);
+        }
+        if !daemon_startup_is_blocked(config)? {
+            return Ok(DaemonStartupAvailability::LockAvailable);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "daemon startup timed out after {:?}: lock remained held at {} while the service sockets were unavailable",
+                timeout,
+                config.lock_path.display()
+            ));
+        }
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
+
 pub(crate) fn daemon_is_up(config: &DaemonConfig) -> bool {
     #[cfg(not(windows))]
     {
@@ -318,23 +355,19 @@ fn start_daemon_detached_with_config(
     config: DaemonConfig,
     timeout: Duration,
 ) -> Result<DaemonConfig, String> {
-    if daemon_is_up(&config) {
-        return Ok(config);
+    let startup_deadline = Instant::now() + timeout;
+    match wait_for_daemon_ready_or_lock_release(&config, startup_deadline, timeout)? {
+        DaemonStartupAvailability::Ready => return Ok(config),
+        DaemonStartupAvailability::LockAvailable => {}
     }
 
     ensure_daemon_start_allowed()?;
 
     remove_stale_daemon_files(&config);
 
-    if daemon_startup_is_blocked(&config)? {
-        return Err(format!(
-            "daemon startup blocked: lock held at {}",
-            config.lock_path.display()
-        ));
-    }
-
     spawn_daemon_run_detached(&config)?;
-    if wait_for_daemon_up(&config, timeout) {
+    let remaining = startup_deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() && wait_for_daemon_up(&config, remaining) {
         return Ok(config);
     }
 
@@ -819,6 +852,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::DaemonLock;
 
     #[test]
     fn daemon_startup_lock_io_error_is_not_reported_as_contention() {
@@ -832,5 +866,46 @@ mod tests {
 
         assert!(error.contains("failed to open daemon lock"));
         assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn daemon_startup_waits_for_an_existing_starter_to_release_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DaemonConfig::from_home(dir.path());
+        let held_lock = DaemonLock::acquire(&config.lock_path).unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(75));
+            drop(held_lock);
+        });
+
+        let timeout = Duration::from_secs(1);
+        let availability =
+            wait_for_daemon_ready_or_lock_release(&config, Instant::now() + timeout, timeout)
+                .expect("a released startup lock should let this caller take over");
+
+        releaser.join().unwrap();
+        assert_eq!(availability, DaemonStartupAvailability::LockAvailable);
+    }
+
+    #[test]
+    fn daemon_startup_reports_timeout_only_after_the_lock_stays_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DaemonConfig::from_home(dir.path());
+        let _held_lock = DaemonLock::acquire(&config.lock_path).unwrap();
+        let timeout = Duration::from_millis(60);
+
+        let error =
+            wait_for_daemon_ready_or_lock_release(&config, Instant::now() + timeout, timeout)
+                .expect_err("a permanently held lock with no sockets must time out");
+
+        assert!(error.contains("startup timed out"), "{error}");
+        assert!(
+            error.contains(&config.lock_path.display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains("service sockets were unavailable"),
+            "{error}"
+        );
     }
 }

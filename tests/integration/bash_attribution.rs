@@ -4,7 +4,8 @@ use crate::test_utils::fixture_path;
 use git_ai::authorship::working_log::AgentId;
 use git_ai::commands::checkpoint_agent::bash_tool::{
     BashCheckpointAction, handle_bash_post_tool_use, handle_bash_pre_tool_use_with_context,
-    reset_timeout_overrides_for_test, set_daemon_socket_for_test, set_walk_timeout_ms_for_test,
+    reset_timeout_overrides_for_test, set_changed_paths_snapshot_failure_for_test,
+    set_daemon_socket_for_test,
 };
 use git_ai::daemon::bash_history_db::BashHistoryDatabase;
 use git_ai::metrics::MetricEvent;
@@ -650,7 +651,7 @@ fn test_bash_history_recovers_untracked_lines_when_post_snapshot_fails() {
     let recovered_path = repo_root.join("recovered.txt");
     fs::write(&recovered_path, "recovered by bash\n").unwrap();
 
-    set_walk_timeout_ms_for_test(0);
+    set_changed_paths_snapshot_failure_for_test(true);
     let post_result = handle_bash_post_tool_use(
         &repo_root,
         "recover-bash-session",
@@ -714,7 +715,7 @@ fn test_bash_history_does_not_recover_across_repos_without_path_evidence() {
 
     fs::write(&target_file, "base\nfrom elsewhere\n").unwrap();
 
-    set_walk_timeout_ms_for_test(0);
+    set_changed_paths_snapshot_failure_for_test(true);
     let post_result = handle_bash_post_tool_use(
         &source_root,
         "cross-repo-bash-session",
@@ -775,7 +776,7 @@ fn test_bash_history_recovers_dirty_lines_present_before_bash() {
 
     fs::write(&file_path, "base\ndirty before bash\nbash recovered line\n").unwrap();
 
-    set_walk_timeout_ms_for_test(0);
+    set_changed_paths_snapshot_failure_for_test(true);
     let post_result = handle_bash_post_tool_use(
         &repo_root,
         "recover-mixed-bash-session",
@@ -838,7 +839,7 @@ fn test_bash_history_recovers_shifted_dirty_lines_present_before_bash() {
 
     fs::write(&file_path, "bash recovered line\nbase\ndirty before bash\n").unwrap();
 
-    set_walk_timeout_ms_for_test(0);
+    set_changed_paths_snapshot_failure_for_test(true);
     let post_result = handle_bash_post_tool_use(
         &repo_root,
         "recover-shifted-bash-session",

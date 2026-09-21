@@ -21,10 +21,6 @@ use std::time::Duration;
 /// Prevents indefinite blocking if the daemon becomes unresponsive.
 const DAEMON_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum time to wait for the daemon socket on process start.
-#[cfg(not(any(test, feature = "test-support")))]
-const DAEMON_TELEMETRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Global handle to the daemon control socket for telemetry submission.
 static DAEMON_TELEMETRY_HANDLE: OnceLock<Mutex<Option<DaemonTelemetryHandle>>> = OnceLock::new();
 
@@ -158,7 +154,7 @@ pub fn init_daemon_telemetry_handle() -> DaemonTelemetryInitResult {
     {
         // Ensure the daemon is running before making its socket available to the lazy handle.
         let config = match crate::commands::daemon::ensure_daemon_running(
-            DAEMON_TELEMETRY_CONNECT_TIMEOUT,
+            crate::commands::daemon::daemon_startup_timeout(),
         ) {
             Ok(config) => config,
             Err(e) => {

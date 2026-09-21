@@ -401,6 +401,8 @@ mod tests {
         assert!(content.contains("process.env.KILO_DB"));
         assert!(content.contains("const GIT_AI_BIN = \"/usr/local/bin/git-ai\""));
         assert!(!content.contains("__GIT_AI_BINARY_PATH__"));
+        assert!(content.contains("windowsHide: true"));
+        assert!(content.contains("name === \"bash_tool\""));
         assert!(content.contains("failClosedHook"));
         assert!(!content.contains("swallowHookErrors"));
     }

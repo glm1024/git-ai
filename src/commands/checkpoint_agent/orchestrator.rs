@@ -13,7 +13,7 @@ use crate::git::repository::discover_repository_in_path_no_git_exec;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +56,18 @@ struct RepoContext {
     base_commit: BaseCommit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsupportedContentPolicy {
+    Reject,
+    SkipBinary,
+}
+
+#[derive(Debug)]
+struct CheckpointFilesBuild {
+    files: Vec<CheckpointFile>,
+    skipped_unsupported_paths: HashSet<PathBuf>,
+}
+
 const MAX_CHECKPOINT_FILES: usize = 1000;
 
 fn checkpoint_content_error(path: &Path, reason: impl std::fmt::Display) -> GitAiError {
@@ -78,6 +90,21 @@ fn reject_nul_binary_content(path: &Path, content: &str) -> Result<(), GitAiErro
 
 fn metadata_error_means_file_is_missing(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
+}
+
+fn file_prefix_is_binary(path: &Path) -> Result<bool, std::io::Error> {
+    const BINARY_PROBE_BYTES: u64 = 8192;
+
+    let mut bytes = Vec::with_capacity(BINARY_PROBE_BYTES as usize);
+    fs::File::open(path)?
+        .take(BINARY_PROBE_BYTES)
+        .read_to_end(&mut bytes)?;
+    let contains_invalid_utf8 = match std::str::from_utf8(&bytes) {
+        Ok(_) => false,
+        // A valid multi-byte character may be cut at the probe boundary.
+        Err(error) => error.error_len().is_some(),
+    };
+    Ok(bytes.contains(&0) || contains_invalid_utf8)
 }
 
 fn apply_checkpoint_content_budget(
@@ -134,12 +161,42 @@ fn build_checkpoint_files(
     )
 }
 
+fn build_bash_checkpoint_files(
+    file_paths: &[PathBuf],
+    strict_errors: bool,
+) -> Result<CheckpointFilesBuild, GitAiError> {
+    build_checkpoint_files_with_budget_and_policy(
+        file_paths,
+        None,
+        strict_errors,
+        CheckpointContentBudget::from_config(config::Config::get()),
+        UnsupportedContentPolicy::SkipBinary,
+    )
+}
+
 fn build_checkpoint_files_with_budget(
     file_paths: &[PathBuf],
     dirty_files: Option<&HashMap<PathBuf, String>>,
     strict_errors: bool,
-    mut content_budget: CheckpointContentBudget,
+    content_budget: CheckpointContentBudget,
 ) -> Result<Vec<CheckpointFile>, GitAiError> {
+    Ok(build_checkpoint_files_with_budget_and_policy(
+        file_paths,
+        dirty_files,
+        strict_errors,
+        content_budget,
+        UnsupportedContentPolicy::Reject,
+    )?
+    .files)
+}
+
+fn build_checkpoint_files_with_budget_and_policy(
+    file_paths: &[PathBuf],
+    dirty_files: Option<&HashMap<PathBuf, String>>,
+    strict_errors: bool,
+    mut content_budget: CheckpointContentBudget,
+    unsupported_content_policy: UnsupportedContentPolicy,
+) -> Result<CheckpointFilesBuild, GitAiError> {
     let perf = std::env::var("GIT_AI_DEBUG_PERFORMANCE").is_ok_and(|v| !v.is_empty() && v != "0");
 
     if file_paths.len() > MAX_CHECKPOINT_FILES {
@@ -153,6 +210,7 @@ fn build_checkpoint_files_with_budget(
 
     let mut repo_cache: HashMap<PathBuf, RepoContext> = HashMap::new();
     let mut files = Vec::new();
+    let mut skipped_unsupported_paths = HashSet::new();
     let max_size = content_budget.max_file_size_bytes();
 
     for path in capped_paths {
@@ -208,6 +266,26 @@ fn build_checkpoint_files_with_budget(
         let content = match fs::metadata(path) {
             Ok(meta) => {
                 if meta.len() as usize > max_size {
+                    if unsupported_content_policy == UnsupportedContentPolicy::SkipBinary {
+                        match file_prefix_is_binary(path) {
+                            Ok(true) => {
+                                tracing::debug!(
+                                    "skipping binary Bash checkpoint path larger than the content limit: {}",
+                                    path.display()
+                                );
+                                skipped_unsupported_paths.insert(path.clone());
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(error) if strict_errors && !override_available => {
+                                return Err(checkpoint_content_error(
+                                    path,
+                                    format!("failed to inspect file content: {error}"),
+                                ));
+                            }
+                            Err(_) => {}
+                        }
+                    }
                     let reason = format!(
                         "file has {} bytes, exceeding the per-file checkpoint limit of {} bytes",
                         meta.len(),
@@ -226,6 +304,17 @@ fn build_checkpoint_files_with_budget(
                 match fs::read_to_string(path) {
                     Ok(content) => Some(content),
                     Err(error) => {
+                        if error.kind() == std::io::ErrorKind::InvalidData
+                            && !override_available
+                            && unsupported_content_policy == UnsupportedContentPolicy::SkipBinary
+                        {
+                            tracing::debug!(
+                                "skipping binary or non-UTF-8 Bash checkpoint path: {}",
+                                path.display()
+                            );
+                            skipped_unsupported_paths.insert(path.clone());
+                            continue;
+                        }
                         if strict_errors && !override_available {
                             let reason = if error.kind() == std::io::ErrorKind::InvalidData {
                                 format!("file is binary or not valid UTF-8: {error}")
@@ -260,11 +349,21 @@ fn build_checkpoint_files_with_budget(
             );
         }
 
-        if strict_errors
-            && !override_available
+        if !override_available
             && let Some(content) = content.as_ref()
+            && content.as_bytes().contains(&0)
         {
-            reject_nul_binary_content(path, content)?;
+            if unsupported_content_policy == UnsupportedContentPolicy::SkipBinary {
+                tracing::debug!(
+                    "skipping NUL-containing Bash checkpoint path: {}",
+                    path.display()
+                );
+                skipped_unsupported_paths.insert(path.clone());
+                continue;
+            }
+            if strict_errors {
+                reject_nul_binary_content(path, content)?;
+            }
         }
 
         let content = match content {
@@ -288,7 +387,10 @@ fn build_checkpoint_files_with_budget(
         });
     }
 
-    Ok(files)
+    Ok(CheckpointFilesBuild {
+        files,
+        skipped_unsupported_paths,
+    })
 }
 
 pub fn execute_preset_checkpoint(
@@ -594,6 +696,28 @@ fn execute_pre_bash_call(
     };
 
     let started_at_ns = crate::daemon::bash_history_db::unix_time_ns();
+    if worktree_root_for_path(e.context.cwd.as_path()).is_none() {
+        let error_message = format!(
+            "No git repository found for Bash working directory: {}",
+            e.context.cwd.display()
+        );
+        let _ = bash_tool::signal_daemon_bash_hook_attempt(
+            BashHookAttemptPhase::Start,
+            BashHookAttemptSignal {
+                original_cwd: e.context.cwd.as_path(),
+                discovered_repo_work_dir: None,
+                repo_discovery_error: Some(&error_message),
+                session_id: &e.context.external_session_id,
+                tool_use_id: &e.tool_use_id,
+                agent_id: &e.context.agent_id,
+                metadata: &e.context.metadata,
+                trace_id: &e.context.trace_id,
+                timestamp_ns: started_at_ns,
+                command: e.command.as_deref(),
+            },
+        );
+        return Ok(vec![]);
+    }
     let repo_work_dir = match discover_repository_in_path_no_git_exec(e.context.cwd.as_path())
         .and_then(|repo| repo.workdir())
     {
@@ -709,9 +833,18 @@ fn execute_pre_bash_call(
         }]);
     }
 
-    let files = build_checkpoint_files(&dirty_paths, None, strict_errors)?;
+    let checkpoint_files = build_bash_checkpoint_files(&dirty_paths, strict_errors)?;
+    let expected_paths: Vec<PathBuf> = dirty_paths
+        .iter()
+        .filter(|path| {
+            !checkpoint_files
+                .skipped_unsupported_paths
+                .contains(path.as_path())
+        })
+        .cloned()
+        .collect();
     let requests = split_files_into_requests(
-        files,
+        checkpoint_files.files,
         e.context.trace_id,
         CheckpointKind::Human,
         Some(e.context.agent_id),
@@ -720,7 +853,7 @@ fn execute_pre_bash_call(
         metadata,
     );
     if strict_errors {
-        ensure_strict_file_coverage(&dirty_paths, &requests, "Bash pre-tool")?;
+        ensure_strict_file_coverage(&expected_paths, &requests, "Bash pre-tool")?;
     }
     Ok(requests)
 }
@@ -734,6 +867,28 @@ fn execute_post_bash_call(
     };
 
     let ended_at_ns = crate::daemon::bash_history_db::unix_time_ns();
+    if worktree_root_for_path(e.context.cwd.as_path()).is_none() {
+        let error_message = format!(
+            "No git repository found for Bash working directory: {}",
+            e.context.cwd.display()
+        );
+        let _ = bash_tool::signal_daemon_bash_hook_attempt(
+            BashHookAttemptPhase::End,
+            BashHookAttemptSignal {
+                original_cwd: e.context.cwd.as_path(),
+                discovered_repo_work_dir: None,
+                repo_discovery_error: Some(&error_message),
+                session_id: &e.context.external_session_id,
+                tool_use_id: &e.tool_use_id,
+                agent_id: &e.context.agent_id,
+                metadata: &e.context.metadata,
+                trace_id: &e.context.trace_id,
+                timestamp_ns: ended_at_ns,
+                command: e.command.as_deref(),
+            },
+        );
+        return Ok(vec![]);
+    }
     let repo_work_dir = match discover_repository_in_path_no_git_exec(e.context.cwd.as_path())
         .and_then(|repo| repo.workdir())
     {
@@ -834,7 +989,16 @@ fn execute_post_bash_call(
         }
     };
 
-    let files = build_checkpoint_files(&file_paths, None, strict_errors)?;
+    let checkpoint_files = build_bash_checkpoint_files(&file_paths, strict_errors)?;
+    let expected_paths: Vec<PathBuf> = file_paths
+        .iter()
+        .filter(|path| {
+            !checkpoint_files
+                .skipped_unsupported_paths
+                .contains(path.as_path())
+        })
+        .cloned()
+        .collect();
     let mut metadata = e.context.metadata;
     metadata
         .entry("tool_use_id".to_string())
@@ -843,7 +1007,7 @@ fn execute_post_bash_call(
         .entry("edit_kind".to_string())
         .or_insert_with(|| "bash".to_string());
     let requests = split_files_into_requests(
-        files,
+        checkpoint_files.files,
         e.context.trace_id,
         CheckpointKind::AiAgent,
         Some(e.context.agent_id),
@@ -852,7 +1016,7 @@ fn execute_post_bash_call(
         metadata,
     );
     if strict_errors {
-        ensure_strict_file_coverage(&file_paths, &requests, "Bash post-tool")?;
+        ensure_strict_file_coverage(&expected_paths, &requests, "Bash post-tool")?;
     }
     Ok(requests)
 }
@@ -890,6 +1054,43 @@ mod strict_mode_tests {
         assert!(strict_bash_action_error(&BashCheckpointAction::MissingPreSnapshot).is_some());
         assert!(strict_bash_action_error(&BashCheckpointAction::NoChanges).is_none());
         assert!(strict_bash_action_error(&BashCheckpointAction::Checkpoint(vec![])).is_none());
+    }
+
+    #[test]
+    fn strict_bash_outside_git_is_an_out_of_scope_noop() {
+        let outside = tempfile::tempdir().unwrap();
+        for preset in ["kilo", "opencode"] {
+            for hook_event_name in ["PreToolUse", "PostToolUse"] {
+                let hook_input = json!({
+                    "hook_event_name": hook_event_name,
+                    "session_id": "session-outside-git",
+                    "tool_use_id": "call-outside-git",
+                    "cwd": outside.path(),
+                    "tool_name": "bash",
+                    "tool_input": {
+                        "command": "printf test",
+                        "workdir": outside.path(),
+                        "path": outside.path().join("tools/git-helper.exe")
+                    }
+                })
+                .to_string();
+
+                let requests = execute_preset_checkpoint_strict(preset, &hook_input)
+                    .expect("a Bash call outside Git is outside checkpoint scope");
+                assert!(requests.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn repository_discovery_does_not_require_a_remote() {
+        let repo = TmpRepo::new().unwrap();
+        assert!(repo.git_command(&["remote"]).unwrap().trim().is_empty());
+
+        let workdir = discover_repository_in_path_no_git_exec(repo.path())
+            .and_then(|repository| repository.workdir())
+            .expect("a local Git repository without remotes is still checkpointable");
+        assert_eq!(workdir, repo.path());
     }
 
     #[test]
@@ -1023,6 +1224,99 @@ mod strict_mode_tests {
         let message = error.to_string();
         assert!(message.contains(&path.display().to_string()), "{message}");
         assert!(message.contains("binary or not valid UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn strict_bash_build_skips_non_utf8_binary_and_keeps_text_files() {
+        let repo = TmpRepo::new().unwrap();
+        let text = repo
+            .write_file("src/main.rs", "fn main() {}\n", false)
+            .unwrap();
+        let spreadsheet = repo.path().join("test_result_analysis.xlsx");
+        fs::write(&spreadsheet, [0x50, 0x4b, 0x03, 0x04, 0x00, 0xff]).unwrap();
+        let nul_binary = repo.path().join("nul-binary.dat");
+        fs::write(&nul_binary, b"valid utf-8\0binary").unwrap();
+
+        let build = build_checkpoint_files_with_budget_and_policy(
+            &[text.clone(), spreadsheet.clone(), nul_binary.clone()],
+            None,
+            true,
+            CheckpointContentBudget::with_limits(1024, 2048, 1000),
+            UnsupportedContentPolicy::SkipBinary,
+        )
+        .expect("binary Bash neighbors are outside line-attribution scope");
+
+        assert_eq!(build.files.len(), 1);
+        assert_eq!(build.files[0].path, text);
+        assert_eq!(
+            build.skipped_unsupported_paths,
+            HashSet::from([spreadsheet, nul_binary])
+        );
+    }
+
+    #[test]
+    fn strict_bash_build_skips_large_binary_without_reading_it_as_text() {
+        let repo = TmpRepo::new().unwrap();
+        let spreadsheet = repo.path().join("large.xlsx");
+        let mut bytes = vec![0; 128];
+        bytes[..4].copy_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+        fs::write(&spreadsheet, bytes).unwrap();
+
+        let build = build_checkpoint_files_with_budget_and_policy(
+            std::slice::from_ref(&spreadsheet),
+            None,
+            true,
+            CheckpointContentBudget::with_limits(16, 1024, 1000),
+            UnsupportedContentPolicy::SkipBinary,
+        )
+        .expect("large binary Bash paths should not consume the text content budget");
+
+        assert!(build.files.is_empty());
+        assert_eq!(
+            build.skipped_unsupported_paths,
+            HashSet::from([spreadsheet])
+        );
+    }
+
+    #[test]
+    fn strict_bash_build_still_rejects_oversized_text() {
+        let repo = TmpRepo::new().unwrap();
+        let text = repo
+            .write_file("large.txt", &"x".repeat(128), false)
+            .unwrap();
+
+        let error = build_checkpoint_files_with_budget_and_policy(
+            std::slice::from_ref(&text),
+            None,
+            true,
+            CheckpointContentBudget::with_limits(16, 1024, 1000),
+            UnsupportedContentPolicy::SkipBinary,
+        )
+        .expect_err("binary exclusion must not hide text content-limit failures");
+
+        let message = error.to_string();
+        assert!(message.contains(&text.display().to_string()), "{message}");
+        assert!(message.contains("per-file checkpoint limit"), "{message}");
+    }
+
+    #[test]
+    fn strict_bash_binary_probe_does_not_misclassify_split_utf8_text() {
+        let repo = TmpRepo::new().unwrap();
+        let text = repo.path().join("large-utf8.txt");
+        fs::write(&text, format!("{}中", "x".repeat(8191))).unwrap();
+
+        let error = build_checkpoint_files_with_budget_and_policy(
+            std::slice::from_ref(&text),
+            None,
+            true,
+            CheckpointContentBudget::with_limits(16, 16384, 1000),
+            UnsupportedContentPolicy::SkipBinary,
+        )
+        .expect_err("a UTF-8 character split at the probe boundary is still text");
+
+        let message = error.to_string();
+        assert!(message.contains(&text.display().to_string()), "{message}");
+        assert!(message.contains("per-file checkpoint limit"), "{message}");
     }
 
     #[test]

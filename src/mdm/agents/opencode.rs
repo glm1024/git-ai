@@ -308,6 +308,7 @@ mod tests {
         assert!(content.contains("\"tool.execute.after\""));
         assert!(content.contains("FILE_EDIT_TOOLS"));
         assert!(content.contains("isBashTool"));
+        assert!(content.contains("name === \"bash_tool\""));
         assert!(content.contains("apply_patch"));
         // Template contains placeholder for binary path
         assert!(content.contains("__GIT_AI_BINARY_PATH__"));
@@ -345,6 +346,7 @@ mod tests {
         assert!(content.contains(r#"const GIT_AI_BIN = "/usr/local/bin/git-ai""#));
         // Checkpoint execution uses spawn(), which works in OpenCode CLI and Desktop.
         assert!(content.contains("spawn(GIT_AI_BIN"));
+        assert!(content.contains("windowsHide: true"));
         assert!(
             content.contains(
                 r#""checkpoint", "opencode", "--strict-errors", "--hook-input", "stdin""#

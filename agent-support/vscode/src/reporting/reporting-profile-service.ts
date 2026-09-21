@@ -1,6 +1,7 @@
 import { spawn } from "child_process";
 import * as vscode from "vscode";
 import { getGitAiBinary, resolveGitAiBinary } from "../utils/binary-path";
+import { HIDDEN_WINDOWS_PROCESS_OPTIONS } from "../utils/process-options";
 import {
   DEFAULT_METRICS_API_BASE_URL,
   emptyReportingProfile,
@@ -175,7 +176,7 @@ export class ReportingProfileService {
     await resolveGitAiBinary();
     return new Promise((resolve, reject) => {
       const child = spawn(getGitAiBinary(), args, {
-        windowsHide: true,
+        ...HIDDEN_WINDOWS_PROCESS_OPTIONS,
         stdio: ["pipe", "pipe", "pipe"],
       });
       let stdout = "";

@@ -44,11 +44,16 @@ const APPLY_PATCH_FILE_PREFIXES = [
   "*** Move to: ",
 ]
 
-const isEditTool = (toolName: string): boolean => FILE_EDIT_TOOLS.has(toolName.toLowerCase())
+const normalizeToolName = (toolName: string): string => {
+  const lower = toolName.toLowerCase()
+  return lower.startsWith("functions.") ? lower.slice("functions.".length) : lower
+}
+
+const isEditTool = (toolName: string): boolean => FILE_EDIT_TOOLS.has(normalizeToolName(toolName))
 
 const isBashTool = (toolName: string): boolean => {
-  const name = toolName.toLowerCase()
-  return name === "bash" || name === "shell"
+  const name = normalizeToolName(toolName)
+  return name === "bash" || name === "shell" || name === "bash_tool"
 }
 
 const normalizePath = (rawPath: string, cwd?: string): string | null => {
@@ -248,6 +253,7 @@ const runCheckpoint = (hookInput: string): Promise<void> => {
     }
 
     const child = spawn(GIT_AI_BIN, CHECKPOINT_ARGS, {
+      windowsHide: true,
       stdio: ["pipe", "ignore", "pipe"],
     })
 

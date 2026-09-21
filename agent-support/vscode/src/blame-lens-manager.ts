@@ -3,6 +3,7 @@ import { BlameService, BlameResult, BlameMetadata, LineBlameInfo } from "./blame
 import { Config, BlameMode } from "./utils/config";
 import { findRepoForFile } from "./utils/git-api";
 import { resolveGitAiBinary } from "./utils/binary-path";
+import { HIDDEN_WINDOWS_PROCESS_OPTIONS } from "./utils/process-options";
 
 export class BlameLensManager {
   private context: vscode.ExtensionContext;
@@ -231,7 +232,7 @@ export class BlameLensManager {
     resolveGitAiBinary().then((path) => {
       if (path) {
         const { execFile } = require('child_process');
-        execFile(path, ['--version'], (err: Error | null, stdout: string) => {
+        execFile(path, ['--version'], HIDDEN_WINDOWS_PROCESS_OPTIONS, (err: Error | null, stdout: string) => {
           if (!err) {
             console.log('[git-ai] Version:', stdout.trim());
           }
@@ -1514,6 +1515,7 @@ export class BlameLensManager {
       // Run git show to get the commit diff
       const diffOutput = await new Promise<string>((resolve, reject) => {
         const proc = spawn('git', ['show', '--color=never', commitSha], {
+          ...HIDDEN_WINDOWS_PROCESS_OPTIONS,
           cwd: workspacePath
         });
         

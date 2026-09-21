@@ -1107,6 +1107,7 @@ fn test_diff_no_gitignore_includes_all_new_files() {
         taken_at: None,
         invocation_key: "test:1".to_string(),
         repo_root: PathBuf::from("/tmp"),
+        head: None,
         effective_worktree_wm: None,
         per_file_wm: HashMap::new(),
     };
@@ -1142,6 +1143,7 @@ fn test_diff_no_gitignore_includes_all_new_files() {
         taken_at: None,
         invocation_key: "test:2".to_string(),
         repo_root: PathBuf::from("/tmp"),
+        head: None,
         effective_worktree_wm: None,
         per_file_wm: HashMap::new(),
     };

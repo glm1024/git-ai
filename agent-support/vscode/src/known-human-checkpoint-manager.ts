@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { spawn } from "child_process";
 import { getGitAiBinary } from "./utils/binary-path";
 import { getGitRepoRoot } from "./utils/git-api";
+import { HIDDEN_WINDOWS_PROCESS_OPTIONS } from "./utils/process-options";
 
 /**
  * Fires a `git-ai checkpoint known_human --hook-input stdin` whenever a
@@ -121,6 +122,7 @@ export class KnownHumanCheckpointManager {
     console.log("[git-ai] KnownHumanCheckpointManager: Firing known_human checkpoint for", editedFilepaths);
 
     const proc = spawn(getGitAiBinary(), ["checkpoint", "known_human", "--hook-input", "stdin"], {
+      ...HIDDEN_WINDOWS_PROCESS_OPTIONS,
       cwd: repoRoot,
     });
 

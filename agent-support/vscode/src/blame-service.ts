@@ -3,6 +3,7 @@ import { spawn } from "child_process";
 import { BlameQueue } from "./blame-queue";
 import { findRepoForFile, getGitRepoRoot } from "./utils/git-api";
 import { getGitAiBinary, resolveGitAiBinary } from "./utils/binary-path";
+import { HIDDEN_WINDOWS_PROCESS_OPTIONS } from "./utils/process-options";
 
 export interface BlameMetadata {
   is_logged_in: boolean;
@@ -243,6 +244,7 @@ export class BlameService {
       const binary = getGitAiBinary();
       console.log('[git-ai] Spawning blame:', { binary, args, cwd });
       const proc = spawn(binary, args, {
+        ...HIDDEN_WINDOWS_PROCESS_OPTIONS,
         cwd,
         timeout: BlameService.TIMEOUT_MS,
       });
@@ -399,6 +401,7 @@ export class BlameService {
     return new Promise((resolve) => {
       const args = ['show-prompt', promptId];
       const proc = spawn(getGitAiBinary(), args, {
+        ...HIDDEN_WINDOWS_PROCESS_OPTIONS,
         cwd,
         timeout: 15000,
       });
@@ -472,5 +475,4 @@ export class BlameService {
     return undefined;
   }
 }
-
 

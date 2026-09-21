@@ -2,8 +2,7 @@
 //!
 //! Verifies that:
 //! - A snapshot walk that exceeds WALK_TIMEOUT returns `Err` immediately.
-//! - A pre-hook walk timeout propagates as `Err` (orchestrator handles gracefully).
-//! - A post-hook walk timeout returns `BashCheckpointAction::SnapshotFailed`.
+//! - Production pre/post hooks do not depend on the legacy full-tree walk timeout.
 //! - A hook-level timeout (the 4 s hard limit) returns `HookTimeout` on the post-hook.
 //!
 //! Timeouts are injected via thread-local overrides so parallel tests in other
@@ -75,10 +74,10 @@ fn test_snapshot_walk_timeout_returns_err() {
     );
 }
 
-/// A walk timeout during pre-hook propagates as Err — the orchestrator
-/// handles this gracefully by returning Ok(vec![]).
+/// Production pre-hooks snapshot only Git-reported changed paths, so the
+/// legacy full-tree walk timeout must not be able to block a Bash command.
 #[test]
-fn test_pre_hook_walk_timeout_returns_err() {
+fn test_pre_hook_does_not_depend_on_full_walk_timeout() {
     let repo = TestRepo::new();
     let root = repo_root(&repo);
 
@@ -94,15 +93,13 @@ fn test_pre_hook_walk_timeout_returns_err() {
     );
     reset_timeout_overrides_for_test();
 
-    assert!(
-        result.is_err(),
-        "pre-hook should return Err on walk timeout"
-    );
+    result.expect("pre-hook should not use the legacy full-tree walker");
 }
 
-/// A walk timeout during the post-hook must return SnapshotFailed, not Err.
+/// Production post-hooks use the same changed-path snapshot and still detect
+/// a file changed by Bash when the legacy walker is forced to time out.
 #[test]
-fn test_post_hook_walk_timeout_returns_snapshot_failed() {
+fn test_post_hook_does_not_depend_on_full_walk_timeout() {
     let repo = TestRepo::new();
     let root = repo_root(&repo);
 
@@ -133,12 +130,14 @@ fn test_post_hook_walk_timeout_returns_snapshot_failed() {
     );
     reset_timeout_overrides_for_test();
 
-    let r = result.expect("post-hook must not return Err on walk timeout");
-    assert!(
-        matches!(r.action, BashCheckpointAction::SnapshotFailed),
-        "post-hook walk timeout should yield SnapshotFailed; got {:?}",
-        r.action
-    );
+    let r = result.expect("post-hook should not use the legacy full-tree walker");
+    match r.action {
+        BashCheckpointAction::Checkpoint(paths) => assert!(
+            paths.iter().any(|path| path.ends_with("changed.txt")),
+            "post-hook should detect changed.txt; got {paths:?}"
+        ),
+        action => panic!("post-hook should checkpoint changed.txt; got {action:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

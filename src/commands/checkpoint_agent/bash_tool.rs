@@ -15,7 +15,7 @@ use crate::utils::normalize_to_posix;
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,6 +51,7 @@ const HOOK_TIMEOUT_MS: u64 = 4000;
 std::thread_local! {
     static TEST_WALK_TIMEOUT_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_HOOK_TIMEOUT_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEST_CHANGED_PATHS_SNAPSHOT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_DAEMON_SOCKET: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -86,6 +87,14 @@ pub fn set_hook_timeout_ms_for_test(ms: u64) {
     TEST_HOOK_TIMEOUT_MS.with(|c| c.set(Some(ms)));
 }
 
+/// Force the production changed-path snapshot to fail in the current test
+/// thread. This keeps recovery/error-path coverage independent of the legacy
+/// full-tree walker timeout.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_changed_paths_snapshot_failure_for_test(enabled: bool) {
+    TEST_CHANGED_PATHS_SNAPSHOT_FAILURE.with(|value| value.set(enabled));
+}
+
 /// Override the daemon control socket path for the current thread.
 /// This avoids process-global env vars that race in parallel tests.
 #[cfg(any(test, feature = "test-support"))]
@@ -100,6 +109,7 @@ pub fn set_daemon_socket_for_test(path: std::path::PathBuf) {
 pub fn reset_timeout_overrides_for_test() {
     TEST_WALK_TIMEOUT_MS.with(|c| c.set(None));
     TEST_HOOK_TIMEOUT_MS.with(|c| c.set(None));
+    TEST_CHANGED_PATHS_SNAPSHOT_FAILURE.with(|value| value.set(false));
 }
 
 /// Resolve the daemon control socket path, preferring the thread-local test
@@ -211,16 +221,15 @@ impl StatEntry {
     }
 }
 
-/// A complete filesystem snapshot: stat-tuples keyed by normalized path.
+/// A filesystem snapshot: stat-tuples keyed by normalized path.
 ///
-/// Only stores entries for files that pass the git-ai ignore filter AND have
-/// `mtime > effective_worktree_wm + GRACE` (i.e., not covered by any watermark).
-/// Filtering is applied uniformly to all files — there is no special treatment
-/// for git-tracked vs untracked files.
+/// The legacy full-tree producer stores non-watermark-covered files. The
+/// production Bash-hook producer stores all Git-dirty files so it can compare
+/// already-dirty paths across the tool call; its watermark fields separately
+/// control which pre-hook paths still need a Human checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatSnapshot {
-    /// File metadata for files that passed the ignore filter and are not
-    /// covered by any watermark at snapshot time.
+    /// File metadata selected by the snapshot producer after ignore filtering.
     pub entries: HashMap<PathBuf, StatEntry>,
     /// When this snapshot was taken.
     #[serde(skip)]
@@ -229,6 +238,11 @@ pub struct StatSnapshot {
     pub invocation_key: String,
     /// Repo root path.
     pub repo_root: PathBuf,
+    /// HEAD captured with this filesystem state. Production Bash snapshots use
+    /// it to include files committed during the tool call even when the
+    /// working tree is clean again by the post-hook.
+    #[serde(default)]
+    pub head: Option<String>,
     /// Effective worktree-level watermark at snapshot time.
     /// Either the real daemon worktree watermark (warm start) or the mtime
     /// of `.git/index` (cold-start proxy).  `None` if neither was available.
@@ -340,9 +354,11 @@ pub fn classify_tool(agent: Agent, tool_name: &str) -> ToolClass {
             "Bash" | "shell_command" => ToolClass::Bash,
             _ => ToolClass::Skip,
         },
-        Agent::OpenCode => match tool_name {
-            "edit" | "write" => ToolClass::FileEdit,
-            "bash" | "shell" => ToolClass::Bash,
+        Agent::OpenCode => match normalize_tool_name(tool_name).to_ascii_lowercase().as_str() {
+            "edit" | "write" | "patch" | "multiedit" | "apply_patch" | "applypatch" => {
+                ToolClass::FileEdit
+            }
+            "bash" | "shell" | "bash_tool" => ToolClass::Bash,
             _ => ToolClass::Skip,
         },
         Agent::Firebender => match tool_name {
@@ -694,6 +710,108 @@ pub fn snapshot(
         taken_at: Some(Instant::now()),
         invocation_key,
         repo_root: repo_root.to_path_buf(),
+        head: crate::git::repo_state::read_head_state_for_worktree(repo_root)
+            .and_then(|state| state.head),
+        effective_worktree_wm,
+        per_file_wm,
+    })
+}
+
+/// Take a production Bash-hook snapshot scoped to paths that Git currently
+/// reports as changed.
+///
+/// Comparing two of these snapshots preserves the stat-diff semantics without
+/// walking every file in the repository:
+/// - a path absent before and present after became dirty during the Bash call;
+/// - a path present in both whose stat tuple changed was already dirty and was
+///   modified again by the Bash call;
+/// - a pre-dirty path absent from the post status but still on disk was restored
+///   to a clean state; a missing path is a deletion and has no new content.
+///
+/// Git performs its own optimized index/worktree refresh and returns only
+/// tracked changes plus non-ignored untracked files. The git-ai ignore rules
+/// are applied afterwards so this has the same attribution scope as
+/// `snapshot()`.
+fn changed_paths_snapshot(
+    repo_root: &Path,
+    session_id: &str,
+    tool_use_id: &str,
+    wm: Option<&DaemonWatermarks>,
+    committed_since: Option<Option<&str>>,
+) -> Result<StatSnapshot, GitAiError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if TEST_CHANGED_PATHS_SNAPSHOT_FAILURE.with(|value| value.get()) {
+        return Err(GitAiError::Generic(
+            "test-injected changed-path snapshot failure".to_string(),
+        ));
+    }
+
+    let start = Instant::now();
+    let invocation_key = format!("{}:{}", session_id, tool_use_id);
+    let effective_worktree_wm: Option<u128> = match wm {
+        Some(w) if w.worktree.is_some() => w.worktree,
+        Some(_) => git_index_mtime_ns(repo_root),
+        None => None,
+    };
+    let per_file_wm: HashMap<String, u128> = wm.map(|w| w.per_file.clone()).unwrap_or_default();
+    let gitignore_filter = build_gitignore(repo_root)?;
+    let mut entries = HashMap::new();
+    let head = crate::git::repo_state::read_head_state_for_worktree(repo_root)
+        .and_then(|state| state.head);
+    let mut changed_paths: HashSet<String> = git_status_fallback(repo_root)?.into_iter().collect();
+    if let Some(baseline_head) = committed_since {
+        changed_paths.extend(git_paths_changed_between_heads(
+            repo_root,
+            baseline_head,
+            head.as_deref(),
+        )?);
+    }
+
+    for changed_path in changed_paths {
+        let rel_path = PathBuf::from(changed_path);
+        if !should_include_new_file(&gitignore_filter, &rel_path, false) {
+            continue;
+        }
+
+        let abs_path = repo_root.join(&rel_path);
+        let meta = match fs::symlink_metadata(&abs_path) {
+            Ok(meta) => meta,
+            // Deleted paths have no post-call content to attribute. This is
+            // the same deletion behavior as the full-tree snapshot diff.
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to stat changed path {}: {}",
+                    abs_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        if meta.is_dir() {
+            continue;
+        }
+
+        let normalized = normalize_path(&rel_path);
+        entries.insert(normalized, StatEntry::from_metadata(&meta));
+        if entries.len() > MAX_TRACKED_FILES {
+            return Err(GitAiError::Generic(format!(
+                "repo has more than {} changed files; skipping stat-diff",
+                MAX_TRACKED_FILES
+            )));
+        }
+    }
+
+    tracing::debug!(
+        "Changed-path snapshot: {} files captured in {}ms",
+        entries.len(),
+        start.elapsed().as_millis()
+    );
+    Ok(StatSnapshot {
+        entries,
+        taken_at: Some(Instant::now()),
+        invocation_key,
+        repo_root: repo_root.to_path_buf(),
+        head,
         effective_worktree_wm,
         per_file_wm,
     })
@@ -709,16 +827,14 @@ pub fn snapshot(
 /// any file in `post.entries` already passed that filter. No secondary
 /// filtering is needed here.
 ///
-/// Files in post but not pre are reported as **created** (either genuinely
-/// new, or previously wm-covered and now modified by bash — both are changed
-/// files that need attribution).  Files in both with a changed stat-tuple are
-/// reported as **modified**.  Deletions are not tracked.
+/// Files in post but not pre are reported as **created**. Files in both with a
+/// changed stat-tuple are reported as **modified**. Pre-only paths that still
+/// exist were restored clean and are also reported as modified; true deletions
+/// are not tracked.
 pub fn diff(pre: &StatSnapshot, post: &StatSnapshot) -> StatDiffResult {
     let mut result = StatDiffResult::default();
 
-    // Files in post but not pre: new files or previously wm-covered files
-    // now modified by bash. Both need attribution; the distinction doesn't
-    // matter since all_changed_paths() merges created + modified.
+    // Files in post but not pre became dirty or were committed during Bash.
     for path in post.entries.keys() {
         if !pre.entries.contains_key(path) {
             result.created.push(path.clone());
@@ -729,6 +845,18 @@ pub fn diff(pre: &StatSnapshot, post: &StatSnapshot) -> StatDiffResult {
     for (path, post_entry) in &post.entries {
         if let Some(pre_entry) = pre.entries.get(path)
             && pre_entry != post_entry
+        {
+            result.modified.push(path.clone());
+        }
+    }
+
+    // A pre-existing dirty path can disappear from `git status` because Bash
+    // restored it to HEAD. If the path still exists, that is a content/state
+    // transition worth checkpointing; true deletions remain intentionally
+    // untracked, matching the previous full-tree diff behavior.
+    for path in pre.entries.keys() {
+        if !post.entries.contains_key(path)
+            && fs::symlink_metadata(post.repo_root.join(path)).is_ok()
         {
             result.modified.push(path.clone());
         }
@@ -811,6 +939,65 @@ pub fn git_status_fallback(repo_root: &Path) -> Result<Vec<String>, GitAiError> 
     }
 
     Ok(changed_files)
+}
+
+/// Return paths whose committed content changed while a Bash tool was active.
+/// These paths may be absent from `git status` at post-hook time because a
+/// command created, staged, and committed them before returning.
+fn git_paths_changed_between_heads(
+    repo_root: &Path,
+    baseline_head: Option<&str>,
+    current_head: Option<&str>,
+) -> Result<Vec<String>, GitAiError> {
+    let Some(current_head) = current_head else {
+        return Ok(Vec::new());
+    };
+    if baseline_head == Some(current_head) {
+        return Ok(Vec::new());
+    }
+
+    let mut args = vec![
+        "-C".to_string(),
+        repo_root.to_string_lossy().into_owned(),
+        "--no-optional-locks".to_string(),
+    ];
+    match baseline_head {
+        Some(baseline_head) => args.extend([
+            "diff".to_string(),
+            "--name-only".to_string(),
+            "--no-renames".to_string(),
+            "-z".to_string(),
+            baseline_head.to_string(),
+            current_head.to_string(),
+            "--".to_string(),
+        ]),
+        None => args.extend([
+            "diff-tree".to_string(),
+            "--root".to_string(),
+            "--no-commit-id".to_string(),
+            "--name-only".to_string(),
+            "--no-renames".to_string(),
+            "-r".to_string(),
+            "-z".to_string(),
+            current_head.to_string(),
+            "--".to_string(),
+        ]),
+    }
+
+    let output = crate::git::repository::exec_git_allow_nonzero(&args)?;
+    if !output.status.success() {
+        return Err(GitAiError::Generic(format!(
+            "git diff for Bash head transition failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| normalize_to_posix(&String::from_utf8_lossy(path)))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,26 +1271,33 @@ pub fn handle_bash_pre_tool_use_with_context_and_cwd(
             worktree: Some(ts),
         })
     });
-    let snap = snapshot(
+    let snap = changed_paths_snapshot(
         repo_root,
         context.session_id,
         context.tool_use_id,
         wm.as_ref(),
+        None,
     )?;
 
-    // When watermarks are unavailable (no daemon + no .git/index), the snapshot
-    // contains every non-ignored file in the repo. Using that as dirty_paths
-    // would trigger per-file repo discovery + file reads in
-    // build_checkpoint_files — catastrophic on large repos. Fall back to git
-    // status which only reports actually changed files.
-    let dirty_paths: Vec<PathBuf> = if wm.is_none() {
-        git_status_fallback(repo_root)?
-            .into_iter()
-            .map(|p| repo_root.join(p))
-            .collect()
-    } else {
-        snap.entries.keys().map(|rel| repo_root.join(rel)).collect()
-    };
+    // The daemon watermark controls which pre-existing changes still need a
+    // Human checkpoint. Keep every Git-dirty path in the stored snapshot so
+    // post-hook diffing can still detect a Bash rewrite of an already-dirty
+    // file, including edits inside the filesystem timestamp grace window.
+    let dirty_paths: Vec<PathBuf> = snap
+        .entries
+        .iter()
+        .filter_map(|(rel, stat)| {
+            let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
+            let posix_key = normalize_to_posix(&rel.to_string_lossy());
+            (!is_wm_covered(
+                mtime_ns,
+                snap.effective_worktree_wm,
+                &snap.per_file_wm,
+                &posix_key,
+            ))
+            .then(|| repo_root.join(rel))
+        })
+        .collect();
 
     let socket = effective_daemon_socket().ok_or_else(|| {
         GitAiError::Generic("no daemon socket available for BashSessionStart".into())
@@ -1226,11 +1420,12 @@ pub fn handle_bash_post_tool_use_with_cwd(
                 } else {
                     None
                 };
-            let result = match snapshot(
+            let result = match changed_paths_snapshot(
                 repo_root,
                 context.session_id,
                 context.tool_use_id,
                 post_wm.as_ref(),
+                Some(pre.head.as_deref()),
             ) {
                 Ok(post) => {
                     let diff_result = diff(&pre, &post);
@@ -1375,6 +1570,7 @@ mod tests {
             taken_at: None,
             invocation_key: "test:1".to_string(),
             repo_root: PathBuf::from("/tmp"),
+            head: None,
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
         };
@@ -1383,6 +1579,7 @@ mod tests {
             taken_at: None,
             invocation_key: "test:2".to_string(),
             repo_root: PathBuf::from("/tmp"),
+            head: None,
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
         };
@@ -1398,6 +1595,7 @@ mod tests {
             taken_at: None,
             invocation_key: "test:1".to_string(),
             repo_root: PathBuf::from("/tmp"),
+            head: None,
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
         };
@@ -1420,6 +1618,7 @@ mod tests {
             taken_at: None,
             invocation_key: "test:2".to_string(),
             repo_root: PathBuf::from("/tmp"),
+            head: None,
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
         };
@@ -1466,6 +1665,7 @@ mod tests {
             taken_at: None,
             invocation_key: "test:1".to_string(),
             repo_root: PathBuf::from("/tmp"),
+            head: None,
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
         };
@@ -1475,6 +1675,7 @@ mod tests {
             taken_at: None,
             invocation_key: "test:2".to_string(),
             repo_root: PathBuf::from("/tmp"),
+            head: None,
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
         };
@@ -1553,8 +1754,14 @@ mod tests {
 
         // OpenCode
         assert_eq!(classify_tool(Agent::OpenCode, "edit"), ToolClass::FileEdit);
+        assert_eq!(
+            classify_tool(Agent::OpenCode, "apply_patch"),
+            ToolClass::FileEdit
+        );
         assert_eq!(classify_tool(Agent::OpenCode, "bash"), ToolClass::Bash);
         assert_eq!(classify_tool(Agent::OpenCode, "shell"), ToolClass::Bash);
+        assert_eq!(classify_tool(Agent::OpenCode, "bash_tool"), ToolClass::Bash);
+        assert_eq!(classify_tool(Agent::OpenCode, "read"), ToolClass::Skip);
 
         // Cursor
         assert_eq!(classify_tool(Agent::Cursor, "Write"), ToolClass::FileEdit);
