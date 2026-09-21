@@ -1,0 +1,111 @@
+src/mdm/agents/opencode.rs
+  s_8d8865f379477e::t_dccf524b82d29a 311
+  s_8d8865f379477e::t_cf84982c8a468d 349
+agent-support/vscode/src/blame-service.ts
+  s_8d8865f379477e::t_f1991d14f68ff2 6,247,404
+src/commands/checkpoint_agent/bash_tool.rs
+  s_8d8865f379477e::t_7a364218b0530a 713,723-730,733-742,744,752-761,772,774-784,790-797,799-800,802-814,832
+  s_8d8865f379477e::t_218eace6bcd482 224,226-229,232
+  s_8d8865f379477e::t_b1b60bc387aaa1 743,762-763,765-771,773
+  s_8d8865f379477e::t_21823a6fb3c14e 18,241-245,716-717
+  s_8d8865f379477e::t_7b111907bde192 947-1002
+  s_8d8865f379477e::t_e5dab5fc059451 1282
+  s_8d8865f379477e::t_93960add462e60 54,90-97,112,721,745-751,945
+  s_8d8865f379477e::t_190c847f661246 764
+  s_8d8865f379477e::t_0b0786c4d1301e 785-789
+  s_8d8865f379477e::t_acc1f70d0b8aa2 798,801,1285-1300
+  s_8d8865f379477e::t_af8d319f2daf33 1760,1763
+  s_8d8865f379477e::t_ba18b9052af268 853-855
+  s_8d8865f379477e::t_76ee5ee303a7a6 357-361,863
+  s_8d8865f379477e::t_01e526c244136f 731-732,833
+  s_8d8865f379477e::t_e7d26dcf544176 714-715
+  s_8d8865f379477e::t_9fa16952227ac5 718-720
+  s_8d8865f379477e::t_a4a900e96899a5 722
+  s_8d8865f379477e::t_d18c72dccd9591 830-831
+  s_8d8865f379477e::t_2bdfd71063fe0d 856-858,860-862
+  s_8d8865f379477e::t_76af7cc0ba1436 864
+  s_8d8865f379477e::t_a8d66bc635e670 944
+  s_8d8865f379477e::t_29cfeab238ab1f 946
+  s_8d8865f379477e::t_4304eb52e2a4a5 1283-1284
+  s_8d8865f379477e::t_75be6e3a65688f 1757-1759
+  s_8d8865f379477e::t_851e199ca4646e 1764
+  s_8d8865f379477e::t_968b783af9039c 837,859,1274,1279,1423,1428,1573,1582,1598,1621,1668,1678
+agent-support/vscode/src/blame-lens-manager.ts
+  s_8d8865f379477e::t_f1991d14f68ff2 6,235,1518
+tests/integration/bash_tool_conformance.rs
+  s_8d8865f379477e::t_4086173bd44a96 1110,1146
+产品业务.md
+  s_8d8865f379477e::t_b57900b9e9b73a 46
+  s_8d8865f379477e::t_57131600d33224 47
+  s_8d8865f379477e::t_76ee5ee303a7a6 45
+tests/integration/bash_tool_timeouts.rs
+  s_8d8865f379477e::t_53f1717efa4f9f 5,77-78,80,96,99-100,102,133-140
+tests/integration/bash_attribution.rs
+  s_8d8865f379477e::t_5e1fe56bbe17e7 7-8,654,718,779,842
+src/commands/checkpoint_agent/orchestrator.rs
+  s_8d8865f379477e::t_bed027f44898cd 1060,1062-1076,1078-1081,1083-1093
+  s_8d8865f379477e::t_76ee5ee303a7a6 699-720,870-891
+  s_8d8865f379477e::t_554ab39c3ca0c4 65
+  s_8d8865f379477e::t_af8d319f2daf33 1061,1077,1094-1095
+  s_8d8865f379477e::t_4583f080c748f2 836-845,847,856,992-1001,1010,1019
+  s_8d8865f379477e::t_9f563993b8fbb2 1237-1238,1241,1253
+  s_8d8865f379477e::t_62508bdf93e2d2 352,354,356-365
+  s_8d8865f379477e::t_d062d72d6b2efb 16,59-64,66-70,95-101,108,164-173,175,183-199,213,269-288,307-308,310-317,366,390-393
+  s_8d8865f379477e::t_4da6cd48df6cc3 102-107,1059,1229,1296-1315
+  s_8d8865f379477e::t_dccf524b82d29a 1082
+  s_8d8865f379477e::t_b57900b9e9b73a 1230-1236,1239-1240,1242-1252,1254-1281
+  s_8d8865f379477e::t_4f170b9b21ce50 1282-1295,1316-1321
+  s_8d8865f379477e::t_77e4a33072d0a5 181,309
+  s_8d8865f379477e::t_2fee76898aa58d 109
+  s_8d8865f379477e::t_fa560c8f3e14ee 174
+  s_8d8865f379477e::t_dbe023427cdfaf 176
+src/mdm/agents/kilo.rs
+  s_8d8865f379477e::t_cf84982c8a468d 404
+  s_8d8865f379477e::t_dccf524b82d29a 405
+agent-support/opencode/git-ai.ts
+  s_8d8865f379477e::t_76ee5ee303a7a6 56
+  s_8d8865f379477e::t_f1991d14f68ff2 256
+  s_8d8865f379477e::t_ee87f6ac67daf7 47-52,55
+src/commands/checkpoint_agent/presets/opencode.rs
+  s_8d8865f379477e::t_76ee5ee303a7a6 261,264-269
+  s_8d8865f379477e::t_af8d319f2daf33 451-458
+  s_8d8865f379477e::t_b180fc96809d92 459-460
+agent-support/vscode/src/reporting/reporting-profile-service.ts
+  s_8d8865f379477e::t_f1991d14f68ff2 4,179
+src/commands/daemon.rs
+  s_8d8865f379477e::t_57614c93687242 855
+  s_8d8865f379477e::t_c6273d6c6e0c65 870-910
+  s_8d8865f379477e::t_54a4b144feb88d 79,106-110,136-145,153,168-169,290-320,358-361,369-370
+agent-support/vscode/src/utils/binary-path.ts
+  s_8d8865f379477e::t_f1991d14f68ff2 4,42,56-59
+agent-support/vscode/src/ai-edit-manager.ts
+  s_8d8865f379477e::t_f1991d14f68ff2 10,420-423,501
+src/commands/checkpoint_agent/presets/kilo.rs
+  s_8d8865f379477e::t_af8d319f2daf33 388-428,430
+  s_8d8865f379477e::t_76ee5ee303a7a6 14,221-229
+  s_8d8865f379477e::t_f5a86facf3eb07 429
+src/daemon/telemetry_handle.rs
+  s_8d8865f379477e::t_f0e1003b232eb3 157
+agent-support/vscode/src/test/process-options.test.ts
+  s_8d8865f379477e::t_cf84982c8a468d 1-8
+agent-support/vscode/src/utils/process-options.ts
+  s_8d8865f379477e::t_f1991d14f68ff2 1-8
+agent-support/vscode/src/known-human-checkpoint-manager.ts
+  s_8d8865f379477e::t_f1991d14f68ff2 6,125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.25",
+  "base_commit_sha": "0b8887c639fb0e9ca3db07bd7655ddbb44a8af3d",
+  "prompts": {},
+  "sessions": {
+    "s_8d8865f379477e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c16b-0e89-7373-aad0-15f324aa2885",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
