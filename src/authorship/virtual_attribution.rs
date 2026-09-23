@@ -2388,90 +2388,11 @@ impl VirtualAttributions {
                 }
             }
 
-            // Fill gaps in committed hunks caused by imara_diff Equal matching.
-            //
-            // When AI rewrites a region, imara_diff can match byte-for-byte
-            // identical lines (e.g. empty lines between code blocks) as "Equal",
-            // preserving the old human attribution. Those lines get stripped from
-            // the checkpoint's line_attributions and never make it here. This
-            // leaves gaps in committed_hunks that show as [no-data] in `git ai diff`.
-            //
-            // Fix: for each gap line in a committed hunk, check the nearest
-            // attributed line before and after it. If both neighbors have the
-            // same AI author (not human/h_), fill the gap with that author.
-            if let Some(hunks) = file_committed_hunks {
-                // Build a sorted map of committed line → author_id for neighbor lookups
-                let mut line_to_author: Vec<(u32, &str)> = Vec::new();
-                for (author_id, lines) in &committed_lines_map {
-                    for &line in lines {
-                        line_to_author.push((line, author_id.as_str()));
-                    }
-                }
-                line_to_author.sort_by_key(|(line, _)| *line);
-
-                let mut gap_fills: Vec<(String, u32)> = Vec::new();
-
-                // Read file content for content-based gap matching
-                let gap_file_content = self
-                    .file_contents
-                    .get(file_path)
-                    .or_else(|| self.file_contents.get(&nfc_file_path));
-                let gap_file_lines: Vec<&str> = gap_file_content
-                    .map(|c| c.lines().collect())
-                    .unwrap_or_default();
-
-                // Build content→author map from AI-attributed lines
-                let mut content_to_ai_author: StdHashMap<&str, &str> = StdHashMap::new();
-                if !gap_file_lines.is_empty() {
-                    for &(line_num, author) in &line_to_author {
-                        if !author.starts_with("h_")
-                            && author != CheckpointKind::Human.to_str()
-                            && let Some(&content) = gap_file_lines.get((line_num - 1) as usize)
-                            && !content.trim().is_empty()
-                        {
-                            content_to_ai_author.insert(content, author);
-                        }
-                    }
-                }
-
-                for hunk in hunks {
-                    for line in hunk.expand() {
-                        // Skip lines that already have attribution
-                        if line_to_author
-                            .binary_search_by_key(&line, |(l, _)| *l)
-                            .is_ok()
-                        {
-                            continue;
-                        }
-
-                        // Find nearest attributed neighbor before this line
-                        let prev = line_to_author.iter().rev().find(|(l, _)| *l < line);
-
-                        // Find nearest attributed neighbor after this line
-                        let next = line_to_author.iter().find(|(l, _)| *l > line);
-
-                        // Fill if both neighbors exist and are the same AI author
-                        if let (Some((_, prev_author)), Some((_, next_author))) = (prev, next)
-                            && prev_author == next_author
-                            && !prev_author.starts_with("h_")
-                        {
-                            gap_fills.push((prev_author.to_string(), line));
-                        } else if let Some(&content) = gap_file_lines.get((line - 1) as usize) {
-                            // Content-based fallback: if the gap line has the same
-                            // content as an AI-attributed line in this file, it's
-                            // likely part of the same AI edit (imara_diff matched it
-                            // as Equal against old content by mistake).
-                            if let Some(&author) = content_to_ai_author.get(content) {
-                                gap_fills.push((author.to_string(), line));
-                            }
-                        }
-                    }
-                }
-
-                for (author_id, line) in gap_fills {
-                    committed_lines_map.entry(author_id).or_default().push(line);
-                }
-            }
+            // Do not infer provenance from neighboring authors or equal text.
+            // Such gaps may be AI-written, but attaching them to an existing
+            // trace invents checkpoint evidence and bypasses recovery metrics.
+            // Leave them for attribution_recovery, which records recovered lines
+            // under their own trace and matching checkpoint metric.
 
             // Add committed attributions to authorship log
             if !committed_lines_map.is_empty() {
@@ -2772,43 +2693,9 @@ impl VirtualAttributions {
                 }
             }
 
-            // Fill attribution gaps for lines in committed hunks that weren't
-            // directly attributed (e.g. empty lines between AI-authored blocks).
-            // Only fill if both nearest neighbors share the same AI author.
-            {
-                let mut line_to_author: Vec<(u32, &str)> = Vec::new();
-                for (author_id, lines) in &committed_lines_map {
-                    for &line in lines {
-                        line_to_author.push((line, author_id.as_str()));
-                    }
-                }
-                line_to_author.sort_by_key(|(line, _)| *line);
-
-                let mut gap_fills: Vec<(String, u32)> = Vec::new();
-
-                for hunk in file_committed_hunks {
-                    for line in hunk.expand() {
-                        if line_to_author
-                            .binary_search_by_key(&line, |(l, _)| *l)
-                            .is_ok()
-                        {
-                            continue;
-                        }
-                        let prev = line_to_author.iter().rev().find(|(l, _)| *l < line);
-                        let next = line_to_author.iter().find(|(l, _)| *l > line);
-                        if let (Some((_, prev_author)), Some((_, next_author))) = (prev, next)
-                            && prev_author == next_author
-                            && !prev_author.starts_with("h_")
-                        {
-                            gap_fills.push((prev_author.to_string(), line));
-                        }
-                    }
-                }
-
-                for (author_id, line) in gap_fills {
-                    committed_lines_map.entry(author_id).or_default().push(line);
-                }
-            }
+            // Project only observed line attributions. Recovery of unobserved
+            // lines belongs to the provenance-aware recovery pipeline, not to
+            // serialization under an existing session/trace.
 
             // Add committed attributions to authorship log
             if !committed_lines_map.is_empty() {

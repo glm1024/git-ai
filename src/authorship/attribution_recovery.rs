@@ -1,6 +1,6 @@
-use crate::authorship::authorship_log::{HumanRecord, LineRange, SessionRecord};
+use crate::authorship::authorship_log::{LineRange, SessionRecord};
 use crate::authorship::authorship_log_serialization::{
-    AuthorshipLog, generate_human_short_hash, generate_session_id, generate_trace_id,
+    AuthorshipLog, generate_session_id, generate_trace_id,
 };
 use crate::authorship::working_log::{AgentId, CheckpointKind};
 use crate::commands::checkpoint_agent::bash_tool::StatEntry;
@@ -285,7 +285,9 @@ pub(crate) fn recover_attribution(
         return Ok(());
     }
 
-    recover_remaining_as_known_human(authorship_log, human_author, unknown_after_session_events);
+    // No recovery source proved who authored the remaining lines. Preserve
+    // them as unknown; a Git committer identity or a different known-human
+    // attestation in the same commit is not line-level authorship evidence.
     Ok(())
 }
 
@@ -704,49 +706,6 @@ fn recover_commit_metadata(
     }
 
     Ok(true)
-}
-
-fn recover_remaining_as_known_human(
-    authorship_log: &mut AuthorshipLog,
-    human_author: &str,
-    unknown_by_file: UnknownLinesByFile,
-) {
-    if !should_recover_remaining_as_known_human(authorship_log) {
-        return;
-    }
-
-    let human_id = generate_human_short_hash(human_author);
-    authorship_log
-        .metadata
-        .humans
-        .entry(human_id.clone())
-        .or_insert_with(|| HumanRecord {
-            author: human_author.to_string(),
-        });
-
-    for (file_path, unknown_lines) in unknown_by_file {
-        add_attestation_ranges(
-            authorship_log,
-            &file_path,
-            &human_id,
-            LineRange::compress_lines(&unknown_lines),
-        );
-    }
-}
-
-fn should_recover_remaining_as_known_human(authorship_log: &AuthorshipLog) -> bool {
-    let mut has_ai_attribution = false;
-    for entry in authorship_log
-        .attestations
-        .iter()
-        .flat_map(|attestation| &attestation.entries)
-    {
-        if entry.hash.starts_with("h_") {
-            return true;
-        }
-        has_ai_attribution |= is_ai_attestation(&entry.hash);
-    }
-    !has_ai_attribution
 }
 
 fn read_commit_metadata(repo: &Repository, commit_sha: &str) -> Result<CommitMetadata, GitAiError> {
@@ -2560,50 +2519,6 @@ mod tests {
 
         assert_eq!(selection.candidate.tool_use_id, "tool-coarse");
         assert_eq!(selection.distance_ns, 500_000_000);
-    }
-
-    #[test]
-    fn terminal_human_recovery_uses_attestations_instead_of_metadata() {
-        let mut log = AuthorshipLog::new();
-        log.metadata.sessions.insert(
-            "s_metadata_only".to_string(),
-            SessionRecord {
-                agent_id: test_agent("metadata-only"),
-                human_author: None,
-                custom_attributes: None,
-            },
-        );
-        assert!(
-            should_recover_remaining_as_known_human(&log),
-            "AI metadata without landed attribution must not block recovery"
-        );
-
-        log.attestations.push(FileAttestation {
-            file_path: "file.txt".to_string(),
-            entries: vec![AttestationEntry::new(
-                "s_ai::t_1".to_string(),
-                vec![LineRange::Single(1)],
-            )],
-        });
-        log.metadata.humans.insert(
-            "h_metadata_only".to_string(),
-            HumanRecord {
-                author: "Human <human@example.com>".to_string(),
-            },
-        );
-        assert!(
-            !should_recover_remaining_as_known_human(&log),
-            "unattested human metadata must not override landed AI attribution"
-        );
-
-        log.attestations[0].entries.push(AttestationEntry::new(
-            "h_landed".to_string(),
-            vec![LineRange::Single(2)],
-        ));
-        assert!(
-            should_recover_remaining_as_known_human(&log),
-            "a landed known-human attestation must enable recovery"
-        );
     }
 
     #[test]

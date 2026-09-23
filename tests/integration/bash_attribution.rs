@@ -965,6 +965,120 @@ fn isolated_metrics_db_path() -> (tempfile::TempDir, String) {
     (dir, path.to_string_lossy().to_string())
 }
 
+#[test]
+fn test_bash_recovery_keeps_ai_total_without_borrowing_88_line_trace() {
+    let (_bash_dir, bash_db) = isolated_bash_history_db_path();
+    let (_metrics_dir, metrics_db) = isolated_metrics_db_path();
+    let mut repo = TestRepo::new_with_daemon_env(&[
+        ("GIT_AI_TEST_BASH_CHECKPOINT_DB_PATH", &bash_db),
+        ("GIT_AI_TEST_METRICS_DB_PATH", &metrics_db),
+    ]);
+    repo.patch_git_ai_config(|patch| {
+        patch.feature_flags = Some(json!({"bash_checkpoints_v2": true}));
+    });
+    repo.git(&["commit", "--allow-empty", "-m", "Empty base"])
+        .unwrap();
+    let root = repo.canonical_path();
+    let path = root.join("evidence.md");
+    let transcript = _metrics_dir.path().join("session.jsonl");
+    fs::write(
+        &transcript,
+        "{\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-4\"}}\n",
+    )
+    .unwrap();
+    // The durable bash history supplies independent recovery evidence. The
+    // serializer must not consume those unknown lines under another trace first.
+    let bash_hook = |phase: &str| {
+        json!({
+            "session_id": "bash-gap-budget",
+            "cwd": root.to_string_lossy(),
+            "hook_event_name": phase,
+            "tool_name": "Bash",
+            "tool_use_id": "bash-gap-write",
+            "tool_input": {"command": "generate-document evidence.md"},
+            "transcript_path": transcript.to_string_lossy()
+        })
+        .to_string()
+    };
+    repo.git_ai(&[
+        "checkpoint",
+        "codex",
+        "--hook-input",
+        &bash_hook("PreToolUse"),
+    ])
+    .unwrap();
+    let original: Vec<String> = (1..=6369)
+        .map(|i| format!("| field_{i} | original |"))
+        .collect();
+    fs::write(&path, format!("{}\n", original.join("\n"))).unwrap();
+    claude_file_edit_checkpoint(&repo, &path, &transcript, "PreToolUse");
+    let mut edited = original;
+    for line in (1..=44).chain(1274..=1317) {
+        edited[line - 1] = format!("| changed_{line} | AI |");
+    }
+    fs::write(&path, format!("{}\n", edited.join("\n"))).unwrap();
+    claude_file_edit_checkpoint(&repo, &path, &transcript, "PostToolUse");
+    let checkpoints = repo.current_working_logs().read_all_checkpoints().unwrap();
+    let direct = checkpoints
+        .iter()
+        .rev()
+        .find(|c| c.kind == git_ai::authorship::working_log::CheckpointKind::AiAgent)
+        .unwrap();
+    assert_eq!(direct.line_stats.additions, 88);
+    let direct_trace = direct.trace_id.as_deref().unwrap().to_string();
+    repo.git_ai(&[
+        "checkpoint",
+        "codex",
+        "--hook-input",
+        &bash_hook("PostToolUse"),
+    ])
+    .unwrap();
+    let commit = repo
+        .stage_all_and_commit("Recover all AI document lines")
+        .unwrap();
+    repo.filename("evidence.md").assert_committed_lines(
+        edited
+            .iter()
+            .map(|line| line.as_str().ai())
+            .collect::<Vec<_>>(),
+    );
+    let entries = &commit
+        .authorship_log
+        .attestations
+        .iter()
+        .find(|f| f.file_path == "evidence.md")
+        .unwrap()
+        .entries;
+    let direct_lines: usize = entries
+        .iter()
+        .filter(|e| e.hash.ends_with(&format!("::{direct_trace}")))
+        .flat_map(|e| &e.line_ranges)
+        .map(|r| r.expand().len())
+        .sum();
+    assert_eq!(
+        direct_lines, 88,
+        "AI total can remain correct while its trace provenance is wrong"
+    );
+
+    let recovered = wait_for_recovery_metric(&metrics_db, "recovered_bash");
+    assert_eq!(
+        recovered
+            .values
+            .get(&checkpoint_pos::LINES_ADDED.to_string())
+            .and_then(|v| v.as_u64()),
+        Some(6281)
+    );
+    let trace = sparse_str(&recovered.attrs, attr_pos::TRACE_ID).unwrap();
+    assert_ne!(trace, direct_trace);
+    let recovered_lines: usize = entries
+        .iter()
+        .filter(|e| e.hash.ends_with(&format!("::{trace}")))
+        .flat_map(|e| &e.line_ranges)
+        .map(|r| r.expand().len())
+        .sum();
+    assert_eq!(recovered_lines, 6281);
+}
+
 fn sparse_str(values: &SparseArray, pos: usize) -> Option<&str> {
     values
         .get(&pos.to_string())
@@ -995,6 +1109,10 @@ fn claude_file_edit_checkpoint(
 }
 
 fn wait_for_edge_recovery_metric(db_path: &str) -> MetricEvent {
+    wait_for_recovery_metric(db_path, "recovered_edge_extension")
+}
+
+fn wait_for_recovery_metric(db_path: &str, checkpoint_type: &str) -> MetricEvent {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let db = MetricsDatabase::open_at_path(Path::new(db_path))
@@ -1004,13 +1122,13 @@ fn wait_for_edge_recovery_metric(db_path: &str) -> MetricEvent {
             .expect("checkpoint metric history should load");
         if let Some(record) = records.into_iter().find(|record| {
             sparse_str(&record.event.values, checkpoint_pos::CHECKPOINT_TYPE)
-                == Some("recovered_edge_extension")
+                == Some(checkpoint_type)
         }) {
             return record.event;
         }
 
         if Instant::now() >= deadline {
-            panic!("recovered_edge_extension checkpoint metric was not persisted");
+            panic!("{checkpoint_type} checkpoint metric was not persisted");
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -1035,8 +1153,8 @@ fn test_edge_extension_recovery_metric_copies_source_session_tool_and_model() {
     repo.stage_all_and_commit("Initial commit").unwrap();
 
     // Two AI checkpoints so the neighboring lines get different traces.
-    // Virtual attribution only fills gaps when both neighbors share the same
-    // author hash; edge recovery also bridges the same session across traces.
+    // Edge recovery bridges this same-session gap under a new trace with its
+    // own metric; commit serialization must not borrow either original trace.
     fs::write(&file_path, "base\nai before\n").unwrap();
     claude_file_edit_checkpoint(&repo, &file_path, &transcript_path, "PreToolUse");
     fs::write(&file_path, "base\nai before edited\n").unwrap();
