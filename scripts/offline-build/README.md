@@ -26,7 +26,7 @@ exe、生成安装清单并打包，最终只需复制：
 offline-dist/git-ai-windows-v<CLI version>.zip
 ```
 
-ZIP 包含 Windows exe、来源元数据、`SHA256SUMS`、可复用的 `install.ps1` 和安装说明。
+ZIP 包含 Windows exe、来源元数据、`SHA256SUMS`、`install.cmd` 启动入口、可复用的 `install.ps1` 和安装说明。
 
 `build-linux.sh` 是研发内网 Linux CLI 的统一交付入口。它构建 Linux x64 和
 ARM64 两种 CLI，再生成一个同时包含两个架构的压缩包：
@@ -109,9 +109,9 @@ GIT_AI_BUILD_OFFLINE=1 sh scripts/offline-build/build-all.sh
 - Linux x64 和 ARM64 musl 二进制文件。
 - Windows x64 MSVC 可执行文件。
 - VS Code/Cursor VSIX 和 JetBrains ZIP 插件包。
-- 最新的 `SHA256SUMS`、包含匹配内置二进制哈希的 Unix `install.sh`、原样复制的可复用 Windows `install.ps1`、`INSTALL.md` 以及 `BUILD-METADATA.txt`。
+- 最新的 `SHA256SUMS`、包含匹配内置二进制哈希的 Unix `install.sh`、Windows `install.cmd` 启动入口、原样复制的可复用 Windows `install.ps1`、`INSTALL.md` 以及 `BUILD-METADATA.txt`。
 
-Windows 安装脚本不再写入每个 CLI 版本的版本号和哈希。用户可保留同一份脚本，把 `GIT_AI_LOCAL_BINARY` 指向新包的 `windows/git-ai-windows-x64.exe`；脚本从该包读取清单并校验暂存 EXE 和构建元数据。后续升级仍需更新产物和清单；只有安装流程本身需要变更时才更新脚本。历史包不原地重写，旧版内嵌脚本需一次性换成可复用版。
+Windows 安装脚本不再写入每个 CLI 版本的版本号和哈希。用户优先通过 `install.cmd` 启动可复用的 `install.ps1`；CMD 入口只对其 PowerShell 子进程设置 `ExecutionPolicy Bypass`。用户也可保留同一套 `install.cmd` / `install.ps1`，把 `GIT_AI_LOCAL_BINARY` 指向新包的 `windows/git-ai-windows-x64.exe`；脚本从该包读取清单并校验暂存 EXE 和构建元数据。后续升级仍需更新产物和清单；只有安装流程本身需要变更时才更新脚本。历史包不原地重写，旧版内嵌脚本需一次性换成可复用版。
 
 Windows 可执行文件是在本地交叉编译的。在分发之前，请在真实的 Windows x64 机器上运行 Windows 安装、hook 设置以及 commit 归因冒烟测试。
 
