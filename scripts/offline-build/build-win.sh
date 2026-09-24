@@ -20,6 +20,7 @@ require_command shasum
 require_command unzip
 require_command zip
 require_clean_release_source
+require_file "${REPO_ROOT}/install.cmd"
 
 sh "${SCRIPT_DIR}/build-windows-x64.sh"
 
@@ -61,6 +62,7 @@ mkdir -p "${STAGING_DIR}/windows"
 cp "${ARTIFACT}" "${STAGING_DIR}/windows/"
 cp "${METADATA}" "${STAGING_DIR}/windows/"
 cp "${REPO_ROOT}/install.ps1" "${STAGING_DIR}/install.ps1"
+cp "${REPO_ROOT}/install.cmd" "${STAGING_DIR}/install.cmd"
 cp "${SCRIPT_DIR}/WINDOWS-INSTALL.md" "${STAGING_DIR}/INSTALL.md"
 
 validate_artifact_source_metadata \
@@ -84,6 +86,7 @@ PACKAGED_AT_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
         windows/git-ai-windows-x64.exe \
         windows/git-ai-windows-x64.exe.build-metadata \
         install.ps1 \
+        install.cmd \
         INSTALL.md \
         BUILD-METADATA.txt \
         | LC_ALL=C sort > SHA256SUMS
