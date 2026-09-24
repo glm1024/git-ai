@@ -147,10 +147,14 @@ awk -v repo="internal/git-ai-offline" -v version="v${OFFLINE_VERSION}" -v checks
 chmod 755 "${STAGING_DIR}/install.sh"
 
 # Windows offline installs resolve version/checksums from the selected bundle.
-# Changing the CLI release must not rewrite the reusable installer.
+# install.cmd provides a process-scoped ExecutionPolicy Bypass entrypoint while
+# install.ps1 remains the reusable installer implementation.
 cp "${REPO_ROOT}/install.ps1" "${STAGING_DIR}/install.ps1"
 cmp -s "${REPO_ROOT}/install.ps1" "${STAGING_DIR}/install.ps1" \
     || fail "Windows offline installer differs from source"
+cp "${REPO_ROOT}/install.cmd" "${STAGING_DIR}/install.cmd"
+cmp -s "${REPO_ROOT}/install.cmd" "${STAGING_DIR}/install.cmd" \
+    || fail "Windows offline installer wrapper differs from source"
 
 INSTALL_TEMPLATE=${GIT_AI_INSTALL_TEMPLATE:-"${SCRIPT_DIR}/INSTALL.template.md"}
 if [ -z "${INSTALL_TEMPLATE}" ] || [ ! -f "${INSTALL_TEMPLATE}" ]; then
@@ -219,6 +223,7 @@ RAW_SHA256SUMS="${STAGING_DIR}/.SHA256SUMS.raw"
         "jetbrains/${JETBRAINS_ZIP}.build-metadata" \
         install.sh \
         install.ps1 \
+        install.cmd \
         INSTALL.md \
         BUILD-METADATA.txt
 ) > "${RAW_SHA256SUMS}"

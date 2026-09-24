@@ -22,6 +22,7 @@ EOF
 cat > "${TEST_ROOT}/repo/install.ps1" <<'EOF'
 Write-Output 'test installer'
 EOF
+cp "${SCRIPT_DIR}/../../install.cmd" "${TEST_ROOT}/repo/install.cmd"
 cat > "${TEST_ROOT}/repo/.gitignore" <<'EOF'
 /build/
 /offline-dist/.git-ai-windows-package-*/
@@ -63,6 +64,18 @@ unzip -q "${archive}" -d "${TEST_ROOT}/extracted"
 (
     cd "${TEST_ROOT}/extracted/git-ai-windows-v9.8.7"
     shasum -a 256 -c SHA256SUMS >/dev/null
+    [ -f install.cmd ] || {
+        printf '%s\n' '[build-win-test] ERROR: install.cmd is missing from Windows ZIP' >&2
+        exit 1
+    }
+    grep -Fq -- '-ExecutionPolicy Bypass' install.cmd || {
+        printf '%s\n' '[build-win-test] ERROR: install.cmd does not set process ExecutionPolicy Bypass' >&2
+        exit 1
+    }
+    grep -Fq '%~dp0install.ps1' install.cmd || {
+        printf '%s\n' '[build-win-test] ERROR: install.cmd does not resolve adjacent install.ps1' >&2
+        exit 1
+    }
 )
 
 printf '%s\n' '[build-win-test] Windows ZIP packaging passed'
