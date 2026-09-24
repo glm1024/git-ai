@@ -143,6 +143,7 @@ for marker in \
     'Initialize-StagingDirectory' \
     'after_committed_journal_before_receipt' \
     'Complete-RecoveredUpgradeReceipt' \
+    'Wait-ForFileAvailable -Path $recoveryPath -InstallDir $installDir' \
     "@('-h', '--help')"
 do
     assert_contains "${REPO_ROOT}/install.ps1" "${marker}"
@@ -152,6 +153,16 @@ receipt_line=$(grep -n -F 'Write-UpgradeReceiptIfRequested -InstalledVersion $In
 unlock_line=$(awk -v start="${complete_line}" 'NR > start && /Exit-InstallLock/ { print NR; exit }' "${REPO_ROOT}/install.ps1")
 [ -n "${receipt_line}" ] && [ -n "${unlock_line}" ] && [ "${receipt_line}" -lt "${unlock_line}" ] \
     || fail 'Windows upgrade receipt must be durably published before releasing the installer lock'
+
+recovery_wait_line=$(grep -n -F 'Wait-ForFileAvailable -Path $recoveryPath -InstallDir $installDir' "${REPO_ROOT}/install.ps1" | head -n 1 | cut -d: -f1)
+recovery_restore_line=$(grep -n -F 'Restore-RecoveredPath -FinalPath $finalExe' "${REPO_ROOT}/install.ps1" | head -n 1 | cut -d: -f1)
+[ -n "${recovery_wait_line}" ] && [ -n "${recovery_restore_line}" ] && [ "${recovery_wait_line}" -lt "${recovery_restore_line}" ] \
+    || fail 'Windows interrupted-install recovery must release the managed executable before restoring it'
+
+transaction_commit_line=$(grep -n -F 'Complete-InstallTransaction -InstalledVersion $installedVersion -ExpectedVersion $expectedVersion' "${REPO_ROOT}/install.ps1" | head -n 1 | cut -d: -f1)
+install_hooks_line=$(grep -n -F '& $finalExe install-hooks --env' "${REPO_ROOT}/install.ps1" | head -n 1 | cut -d: -f1)
+[ -n "${transaction_commit_line}" ] && [ -n "${install_hooks_line}" ] && [ "${transaction_commit_line}" -lt "${install_hooks_line}" ] \
+    || fail 'Windows executable transaction must commit before install-hooks can restart the daemon'
 
 upgrade_source="${REPO_ROOT}/src/commands/upgrade.rs"
 for marker in \

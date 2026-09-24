@@ -216,6 +216,13 @@ jobs:
       - name: Build git-ai
         run: cargo build --release --bin git-ai
 
+      - name: Test interrupted Windows install recovery with a running daemon
+        if: matrix.agent.name == 'claude'
+        shell: pwsh
+        run: |
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\scripts\offline-build\test-windows-interrupted-install-recovery.ps1" -BinaryPath ".\target\release\git-ai.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'

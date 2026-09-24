@@ -748,6 +748,29 @@ function Recover-InterruptedInstall {
             }
         }
     } else {
+        # A prepared transaction may already have published the candidate EXE.
+        # install-hooks can start the daemon from that path, and an abrupt shell
+        # close can therefore leave the candidate running while rollback is
+        # still required. Release both managed entry points before restoring
+        # backups so Windows does not reject Remove-Item/Move-Item with
+        # "access denied" for an in-use executable.
+        foreach ($recoveryPath in @($finalExe, $gitShim)) {
+            if (-not (Test-Path -LiteralPath $recoveryPath)) {
+                continue
+            }
+            $recoveryItem = Get-Item -LiteralPath $recoveryPath -Force -ErrorAction Stop
+            if ($recoveryItem.PSIsContainer) {
+                throw [System.InvalidOperationException]::new(
+                    "Interrupted install recovery path is a directory: $recoveryPath"
+                )
+            }
+            if (-not (Wait-ForFileAvailable -Path $recoveryPath -InstallDir $installDir)) {
+                throw [System.InvalidOperationException]::new(
+                    "Could not release $recoveryPath before recovering the interrupted install. Close any running git-ai/git processes and retry."
+                )
+            }
+        }
+
         Restore-RecoveredPath -FinalPath $gitShim -BackupPath $gitShimBackup `
             -WasPresent ([bool]$journal.git_shim_was_present) -Label 'git shim'
         Restore-RecoveredPath -FinalPath $finalExe -BackupPath $binaryBackup `
@@ -1226,6 +1249,13 @@ if ($needLogin) {
     }
 }
 
+# A detached Windows self-update is not successful until the installed binary
+# exactly matches the expected release and its durable receipt exists. Commit
+# the executable transaction before install-hooks: install-hooks restarts the
+# git-ai daemon, and a daemon running from git-ai.exe would lock that file if
+# the shell were closed while the transaction was still only "prepared".
+Complete-InstallTransaction -InstalledVersion $installedVersion -ExpectedVersion $expectedVersion
+
 # Install hooks. --env also updates the persistent user PATH and configures
 # Git Bash shell profiles.
 Write-Host 'Setting up IDE/agent hooks...'
@@ -1256,11 +1286,6 @@ if ($env:GIT_AI_SKIP_PATH_UPDATE -ne '1') {
         }
     } catch { }
 }
-
-# A detached Windows self-update is not successful until the installed binary
-# exactly matches the expected release and its durable receipt exists. Both are
-# committed while the installer lock is still held.
-Complete-InstallTransaction -InstalledVersion $installedVersion -ExpectedVersion $expectedVersion
 
 # Best-effort restart only after the executable transaction is committed.
 Start-DaemonIfRequested
