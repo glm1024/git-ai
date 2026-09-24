@@ -1,0 +1,19 @@
+tests/integration/session_event_attribution.rs
+  s_8d8865f379477e::t_85307beb24188a 411,420-426,431,449-452,533,537-539,571,575-577,601,643,673,712,941,954-957,961-962,981-983,999-1000,1004-1005,1021-1022,1026-1027,1063-1065
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.25",
+  "base_commit_sha": "4152e018cb18857270d39a41fea90978b72b2e9a",
+  "prompts": {},
+  "sessions": {
+    "s_8d8865f379477e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c16b-0e89-7373-aad0-15f324aa2885",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
