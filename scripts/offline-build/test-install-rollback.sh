@@ -412,6 +412,8 @@ if [ -n "${PACKAGED_DIST_UNDER_TEST}" ]; then
         || fail "Packaged installer is missing: ${PACKAGED_DIST_UNDER_TEST}/install.sh"
     [ -f "${PACKAGED_DIST_UNDER_TEST}/install.ps1" ] \
         || fail "Packaged installer is missing: ${PACKAGED_DIST_UNDER_TEST}/install.ps1"
+    [ -f "${PACKAGED_DIST_UNDER_TEST}/install.cmd" ] \
+        || fail "Packaged installer is missing: ${PACKAGED_DIST_UNDER_TEST}/install.cmd"
     run_unix_installer_suite "${PACKAGED_DIST_UNDER_TEST}/install.sh" packaged
     assert_windows_release_shape "${PACKAGED_DIST_UNDER_TEST}/install.ps1"
 fi
