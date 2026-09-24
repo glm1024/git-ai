@@ -53,6 +53,7 @@ assert_contains "${package_script}" 'schema_compatibility=forward-only'
 assert_contains "${package_script}" 'INSTALL.md \'
 assert_contains "${package_script}" 'BUILD-METADATA.txt'
 assert_contains "${package_script}" 'cp "${REPO_ROOT}/install.ps1" "${STAGING_DIR}/install.ps1"'
+assert_contains "${package_script}" 'cp "${REPO_ROOT}/install.cmd" "${STAGING_DIR}/install.cmd"'
 if grep -Fq '/^\$PinnedVersion = /' "${package_script}"; then
     fail 'Windows offline installer must not embed per-release versions'
 fi
@@ -67,13 +68,17 @@ for marker in \
     'DIST_NAME="git-ai-windows-v${CLI_VERSION}"' \
     'DIST_ZIP="${REPO_ROOT}/offline-dist/${DIST_NAME}.zip"' \
     'validate_artifact_source_metadata' \
+    'cp "${REPO_ROOT}/install.cmd" "${STAGING_DIR}/install.cmd"' \
     'shasum -a 256 -c SHA256SUMS' \
     'unzip -tq "${STAGING_ZIP}"' \
     'mv -f "${STAGING_ZIP}" "${DIST_ZIP}"'
 do
     assert_contains "${windows_build_script}" "${marker}"
 done
-assert_contains "${SCRIPT_DIR}/WINDOWS-INSTALL.md" '& .\install.ps1'
+assert_contains "${SCRIPT_DIR}/WINDOWS-INSTALL.md" '& .\install.cmd'
+assert_contains "${REPO_ROOT}/install.cmd" '-ExecutionPolicy Bypass'
+assert_contains "${REPO_ROOT}/install.cmd" '%~dp0install.ps1'
+assert_contains "${REPO_ROOT}/install.cmd" '-NoProfile'
 assert_contains "${REPO_ROOT}/.gitignore" '/offline-dist/.git-ai-windows-package-*/'
 assert_contains "${REPO_ROOT}/.gitignore" '/offline-dist/git-ai-windows-v*.zip'
 sh "${SCRIPT_DIR}/test-build-win-package.sh"
@@ -88,6 +93,7 @@ for token in __OFFLINE_VERSION__ __VSCODE_VSIX__ __JETBRAINS_ZIP__; do
     assert_contains "${template}" "${token}"
 done
 assert_contains "${template}" 'git-ai config reporting-profile set --stdin'
+assert_contains "${template}" '& .\install.cmd'
 profile_line=$(grep -n -F 'git-ai config reporting-profile set --stdin' "${template}" | head -n 1 | cut -d: -f1)
 daemon_line=$(grep -n -F 'git-ai bg start' "${template}" | head -n 1 | cut -d: -f1)
 [ -n "${profile_line}" ] && [ -n "${daemon_line}" ] && [ "${profile_line}" -lt "${daemon_line}" ] \
