@@ -1,0 +1,31 @@
+src/daemon.rs
+  s_fd0ac51cb24172::t_9b0bfe32e2cad5 2177,2183-2189,2195-2196,2200
+  s_fd0ac51cb24172::t_7ba477ba4fb84f 2176,2178-2182,2190-2194,2197-2198
+  s_fd0ac51cb24172::t_09c4d08b0da7da 2199
+  s_fd0ac51cb24172::t_5d1182d3203a44 2201-2203
+  s_fd0ac51cb24172::t_eea2a173a61811 2204,7455-7461
+src/daemon/rewrite_metrics.rs
+  s_fd0ac51cb24172::t_5003674ebd073e 1604-1605
+  s_fd0ac51cb24172::t_9b0bfe32e2cad5 328-338,343,902-1064,1331,1382,1556
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.25",
+  "base_commit_sha": "41bb50af30ee853a4571888da5c6196410b633ad",
+  "prompts": {},
+  "humans": {
+    "h_4078690cfc5c9e": {
+      "author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_fd0ac51cb24172": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a11b4d-eb42-71e1-aa3c-18a029ced660",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
