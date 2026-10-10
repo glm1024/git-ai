@@ -325,11 +325,22 @@ fn build_mapped_lifecycle_events(
         | crate::authorship::rewrite::RewriteMetricOperation::CherryPickNoCommit
         | crate::authorship::rewrite::RewriteMetricOperation::Revert => return Ok(Vec::new()),
     };
+    let branch = commit.branch.as_deref().map(str::trim).and_then(|branch| {
+        let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        (!branch.is_empty() && !branch.eq_ignore_ascii_case("HEAD")).then_some(branch)
+    });
+    let Some(branch) = branch else {
+        tracing::debug!(
+            operation_kind = commit.operation.as_str(),
+            "skipping mapped lifecycle without a reliable named branch; rewrite commit fact retained"
+        );
+        return Ok(Vec::new());
+    };
     build_lifecycle_events_checked(
         commit.operation.as_str(),
         invalidated.first().map(String::as_str).unwrap_or(""),
         &commit.new_sha,
-        commit.branch.as_deref(),
+        Some(branch),
         invalidated,
         std::slice::from_ref(&commit.new_sha),
         semantics,
@@ -888,6 +899,169 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    fn amend_command_fixture(
+        old: &str,
+        new: &str,
+        references: &[&str],
+    ) -> crate::daemon::domain::NormalizedCommand {
+        let ref_changes = references
+            .iter()
+            .map(|reference| crate::daemon::domain::RefChange {
+                reference: (*reference).to_string(),
+                old: old.to_string(),
+                new: new.to_string(),
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(serde_json::json!({
+            "scope": "Global", "family_key": null, "worktree": null, "root_sid": "amend-fixture",
+            "raw_argv": ["git", "commit", "--amend"], "primary_command": "commit",
+            "invoked_command": "commit", "invoked_args": ["--amend"], "observed_child_commands": [],
+            "exit_code": 0, "started_at_ns": 1, "finished_at_ns": 2, "stash_target_oid": null,
+            "cherry_pick_source_oids": [], "revert_source_oids": [], "ref_changes": ref_changes,
+            "confidence": "High"
+        }))
+        .expect("immutable command fixture")
+    }
+
+    #[test]
+    fn amend_command_branch_propagates_to_both_metrics_and_operation_hash() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "base\n", false)
+            .expect("base file");
+        let old = tmp.commit_all("base").expect("base commit");
+        tmp.write_file("file.txt", "base\nai\n", false)
+            .expect("new file");
+        let new = tmp.commit_all("amended result").expect("new commit");
+        let command = amend_command_fixture(
+            &old,
+            &new,
+            &["HEAD", "refs/heads/recorded", "refs/heads/recorded"],
+        );
+        let commits = crate::daemon::amend_metric_commits_from_command(
+            &command,
+            &old,
+            &new,
+            old.clone(),
+            note_for_ai_line("file.txt", 2),
+        );
+        let events =
+            build_rewrite_metric_events(tmp.gitai_repo(), &commits).expect("rewrite facts");
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(
+                event
+                    .attrs
+                    .get(&crate::metrics::attrs::attr_pos::BRANCH.to_string()),
+                Some(&serde_json::json!("recorded"))
+            );
+        }
+        assert_eq!(
+            events[0].values.get("0"),
+            Some(&serde_json::json!(lifecycle_operation_id(
+                "amend",
+                &old,
+                &new,
+                Some("recorded")
+            )))
+        );
+        assert_eq!(
+            events[1].event_id,
+            crate::metrics::types::MetricEventId::RewriteCommitted as u16
+        );
+    }
+
+    #[test]
+    fn amend_command_branch_unknown_or_conflicting_keeps_commit_without_strong_lifecycle() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "base\n", false)
+            .expect("base file");
+        let old = tmp.commit_all("base").expect("base commit");
+        tmp.write_file("file.txt", "base\nai\n", false)
+            .expect("new file");
+        let new = tmp.commit_all("amended result").expect("new commit");
+        for references in [
+            vec!["HEAD"],
+            vec!["HEAD", "refs/heads/first", "refs/heads/second"],
+        ] {
+            let command = amend_command_fixture(&old, &new, &references);
+            let commits = crate::daemon::amend_metric_commits_from_command(
+                &command,
+                &old,
+                &new,
+                old.clone(),
+                note_for_ai_line("file.txt", 2),
+            );
+            let events =
+                build_rewrite_metric_events(tmp.gitai_repo(), &commits).expect("rewrite facts");
+            assert_eq!(
+                events.len(),
+                1,
+                "unknown named branch must not create Event 8"
+            );
+            assert_eq!(
+                events[0].event_id,
+                crate::metrics::types::MetricEventId::RewriteCommitted as u16
+            );
+            assert!(
+                !events[0]
+                    .attrs
+                    .contains_key(&crate::metrics::attrs::attr_pos::BRANCH.to_string())
+            );
+        }
+        let mut command = amend_command_fixture(&old, &new, &["HEAD", "refs/heads/unrelated"]);
+        command.ref_changes[1].old = "another-old-tip".to_string();
+        let commits = crate::daemon::amend_metric_commits_from_command(
+            &command,
+            &old,
+            &new,
+            old.clone(),
+            note_for_ai_line("file.txt", 2),
+        );
+        assert!(
+            commits[0].branch.is_none(),
+            "a different transition is not branch evidence"
+        );
+    }
+
+    #[test]
+    fn amend_command_branch_detached_preserves_commit_fact_without_lifecycle() {
+        let tmp = crate::git::test_utils::TmpRepo::new().expect("tmp repo");
+        tmp.write_file("file.txt", "base\n", false)
+            .expect("base file");
+        let old = tmp.commit_all("base").expect("base commit");
+        tmp.git_command(&["checkout", "--detach", &old])
+            .expect("detached HEAD");
+        tmp.write_file("file.txt", "base\nai\n", false)
+            .expect("new file");
+        tmp.git_command(&["commit", "--amend", "--no-edit", "-a"])
+            .expect("detached amend");
+        let new = tmp
+            .git_command(&["rev-parse", "HEAD"])
+            .expect("new HEAD")
+            .trim()
+            .to_string();
+        let command = amend_command_fixture(&old, &new, &["HEAD"]);
+        let commits = crate::daemon::amend_metric_commits_from_command(
+            &command,
+            &old,
+            &new,
+            "initial".to_string(),
+            note_for_ai_line("file.txt", 2),
+        );
+        let events =
+            build_rewrite_metric_events(tmp.gitai_repo(), &commits).expect("rewrite facts");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event_id,
+            crate::metrics::types::MetricEventId::RewriteCommitted as u16
+        );
+        assert!(
+            !events[0]
+                .attrs
+                .contains_key(&crate::metrics::attrs::attr_pos::BRANCH.to_string())
+        );
+    }
+
     fn metric_commit(
         new_sha: &str,
         originals: &[&str],
@@ -1154,6 +1328,7 @@ mod tests {
             &[&parent_sha],
             RewriteMetricOperation::NonFastForward,
         )
+        .with_branch("main")
         .with_authorship_note(note);
 
         let events =
@@ -1204,6 +1379,7 @@ mod tests {
         let note = note_for_ai_line("file.txt", 1);
 
         let commit = metric_commit(&root_sha, &["old"], RewriteMetricOperation::Amend)
+            .with_branch("main")
             .with_authorship_note(note);
 
         let events =
@@ -1377,7 +1553,7 @@ mod tests {
             RewriteMetricOperation::Amend,
             RewriteMetricOperation::Rebase,
         ] {
-            let commit = metric_commit("new", &["old"], operation);
+            let commit = metric_commit("new", &["old"], operation).with_branch("main");
             let events =
                 build_mapped_lifecycle_events(&commit, &context).expect("mapped lifecycle");
             assert_eq!(events.len(), 1);
@@ -1425,7 +1601,8 @@ mod tests {
             .map(|index| format!("old-{index}"))
             .collect::<Vec<_>>();
         let commit =
-            RewriteMetricCommit::new("new".to_string(), originals, RewriteMetricOperation::Rebase);
+            RewriteMetricCommit::new("new".to_string(), originals, RewriteMetricOperation::Rebase)
+                .with_branch("main");
 
         let error = build_mapped_lifecycle_events(&commit, &context)
             .expect_err("oversized strong lifecycle evidence must fail the tracked task");

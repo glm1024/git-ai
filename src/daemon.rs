@@ -2173,6 +2173,35 @@ fn rewrite_metric_commits_with_branch(
     }
 }
 
+fn amend_metric_commits_from_command(
+    cmd: &crate::daemon::domain::NormalizedCommand,
+    old_head: &str,
+    new_head: &str,
+    parent_sha: String,
+    authorship_note: String,
+) -> Vec<crate::authorship::rewrite::RewriteMetricCommit> {
+    // Only the command's exact observed transition can identify this amend's
+    // branch. Repository HEAD can already have moved by side-effect processing.
+    let mut branches = cmd
+        .ref_changes
+        .iter()
+        .filter(|change| change.old == old_head && change.new == new_head)
+        .filter_map(|change| rewrite_metric_branch_for_ref(&change.reference));
+    let branch = branches
+        .next()
+        .and_then(|first| branches.all(|branch| branch == first).then_some(first));
+    let commits = vec![
+        crate::authorship::rewrite::RewriteMetricCommit::new(
+            new_head.to_string(),
+            vec![old_head.to_string()],
+            crate::authorship::rewrite::RewriteMetricOperation::Amend,
+        )
+        .with_parent_sha(parent_sha)
+        .with_authorship_note(authorship_note),
+    ];
+    rewrite_metric_commits_with_branch(commits, branch)
+}
+
 fn rebase_new_tip_from_command(
     cmd: &crate::daemon::domain::NormalizedCommand,
     original_head: &str,
@@ -7423,15 +7452,13 @@ impl ActorDaemonCoordinator {
                             if crate::authorship::rewrite::rewrite_metrics_enabled() {
                                 crate::daemon::rewrite_metrics::persist_rewrite_commit_metrics(
                                     &repo,
-                                    vec![
-                                        crate::authorship::rewrite::RewriteMetricCommit::new(
-                                            new_head.to_string(),
-                                            vec![old_head.to_string()],
-                                            crate::authorship::rewrite::RewriteMetricOperation::Amend,
-                                        )
-                                        .with_parent_sha(amend_result.parent_sha)
-                                        .with_authorship_note(amend_result.authorship_note),
-                                    ],
+                                    amend_metric_commits_from_command(
+                                        cmd,
+                                        old_head,
+                                        new_head,
+                                        amend_result.parent_sha,
+                                        amend_result.authorship_note,
+                                    ),
                                 )
                                 .await?;
                             }
