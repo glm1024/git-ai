@@ -3,7 +3,9 @@
 //! This library maintains attribution ranges as files are edited, preserving
 //! authorship information even through moves, edits, and whitespace changes.
 
-use crate::authorship::imara_diff_utils::{ByteDiff, ByteDiffOp, DiffOp, capture_diff_slices};
+use crate::authorship::imara_diff_utils::{
+    ByteDiff, ByteDiffOp, DiffOp, capture_diff_slices, normalize_line_endings,
+};
 use crate::authorship::move_detection::{DeletedLine, InsertedLine, detect_moves};
 use crate::authorship::working_log::CheckpointKind;
 use crate::error::GitAiError;
@@ -169,6 +171,49 @@ pub(crate) struct MoveMapping {
     pub(crate) source_range: (usize, usize),
     /// Range within the insertion text where the deletion text lands (start, end) exclusive bounds
     pub(crate) target_range: (usize, usize),
+}
+
+/// Byte boundaries removed by CRLF normalization, in original and normalized coordinates.
+/// Bare CRs are content and must not participate in this mapping.
+struct LineEndingOffsets {
+    removed_crs: Vec<(usize, usize)>,
+}
+
+impl LineEndingOffsets {
+    fn new(content: &str) -> Self {
+        let mut removed_crs = Vec::new();
+        for (offset, pair) in content.as_bytes().windows(2).enumerate() {
+            if pair == b"\r\n" {
+                removed_crs.push((offset, offset - removed_crs.len()));
+            }
+        }
+        Self { removed_crs }
+    }
+
+    fn to_normalized(&self, offset: usize) -> usize {
+        offset
+            - self
+                .removed_crs
+                .partition_point(|&(original, _)| original < offset)
+    }
+
+    fn to_original(&self, offset: usize) -> usize {
+        // The normalized LF starts before the original CR and ends after the LF,
+        // so an attributed newline maps back to the complete CRLF pair.
+        offset
+            + self
+                .removed_crs
+                .partition_point(|&(_, normalized)| normalized < offset)
+    }
+
+    fn normalize_attribution(&self, attr: &Attribution) -> Option<Attribution> {
+        let start = self.to_normalized(attr.start);
+        let end = self.to_normalized(attr.end);
+        // A CR-only range is not a real deletion marker. Preserve existing markers,
+        // but do not invent new ones when a nonempty range collapses.
+        (start < end || attr.start == attr.end)
+            .then(|| Attribution::new(start, end, attr.author_id.clone(), attr.ts))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +601,54 @@ impl AttributionTracker {
     }
 
     pub fn update_attributions_for_checkpoint(
+        &self,
+        old_content: &str,
+        new_content: &str,
+        old_attributions: &[Attribution],
+        current_author: &str,
+        ts: u128,
+        is_ai_checkpoint: bool,
+    ) -> Result<Vec<Attribution>, GitAiError> {
+        let normalized_old = normalize_line_endings(old_content);
+        let normalized_new = normalize_line_endings(new_content);
+        if matches!(normalized_old, std::borrow::Cow::Borrowed(_))
+            && matches!(normalized_new, std::borrow::Cow::Borrowed(_))
+        {
+            return self.update_attributions_normalized(
+                old_content,
+                new_content,
+                old_attributions,
+                current_author,
+                ts,
+                is_ai_checkpoint,
+            );
+        }
+
+        // Use the same LF/CRLF equivalence as checkpoint line statistics. Diffing
+        // raw terminators would turn unchanged lines into AI replacements; emitting
+        // ordinary CR insert/delete operations would also give them new AI ownership.
+        let old_offsets = LineEndingOffsets::new(old_content);
+        let new_offsets = LineEndingOffsets::new(new_content);
+        let normalized_attrs: Vec<_> = old_attributions
+            .iter()
+            .filter_map(|attr| old_offsets.normalize_attribution(attr))
+            .collect();
+        let mut updated = self.update_attributions_normalized(
+            &normalized_old,
+            &normalized_new,
+            &normalized_attrs,
+            current_author,
+            ts,
+            is_ai_checkpoint,
+        )?;
+        for attr in &mut updated {
+            attr.start = new_offsets.to_original(attr.start);
+            attr.end = new_offsets.to_original(attr.end);
+        }
+        Ok(updated)
+    }
+
+    fn update_attributions_normalized(
         &self,
         old_content: &str,
         new_content: &str,
@@ -2624,6 +2717,237 @@ mod tests {
     // ====================================================================
     // CRLF / LF normalization tests
     // ====================================================================
+
+    #[test]
+    fn eol_offset_mapping_preserves_newlines_and_real_markers() {
+        let original = "中\r\n\r\n尾\r";
+        let normalized = "中\n\n尾\r";
+        let offsets = LineEndingOffsets::new(original);
+        for (offset, _) in normalized
+            .char_indices()
+            .chain(std::iter::once((normalized.len(), '\0')))
+        {
+            let restored = offsets.to_original(offset);
+            assert!(original.is_char_boundary(restored));
+            assert_eq!(offsets.to_normalized(restored), offset);
+        }
+        assert_eq!((offsets.to_original(3), offsets.to_original(4)), (3, 5));
+        assert_eq!((offsets.to_original(4), offsets.to_original(5)), (5, 7));
+        let attrs = [
+            Attribution::new(3, 4, "cr_only".into(), TEST_TS),
+            Attribution::new(3, 3, "first_marker".into(), TEST_TS),
+            Attribution::new(4, 4, "second_marker".into(), TEST_TS),
+            Attribution::new(3, 5, "newline".into(), TEST_TS),
+        ];
+        let mapped: Vec<_> = attrs
+            .iter()
+            .filter_map(|a| offsets.normalize_attribution(a))
+            .collect();
+        assert_eq!(mapped.len(), 3);
+        assert_eq!(
+            mapped[0],
+            Attribution::new(3, 3, "first_marker".into(), TEST_TS)
+        );
+        assert_eq!(
+            mapped[1],
+            Attribution::new(3, 3, "second_marker".into(), TEST_TS)
+        );
+        assert_eq!(mapped[2], Attribution::new(3, 4, "newline".into(), TEST_TS));
+    }
+
+    #[test]
+    fn ai_eol_normalization_first_checkpoint_only_attributes_real_edit() {
+        use crate::authorship::imara_diff_utils::{LineChangeTag, compute_line_changes};
+
+        let lines: Vec<String> = (0..120).map(|i| format!("source_line_{i:03}")).collect();
+        for (old_eol, new_eol) in [("\n", "\r\n"), ("\r\n", "\n")] {
+            let old = lines.join(old_eol) + old_eol;
+            let mut edited = lines.clone();
+            edited[60] = "changed_line".into();
+            let new = edited.join(new_eol) + new_eol;
+            let changes = compute_line_changes(&old, &new);
+            assert_eq!(
+                changes
+                    .iter()
+                    .filter(|c| *c.tag() == LineChangeTag::Insert)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                changes
+                    .iter()
+                    .filter(|c| *c.tag() == LineChangeTag::Delete)
+                    .count(),
+                1
+            );
+            let attrs = AttributionTracker::new()
+                .update_attributions_for_checkpoint(&old, &new, &[], "new_trace", TEST_TS, true)
+                .unwrap();
+            let ranges = attributions_to_line_attributions_for_checkpoint(&attrs, &new, true);
+            assert_eq!(ranges.len(), 1, "{old_eol:?} -> {new_eol:?}: {ranges:?}");
+            assert_eq!((ranges[0].start_line, ranges[0].end_line), (61, 61));
+            assert_eq!(ranges[0].author_id, "new_trace");
+        }
+    }
+
+    #[test]
+    fn ai_eol_normalization_preserves_owners_and_offsets_across_checkpoints() {
+        let lines = [
+            "旧来源 😀",
+            "",
+            "human content",
+            "known human",
+            "change me",
+            "旧来源乙",
+            "\t",
+            "last",
+        ];
+        let owners = [
+            "old_a", "old_a", "human", "h_known", "old_b", "old_b", "h_known", "old_a",
+        ];
+        let render = |text: &[&str], eols: &[&str], trailing: bool| -> String {
+            text.iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    format!(
+                        "{line}{}",
+                        if i + 1 == text.len() && !trailing {
+                            ""
+                        } else {
+                            eols[i % eols.len()]
+                        }
+                    )
+                })
+                .collect()
+        };
+        for (old_eols, new_eols) in [
+            (&["\n"][..], &["\r\n"][..]),
+            (&["\r\n"][..], &["\n"][..]),
+            (&["\n", "\r\n"][..], &["\r\n", "\n"][..]),
+        ] {
+            for trailing in [true, false] {
+                for edit in [false, true] {
+                    let old = render(&lines, old_eols, trailing);
+                    let metadata = collect_line_metadata(&old);
+                    let original: Vec<_> = metadata
+                        .iter()
+                        .enumerate()
+                        .map(|(i, line)| {
+                            Attribution::new(
+                                line.start,
+                                line.end,
+                                owners[i].into(),
+                                TEST_TS + i as u128,
+                            )
+                        })
+                        .collect();
+                    let mut edited = lines;
+                    if edit {
+                        edited[4] = "真实修改 🚀";
+                    }
+                    let new = render(&edited, new_eols, trailing);
+                    let tracker = AttributionTracker::new();
+                    let updated = tracker
+                        .update_attributions_for_checkpoint(
+                            &old,
+                            &new,
+                            &original,
+                            "new_trace",
+                            TEST_TS + 20,
+                            true,
+                        )
+                        .unwrap();
+                    for (i, line) in collect_line_metadata(&new).iter().enumerate() {
+                        let owner = if edit && i == 4 {
+                            "new_trace"
+                        } else {
+                            owners[i]
+                        };
+                        assert_range_owned_by(&updated, line.start, line.end, owner);
+                        let attr = updated
+                            .iter()
+                            .find(|a| a.start <= line.start && a.end >= line.end)
+                            .unwrap();
+                        assert_eq!(
+                            attr.ts,
+                            if edit && i == 4 {
+                                TEST_TS + 20
+                            } else {
+                                TEST_TS + i as u128
+                            }
+                        );
+                    }
+                    assert!(updated.iter().all(|a| a.end <= new.len()
+                        && new.is_char_boundary(a.start)
+                        && new.is_char_boundary(a.end)));
+
+                    // A subsequent edit must still use offsets in the original CRLF/LF text.
+                    edited[7] = "second edit 🦀";
+                    let next = render(&edited, new_eols, trailing);
+                    let again = tracker
+                        .update_attributions_for_checkpoint(
+                            &new,
+                            &next,
+                            &updated,
+                            "second_trace",
+                            TEST_TS + 30,
+                            true,
+                        )
+                        .unwrap();
+                    let ranges =
+                        attributions_to_line_attributions_for_checkpoint(&again, &next, true);
+                    for (i, old_owner) in owners.iter().enumerate() {
+                        let expected = if i == 7 {
+                            "second_trace"
+                        } else if edit && i == 4 {
+                            "new_trace"
+                        } else {
+                            old_owner
+                        };
+                        let owner = ranges
+                            .iter()
+                            .find(|a| a.start_line <= i as u32 + 1 && a.end_line > i as u32)
+                            .map(|a| a.author_id.as_str())
+                            .unwrap_or("human");
+                        assert_eq!(owner, expected, "line {}: {ranges:?}", i + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ai_eol_normalization_keeps_real_whitespace_edits() {
+        for (old, new, expected_line) in [
+            ("stable\r\nbody\r\n", "stable\n  body\n", 2),
+            ("stable\r\nbody\r\n", "stable\n\nbody\n", 2),
+            ("stable\r\nbody\r", "stable\nbody", 2),
+            ("stable\r\nbody", "stable\nbody\n", 2),
+            ("stable\r\nbody\n", "stable\nbody", 2),
+        ] {
+            let original = vec![Attribution::new(0, old.len(), "old_trace".into(), TEST_TS)];
+            let updated = AttributionTracker::new()
+                .update_attributions_for_checkpoint(
+                    old,
+                    new,
+                    &original,
+                    "new_trace",
+                    TEST_TS + 1,
+                    true,
+                )
+                .unwrap();
+            let ranges = attributions_to_line_attributions_for_checkpoint(&updated, new, true);
+            let changed: Vec<_> = ranges
+                .iter()
+                .filter(|a| a.author_id == "new_trace")
+                .collect();
+            assert_eq!(changed.len(), 1, "{old:?} -> {new:?}: {ranges:?}");
+            assert_eq!(
+                (changed[0].start_line, changed[0].end_line),
+                (expected_line, expected_line)
+            );
+        }
+    }
 
     #[test]
     fn crlf_to_lf_same_content_preserves_attributions() {

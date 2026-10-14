@@ -2,12 +2,15 @@ use crate::authorship::authorship_log::{LineRange, SessionRecord};
 use crate::authorship::authorship_log_serialization::{
     AuthorshipLog, generate_session_id, generate_trace_id,
 };
+use crate::authorship::diff_base::single_commit_diff_base;
+use crate::authorship::imara_diff_utils::{DiffOp, capture_diff_slices, normalize_line_endings};
+use crate::authorship::rewrite::{DiffTreeResult, compute_diff_trees_batch};
 use crate::authorship::working_log::{AgentId, CheckpointKind};
 use crate::commands::checkpoint_agent::bash_tool::StatEntry;
 use crate::daemon::bash_history_db::{BashCheckpointCall, distance_to_call_window};
 use crate::error::GitAiError;
 use crate::git::repo_state::worktree_root_for_path;
-use crate::git::repository::{Repository, exec_git};
+use crate::git::repository::{Repository, batch_read_paths_at_treeishes, exec_git};
 use crate::metrics::db::SessionEventRecoveryCandidate;
 use crate::metrics::{CheckpointValues, EventAttributes, MetricEvent, PosEncoded};
 use serde_json::json;
@@ -196,6 +199,7 @@ struct CommitMetadataSessionSelection {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct AttributionRecoveryContext<'a> {
     pub(crate) file_timestamps: Option<&'a FileTimestampsByPath>,
+    pub(crate) precomputed_parent_diff: Option<&'a DiffTreeResult>,
     pub(crate) before_external_recovery: Option<&'a dyn Fn(&UnknownLinesByFile)>,
 }
 
@@ -213,6 +217,28 @@ pub(crate) fn recover_attribution(
     }
 
     if unknown_lines_by_file(authorship_log, committed_hunks).is_empty() {
+        return Ok(());
+    }
+
+    // Raw Git added-line hunks include untouched lines during LF/CRLF conversion.
+    // Every recovery solver must use actual logical additions, not those raw hunks.
+    // Keep the raw commit diff intact for metrics and only narrow recovery evidence.
+    let filtered_hunks = match logical_recovery_hunks(
+        repo,
+        parent_sha,
+        commit_sha,
+        authorship_log,
+        committed_hunks,
+        context.precomputed_parent_diff,
+    ) {
+        Ok(hunks) => hunks,
+        Err(error) => {
+            tracing::debug!(%error, "logical recovery evidence unavailable; retaining unknown lines");
+            return Ok(());
+        }
+    };
+    let committed_hunks = &filtered_hunks;
+    if committed_hunks.is_empty() {
         return Ok(());
     }
 
@@ -345,6 +371,149 @@ pub(crate) fn matching_session_event_candidate_exists(
         .ok()?;
 
     Some(select_best_session_event_candidate(&candidates, timestamps_ns, target_repo_url).is_some())
+}
+
+/// Match normalized logical lines while retaining terminators: CRLF/LF is
+/// equivalent, but bare CR, spaces and adding/removing the final LF are edits.
+fn logical_added_candidates(
+    parent_content: &str,
+    committed_content: &str,
+    candidates: &[LineRange],
+) -> Vec<LineRange> {
+    // Keep existing recovery behavior for commits with no CRLF evidence.
+    // Only EOL-sensitive candidates need this additional logical-line diff.
+    if !parent_content.contains("\r\n") && !committed_content.contains("\r\n") {
+        return candidates.to_vec();
+    }
+    let parent = normalize_line_endings(parent_content);
+    let committed = normalize_line_endings(committed_content);
+    let old_lines: Vec<&str> = parent.split_inclusive('\n').collect();
+    let new_lines: Vec<&str> = committed.split_inclusive('\n').collect();
+    let mut added = HashSet::new();
+    for op in capture_diff_slices(&old_lines, &new_lines) {
+        if let DiffOp::Insert {
+            new_index, new_len, ..
+        }
+        | DiffOp::Replace {
+            new_index, new_len, ..
+        } = op
+        {
+            added.extend((new_index..new_index + new_len).map(|line| line as u32 + 1));
+        }
+    }
+    let mut lines: Vec<u32> = candidates
+        .iter()
+        .flat_map(LineRange::expand)
+        .filter(|line| added.contains(line))
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    LineRange::compress_lines(&lines)
+}
+
+fn logical_recovery_hunks(
+    repo: &Repository,
+    parent_sha: &str,
+    commit_sha: &str,
+    authorship_log: &AuthorshipLog,
+    raw_hunks: &HashMap<String, Vec<LineRange>>,
+    precomputed_parent_diff: Option<&DiffTreeResult>,
+) -> Result<HashMap<String, Vec<LineRange>>, GitAiError> {
+    let unknown = unknown_lines_by_file(authorship_log, raw_hunks);
+    let parent_tree = single_commit_diff_base(parent_sha, commit_sha);
+    // Reuse the existing rename mapping; the fallback also batches its tree
+    // lookup and diff, never spawning Git once per path or object.
+    let fallback_diff;
+    let diff = if let Some(diff) = precomputed_parent_diff {
+        diff
+    } else {
+        fallback_diff =
+            compute_diff_trees_batch(repo, &[(parent_tree.clone(), commit_sha.to_string())])?;
+        fallback_diff
+            .first()
+            .ok_or_else(|| GitAiError::Generic("missing recovery parent diff".to_string()))?
+    };
+    let old_paths: HashMap<&str, &str> = diff
+        .renames
+        .iter()
+        .map(|(old, new)| (new.as_str(), old.as_str()))
+        .collect();
+    let mut requests = Vec::with_capacity(unknown.len() * 2);
+    for file_path in unknown.keys() {
+        let old_path = old_paths
+            .get(file_path.as_str())
+            .copied()
+            .unwrap_or(file_path);
+        requests.push((parent_tree.clone(), old_path.to_string()));
+        requests.push((commit_sha.to_string(), file_path.clone()));
+    }
+    let contents = batch_read_paths_at_treeishes(repo, &requests)?;
+    let missing_parent = parent_sha != "initial"
+        && unknown.keys().any(|path| {
+            let old_path = old_paths.get(path.as_str()).copied().unwrap_or(path);
+            contents.contains_key(&(commit_sha.to_string(), path.clone()))
+                && !contents.contains_key(&(parent_tree.clone(), old_path.to_string()))
+        });
+    let parent_paths = if missing_parent {
+        // A single recursive tree listing distinguishes absent paths from blobs
+        // that the batch reader could not return. NUL framing preserves spaces,
+        // Unicode, tabs and newlines without Git's display quoting.
+        let mut args = repo.global_args_for_exec();
+        args.extend(
+            ["ls-tree", "-r", "-z", "--full-tree", "--name-only"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        args.push(parent_tree.clone());
+        let output = exec_git(&args)?;
+        let paths = String::from_utf8(output.stdout)?;
+        Some(
+            paths
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect::<HashSet<_>>(),
+        )
+    } else {
+        None
+    };
+    let mut result = HashMap::new();
+    for (file_path, lines) in unknown {
+        let old_path = old_paths
+            .get(file_path.as_str())
+            .copied()
+            .unwrap_or(&file_path);
+        let Some(committed) = contents.get(&(commit_sha.to_string(), file_path.clone())) else {
+            continue;
+        };
+        // A missing batch value alone never proves an empty parent: the
+        // successful tree listing must also establish that the old path is absent.
+        let parent = match contents.get(&(parent_tree.clone(), old_path.to_string())) {
+            Some(content) => content.as_str(),
+            None if parent_sha == "initial" => "",
+            None if parent_paths
+                .as_ref()
+                .is_some_and(|paths| !paths.contains(old_path)) =>
+            {
+                ""
+            }
+            None => continue,
+        };
+        // The existing batch reader decodes invalid UTF-8 lossily. Such content
+        // is not evidence for text recovery; retain Unknown conservatively.
+        if [parent, committed.as_str()]
+            .iter()
+            .any(|content| content.contains('\0') || content.contains('\u{fffd}'))
+        {
+            continue;
+        }
+        let filtered =
+            logical_added_candidates(parent, committed, &LineRange::compress_lines(&lines));
+        if !filtered.is_empty() {
+            result.insert(file_path, filtered);
+        }
+    }
+    Ok(result)
 }
 
 fn recover_bash_mtime(
@@ -1903,6 +2072,57 @@ mod tests {
         AttestationEntry, AuthorshipLog, FileAttestation,
     };
     use crate::authorship::working_log::AgentId;
+
+    #[test]
+    fn logical_recovery_ignores_both_eol_directions_with_real_edit() {
+        for (before, after) in [
+            (
+                "old one\nold two\nold three\n",
+                "old one\r\nAI two\r\nold three\r\n",
+            ),
+            (
+                "old one\r\nold two\r\nold three\r\n",
+                "old one\nAI two\nold three\n",
+            ),
+        ] {
+            assert_eq!(
+                logical_added_candidates(before, after, &[LineRange::Range(1, 3)]),
+                vec![LineRange::Single(2)]
+            );
+        }
+        assert!(logical_added_candidates("same\n", "same\r\n", &[LineRange::Single(1)]).is_empty());
+    }
+
+    #[test]
+    fn logical_recovery_keeps_real_whitespace_bare_cr_and_final_lf_edits() {
+        for (before, after) in [
+            ("same\n", "same \n"),
+            ("same", "same\r"),
+            ("same", "same\n"),
+            ("same\n", "same"),
+        ] {
+            assert_eq!(
+                logical_added_candidates(before, after, &[LineRange::Single(1)]),
+                vec![LineRange::Single(1)]
+            );
+        }
+    }
+
+    #[test]
+    fn logical_recovery_preserves_insertions_and_intersects_raw_candidates() {
+        assert_eq!(
+            logical_added_candidates("old\n", "inserted\r\nold\r\n", &[LineRange::Range(1, 2)]),
+            vec![LineRange::Single(1)]
+        );
+        assert!(
+            logical_added_candidates("old\n", "inserted\r\nold\r\n", &[LineRange::Single(2)])
+                .is_empty()
+        );
+        assert_eq!(
+            logical_added_candidates("", "new file\r\n", &[LineRange::Single(1)]),
+            vec![LineRange::Single(1)]
+        );
+    }
 
     #[test]
     #[serial_test::serial]

@@ -417,6 +417,7 @@ where
             &recovery_hunks,
             AttributionRecoveryContext {
                 file_timestamps: context.recovery_file_timestamps,
+                precomputed_parent_diff: context.precomputed_parent_diff,
                 before_external_recovery: context.before_external_recovery,
             },
         )?;
@@ -863,6 +864,7 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
         &recovery_hunks,
         AttributionRecoveryContext {
             file_timestamps: recovery_file_timestamps,
+            precomputed_parent_diff: None,
             before_external_recovery,
         },
     )?;
