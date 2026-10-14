@@ -1,0 +1,35 @@
+src/authorship/attribution_tracker.rs
+  s_bcb46cebe26f3f::t_9e81ce0138aca3 2728-2825,2845,2847,2864,2866,2892,2894,2903
+  s_bcb46cebe26f3f::t_132a409beea001 6-8,176-218,611-633,2904
+  s_bcb46cebe26f3f::t_714594b4f1a141 2721-2727
+  s_bcb46cebe26f3f::t_16e54b0ce3a795 634-636
+  s_bcb46cebe26f3f::t_b73f4d6146540b 2826-2828,2842-2844
+  s_bcb46cebe26f3f::t_524e0368cd4162 2846
+  s_bcb46cebe26f3f::t_8be464c0a52e2c 2848-2850,2861-2863
+  s_bcb46cebe26f3f::t_0120b281cf7359 2865
+  s_bcb46cebe26f3f::t_1cbb17c5188e56 2867-2869,2889-2891
+  s_bcb46cebe26f3f::t_3dc1a4f4311af6 2893
+  s_bcb46cebe26f3f::t_c11f0693794bb3 2895-2897,2900-2902
+  s_bcb46cebe26f3f::t_09d8d786e1644f 2905-2907
+  s_bcb46cebe26f3f::t_19863002deec17 637-658,2829-2841,2851-2860,2870-2888,2898-2899,2908-2951
+tests/integration/main.rs
+  s_bcb46cebe26f3f::t_6b19bab97638d4 65
+产品业务.md
+  s_bcb46cebe26f3f::t_c571a27bf3ba6a 35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.25",
+  "base_commit_sha": "067dd3e360d02b9c7d503ee017869a47a5c0fc0d",
+  "prompts": {},
+  "sessions": {
+    "s_bcb46cebe26f3f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12f69-fc7d-7213-bfb1-a4f3009cdb0a",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
