@@ -593,6 +593,81 @@ impl BashHistoryDatabase {
         Ok(())
     }
 
+    /// Only unfinished, already observed ZCode pres in this enrolled session.
+    /// Does not read command bodies or discover other sessions/history.
+    pub(crate) fn open_zcode_pres(
+        &self,
+        worktree: &str,
+        session: &str,
+        activation_ns: u128,
+    ) -> Result<Vec<crate::daemon::bash_sessions::ZCodeBashPre>, GitAiError> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_use_id,agent_model,start_trace_id,start_time_ns,metadata_json
+            FROM bash_checkpoint_calls WHERE agent_tool='zcode' AND agent_external_id=?1
+              AND session_id=?1 AND repo_work_dir=?2 AND end_time_ns IS NULL
+              AND start_time_ns>=?3 AND start_trace_id IS NOT NULL ORDER BY id LIMIT 65",
+        )?;
+        let rows = stmt.query_map(
+            params![session, worktree, ns_to_i64(activation_ns)?],
+            |row| {
+                let metadata: String = row.get(4)?;
+                Ok(crate::daemon::bash_sessions::ZCodeBashPre {
+                    has_snapshot: false,
+                    tool_use_id: row.get(0)?,
+                    agent_id: AgentId {
+                        tool: "zcode".into(),
+                        id: session.into(),
+                        model: row.get(1)?,
+                    },
+                    start_trace_id: row.get(2)?,
+                    started_at_ns: row.get::<_, i64>(3)?.max(0) as u128,
+                    metadata: serde_json::from_str(&metadata).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GitAiError::from)
+    }
+
+    pub(crate) fn zcode_pre_has_state(
+        &self,
+        worktree: &str,
+        session: &str,
+        call: &str,
+        trace: &str,
+        started_ns: u128,
+        terminal: bool,
+    ) -> Result<bool, GitAiError> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM bash_checkpoint_calls
+            WHERE agent_tool='zcode' AND session_id=?1 AND tool_use_id=?2 AND repo_work_dir=?3
+              AND start_trace_id=?4 AND start_time_ns=?5 AND (end_time_ns IS NOT NULL)=?6)",
+                params![
+                    session,
+                    call,
+                    worktree,
+                    trace,
+                    ns_to_i64(started_ns)?,
+                    terminal
+                ],
+                |row| row.get(0),
+            )
+            .map_err(GitAiError::from)
+    }
+
     pub fn candidates_near_timestamps(
         &self,
         timestamps_ns: &[u128],
@@ -793,6 +868,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = BashHistoryDatabase::open_at_path(&dir.path().join("bash.db")).unwrap();
         (db, dir)
+    }
+
+    #[test]
+    fn zcode_open_pre_recovery_is_session_worktree_and_activation_scoped() {
+        let (mut db, _dir) = test_db();
+        let start = |session: &str, call: &str, repo: &str, ns: u128| BashCallStart {
+            original_cwd: repo.into(),
+            repo_work_dir: Some(repo.into()),
+            repo_discovery_error: None,
+            session_id: session.into(),
+            tool_use_id: call.into(),
+            agent_id: AgentId {
+                tool: "zcode".into(),
+                id: session.into(),
+                model: "exact-pre-model".into(),
+            },
+            start_trace_id: format!("trace-{call}"),
+            started_at_ns: ns,
+            command: None,
+            metadata: HashMap::new(),
+        };
+        for pre in [
+            start("s", "eligible", "/repo", 1000),
+            start("s", "history", "/repo", 100),
+            start("other", "other-session", "/repo", 1000),
+            start("s", "other-worktree", "/another", 1000),
+        ] {
+            db.record_start(&pre).unwrap();
+        }
+        let candidates = db.open_zcode_pres("/repo", "s", 500).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].tool_use_id, "eligible");
+        assert!(
+            !candidates[0].has_snapshot,
+            "restart cannot pretend it restored file evidence"
+        );
+        assert!(
+            db.zcode_pre_has_state("/repo", "s", "eligible", "trace-eligible", 1000, false)
+                .unwrap()
+        );
+        assert!(
+            !db.zcode_pre_has_state("/repo", "s", "eligible", "wrong-trace", 1000, false)
+                .unwrap()
+        );
+        assert!(
+            !db.zcode_pre_has_state("/repo", "s", "eligible", "trace-eligible", 1001, false)
+                .unwrap()
+        );
+        assert!(
+            !db.zcode_pre_has_state("/another", "s", "eligible", "trace-eligible", 1000, false)
+                .unwrap()
+        );
     }
 
     #[test]

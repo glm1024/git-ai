@@ -1070,7 +1070,12 @@ fn query_daemon_watermarks(repo_working_dir: &str) -> Option<DaemonWatermarks> {
 ///
 /// Returns `None` if the daemon is not running, the session is not found,
 /// or any communication error occurs.
-fn query_daemon_bash_snapshot(session_id: &str, tool_use_id: &str) -> Option<StatSnapshot> {
+fn query_daemon_bash_snapshot(
+    session_id: &str,
+    tool_use_id: &str,
+    expected_started_at_ns: Option<u128>,
+    expected_start_trace_id: Option<&str>,
+) -> Option<StatSnapshot> {
     let socket = effective_daemon_socket()?;
     if !socket.exists() {
         return None;
@@ -1078,6 +1083,8 @@ fn query_daemon_bash_snapshot(session_id: &str, tool_use_id: &str) -> Option<Sta
     let request = ControlRequest::BashSnapshotQuery {
         session_id: session_id.to_string(),
         tool_use_id: tool_use_id.to_string(),
+        expected_started_at_ns,
+        expected_start_trace_id: expected_start_trace_id.map(str::to_owned),
     };
     let response =
         send_control_request_with_timeout(&socket, &request, Duration::from_millis(500)).ok()?;
@@ -1525,7 +1532,18 @@ pub fn handle_bash_post_tool_use_with_cwd(
         }};
     }
 
-    let pre_snapshot = query_daemon_bash_snapshot(context.session_id, context.tool_use_id);
+    let pre_snapshot = query_daemon_bash_snapshot(
+        context.session_id,
+        context.tool_use_id,
+        context
+            .agent_metadata
+            .and_then(|metadata| metadata.get("zcode_expected_pre_started_at_ns"))
+            .and_then(|value| value.parse().ok()),
+        context
+            .agent_metadata
+            .and_then(|metadata| metadata.get("zcode_expected_pre_trace_id"))
+            .map(String::as_str),
+    );
 
     match pre_snapshot {
         Some(pre) => {

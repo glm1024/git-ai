@@ -1,0 +1,349 @@
+{
+  "schema": "zcode-independent-line-verification/v1",
+  "scenario": "zcode-deep-20261028-v1",
+  "repo": "/Users/mark/workspace/babel-zcode-acceptance-20261028",
+  "commit": "e86423064779fa69bd1113900c30b4c238b50086",
+  "phase": "amend",
+  "file": "tests/fixtures/zcode_deep_20261028_v1/lineage.txt",
+  "verification_scope": "exact text, line kind, tool, external session, per-trace model; optional trace bindings",
+  "expected_generation_note": "If rounds share session/model, separate generation trace identity is checked only when --trace-roundN is supplied.",
+  "bindings": {
+    "round1": {
+      "session": "session_0d3bdb1e9ffb7f5d08838f86d5fe042f",
+      "model": "deepseek-v4.1-flash",
+      "traces": []
+    },
+    "round2": {
+      "session": "session_7825076eb99173157eecb17e414d3a56",
+      "model": "deepseek-v4.1-flash",
+      "traces": []
+    }
+  },
+  "expected_counts": {
+    "ai": 6,
+    "unknown": 7,
+    "known_human": 0
+  },
+  "actual_counts": {
+    "ai": 6,
+    "unknown": 7,
+    "known_human": 0,
+    "unresolved": 0
+  },
+  "expected_text_sha256": "5c5849ee6d2b2a409efc8a1a0a4b5f8fc956ed69193539659244949d82ae3292",
+  "actual_text_sha256": "5c5849ee6d2b2a409efc8a1a0a4b5f8fc956ed69193539659244949d82ae3292",
+  "text_matches": true,
+  "rows": [
+    {
+      "line": 1,
+      "id": "ZDA-H01",
+      "text": "ZDA-H01 | baseline stable alpha",
+      "expected": {
+        "id": "ZDA-H01",
+        "kind": "unknown"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "origin": {
+        "commit": "68bba57f2f9d44446dea853bcf14813edcf87b69",
+        "origin_line": 1,
+        "text": "ZDA-H01 | baseline stable alpha"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 2,
+      "id": "ZDA-H02",
+      "text": "ZDA-H02 | round2 replaced baseline beta",
+      "expected": {
+        "id": "ZDA-H02",
+        "kind": "ai",
+        "generation": "round2",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "ai",
+        "author_id": "s_51f4a0c49ed368::checkpoint-job:58467e8b1dc293b3feebdbd06f4cd040b0bff7a3004612dd9a6ec1d3e058ed59",
+        "session_key": "s_51f4a0c49ed368",
+        "trace": "checkpoint-job:58467e8b1dc293b3feebdbd06f4cd040b0bff7a3004612dd9a6ec1d3e058ed59",
+        "tool": "zcode",
+        "session": "session_7825076eb99173157eecb17e414d3a56",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "origin": {
+        "commit": "e86423064779fa69bd1113900c30b4c238b50086",
+        "origin_line": 2,
+        "text": "ZDA-H02 | round2 replaced baseline beta"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 3,
+      "id": "ZDA-H03",
+      "text": "ZDA-H03 | baseline stable gamma",
+      "expected": {
+        "id": "ZDA-H03",
+        "kind": "unknown"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "origin": {
+        "commit": "68bba57f2f9d44446dea853bcf14813edcf87b69",
+        "origin_line": 3,
+        "text": "ZDA-H03 | baseline stable gamma"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 4,
+      "id": "ZDA-H04",
+      "text": "ZDA-H04 | baseline stable delta",
+      "expected": {
+        "id": "ZDA-H04",
+        "kind": "unknown"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "origin": {
+        "commit": "68bba57f2f9d44446dea853bcf14813edcf87b69",
+        "origin_line": 4,
+        "text": "ZDA-H04 | baseline stable delta"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 5,
+      "id": "ZDA-H05",
+      "text": "ZDA-H05 | baseline stable epsilon",
+      "expected": {
+        "id": "ZDA-H05",
+        "kind": "unknown"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "origin": {
+        "commit": "68bba57f2f9d44446dea853bcf14813edcf87b69",
+        "origin_line": 5,
+        "text": "ZDA-H05 | baseline stable epsilon"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 6,
+      "id": "ZDA-H06",
+      "text": "ZDA-H06 | baseline stable zeta",
+      "expected": {
+        "id": "ZDA-H06",
+        "kind": "unknown"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "origin": {
+        "commit": "68bba57f2f9d44446dea853bcf14813edcf87b69",
+        "origin_line": 6,
+        "text": "ZDA-H06 | baseline stable zeta"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 7,
+      "id": "ZDA-A01",
+      "text": "ZDA-A01 | round2 rewrote alpha",
+      "expected": {
+        "id": "ZDA-A01",
+        "kind": "ai",
+        "generation": "round2",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "ai",
+        "author_id": "s_51f4a0c49ed368::checkpoint-job:58467e8b1dc293b3feebdbd06f4cd040b0bff7a3004612dd9a6ec1d3e058ed59",
+        "session_key": "s_51f4a0c49ed368",
+        "trace": "checkpoint-job:58467e8b1dc293b3feebdbd06f4cd040b0bff7a3004612dd9a6ec1d3e058ed59",
+        "tool": "zcode",
+        "session": "session_7825076eb99173157eecb17e414d3a56",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "origin": {
+        "commit": "e86423064779fa69bd1113900c30b4c238b50086",
+        "origin_line": 7,
+        "text": "ZDA-A01 | round2 rewrote alpha"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 8,
+      "id": "ZDA-A02",
+      "text": "ZDA-A02 | human override after round1",
+      "expected": {
+        "id": "ZDA-A02",
+        "kind": "unknown"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "origin": {
+        "commit": "68bba57f2f9d44446dea853bcf14813edcf87b69",
+        "origin_line": 8,
+        "text": "ZDA-A02 | human override after round1"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 9,
+      "id": "ZDA-H07",
+      "text": "ZDA-H07 | human insertion after round1",
+      "expected": {
+        "id": "ZDA-H07",
+        "kind": "unknown"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "origin": {
+        "commit": "68bba57f2f9d44446dea853bcf14813edcf87b69",
+        "origin_line": 10,
+        "text": "ZDA-H07 | human insertion after round1"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 10,
+      "id": "ZDA-A04",
+      "text": "ZDA-A04 | round2 edited delta",
+      "expected": {
+        "id": "ZDA-A04",
+        "kind": "ai",
+        "generation": "round2",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "ai",
+        "author_id": "s_51f4a0c49ed368::checkpoint-job:58467e8b1dc293b3feebdbd06f4cd040b0bff7a3004612dd9a6ec1d3e058ed59",
+        "session_key": "s_51f4a0c49ed368",
+        "trace": "checkpoint-job:58467e8b1dc293b3feebdbd06f4cd040b0bff7a3004612dd9a6ec1d3e058ed59",
+        "tool": "zcode",
+        "session": "session_7825076eb99173157eecb17e414d3a56",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "origin": {
+        "commit": "e86423064779fa69bd1113900c30b4c238b50086",
+        "origin_line": 10,
+        "text": "ZDA-A04 | round2 edited delta"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 11,
+      "id": "ZDA-A05",
+      "text": "ZDA-A05 | round1 epsilon preserved through amend",
+      "expected": {
+        "id": "ZDA-A05",
+        "kind": "ai",
+        "generation": "round1",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "ai",
+        "author_id": "s_5b15d850b8a7f8::checkpoint-job:7a2bbac279d8986dc555421ea478054b2e6614167daa603fbc49a4fe8c354777",
+        "session_key": "s_5b15d850b8a7f8",
+        "trace": "checkpoint-job:7a2bbac279d8986dc555421ea478054b2e6614167daa603fbc49a4fe8c354777",
+        "tool": "zcode",
+        "session": "session_0d3bdb1e9ffb7f5d08838f86d5fe042f",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "origin": {
+        "commit": "e86423064779fa69bd1113900c30b4c238b50086",
+        "origin_line": 11,
+        "text": "ZDA-A05 | round1 epsilon preserved through amend"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 12,
+      "id": "ZDA-A06",
+      "text": "ZDA-A06 | round1 zeta staged only for amend",
+      "expected": {
+        "id": "ZDA-A06",
+        "kind": "ai",
+        "generation": "round1",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "ai",
+        "author_id": "s_5b15d850b8a7f8::checkpoint-job:7a2bbac279d8986dc555421ea478054b2e6614167daa603fbc49a4fe8c354777",
+        "session_key": "s_5b15d850b8a7f8",
+        "trace": "checkpoint-job:7a2bbac279d8986dc555421ea478054b2e6614167daa603fbc49a4fe8c354777",
+        "tool": "zcode",
+        "session": "session_0d3bdb1e9ffb7f5d08838f86d5fe042f",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "origin": {
+        "commit": "e86423064779fa69bd1113900c30b4c238b50086",
+        "origin_line": 12,
+        "text": "ZDA-A06 | round1 zeta staged only for amend"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 13,
+      "id": "ZDA-B01",
+      "text": "ZDA-B01 | round2 new line staged only for amend",
+      "expected": {
+        "id": "ZDA-B01",
+        "kind": "ai",
+        "generation": "round2",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "ai",
+        "author_id": "s_51f4a0c49ed368::checkpoint-job:58467e8b1dc293b3feebdbd06f4cd040b0bff7a3004612dd9a6ec1d3e058ed59",
+        "session_key": "s_51f4a0c49ed368",
+        "trace": "checkpoint-job:58467e8b1dc293b3feebdbd06f4cd040b0bff7a3004612dd9a6ec1d3e058ed59",
+        "tool": "zcode",
+        "session": "session_7825076eb99173157eecb17e414d3a56",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "origin": {
+        "commit": "e86423064779fa69bd1113900c30b4c238b50086",
+        "origin_line": 13,
+        "text": "ZDA-B01 | round2 new line staged only for amend"
+      },
+      "passed": true,
+      "errors": []
+    }
+  ],
+  "errors": [],
+  "passed": true,
+  "oracle_sha256": "49829488e35bb1c5c050c814352d28fda174b8ebb4fc163797570eb759289740"
+}

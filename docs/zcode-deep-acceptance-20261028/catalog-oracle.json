@@ -1,0 +1,334 @@
+{
+  "schema": "zcode-independent-batch-oracle/v1",
+  "scenario_id": "zcode-deep-20261028-batch-v1",
+  "file": "tests/fixtures/zcode_deep_20261028_v1/catalog.jsonl",
+  "expected_kind": "ai",
+  "expected_tool": "zcode",
+  "model_default": "deepseek-v4.1-flash",
+  "require_trace_models": true,
+  "row_count": 64,
+  "comparison": "exact objects, exact field types, unique IDs and exact order; JSON whitespace/key order may differ",
+  "canonical_records_sha256": "c6ad9f50abc4644a35e496ed22f598dd9a82f8f244f6865cf0b5f3f505c7a5e7",
+  "records": [
+    {
+      "id": 1,
+      "code": "ZDB-001",
+      "enabled": false
+    },
+    {
+      "id": 2,
+      "code": "ZDB-002",
+      "enabled": true
+    },
+    {
+      "id": 3,
+      "code": "ZDB-003",
+      "enabled": false
+    },
+    {
+      "id": 4,
+      "code": "ZDB-004",
+      "enabled": true
+    },
+    {
+      "id": 5,
+      "code": "ZDB-005",
+      "enabled": false
+    },
+    {
+      "id": 6,
+      "code": "ZDB-006",
+      "enabled": true
+    },
+    {
+      "id": 7,
+      "code": "ZDB-007",
+      "enabled": false
+    },
+    {
+      "id": 8,
+      "code": "ZDB-008",
+      "enabled": true
+    },
+    {
+      "id": 9,
+      "code": "ZDB-009",
+      "enabled": false
+    },
+    {
+      "id": 10,
+      "code": "ZDB-010",
+      "enabled": true
+    },
+    {
+      "id": 11,
+      "code": "ZDB-011",
+      "enabled": false
+    },
+    {
+      "id": 12,
+      "code": "ZDB-012",
+      "enabled": true
+    },
+    {
+      "id": 13,
+      "code": "ZDB-013",
+      "enabled": false
+    },
+    {
+      "id": 14,
+      "code": "ZDB-014",
+      "enabled": true
+    },
+    {
+      "id": 15,
+      "code": "ZDB-015",
+      "enabled": false
+    },
+    {
+      "id": 16,
+      "code": "ZDB-016",
+      "enabled": true
+    },
+    {
+      "id": 17,
+      "code": "ZDB-017",
+      "enabled": false
+    },
+    {
+      "id": 18,
+      "code": "ZDB-018",
+      "enabled": true
+    },
+    {
+      "id": 19,
+      "code": "ZDB-019",
+      "enabled": false
+    },
+    {
+      "id": 20,
+      "code": "ZDB-020",
+      "enabled": true
+    },
+    {
+      "id": 21,
+      "code": "ZDB-021",
+      "enabled": false
+    },
+    {
+      "id": 22,
+      "code": "ZDB-022",
+      "enabled": true
+    },
+    {
+      "id": 23,
+      "code": "ZDB-023",
+      "enabled": false
+    },
+    {
+      "id": 24,
+      "code": "ZDB-024",
+      "enabled": true
+    },
+    {
+      "id": 25,
+      "code": "ZDB-025",
+      "enabled": false
+    },
+    {
+      "id": 26,
+      "code": "ZDB-026",
+      "enabled": true
+    },
+    {
+      "id": 27,
+      "code": "ZDB-027",
+      "enabled": false
+    },
+    {
+      "id": 28,
+      "code": "ZDB-028",
+      "enabled": true
+    },
+    {
+      "id": 29,
+      "code": "ZDB-029",
+      "enabled": false
+    },
+    {
+      "id": 30,
+      "code": "ZDB-030",
+      "enabled": true
+    },
+    {
+      "id": 31,
+      "code": "ZDB-031",
+      "enabled": false
+    },
+    {
+      "id": 32,
+      "code": "ZDB-032",
+      "enabled": true
+    },
+    {
+      "id": 33,
+      "code": "ZDB-033",
+      "enabled": false
+    },
+    {
+      "id": 34,
+      "code": "ZDB-034",
+      "enabled": true
+    },
+    {
+      "id": 35,
+      "code": "ZDB-035",
+      "enabled": false
+    },
+    {
+      "id": 36,
+      "code": "ZDB-036",
+      "enabled": true
+    },
+    {
+      "id": 37,
+      "code": "ZDB-037",
+      "enabled": false
+    },
+    {
+      "id": 38,
+      "code": "ZDB-038",
+      "enabled": true
+    },
+    {
+      "id": 39,
+      "code": "ZDB-039",
+      "enabled": false
+    },
+    {
+      "id": 40,
+      "code": "ZDB-040",
+      "enabled": true
+    },
+    {
+      "id": 41,
+      "code": "ZDB-041",
+      "enabled": false
+    },
+    {
+      "id": 42,
+      "code": "ZDB-042",
+      "enabled": true
+    },
+    {
+      "id": 43,
+      "code": "ZDB-043",
+      "enabled": false
+    },
+    {
+      "id": 44,
+      "code": "ZDB-044",
+      "enabled": true
+    },
+    {
+      "id": 45,
+      "code": "ZDB-045",
+      "enabled": false
+    },
+    {
+      "id": 46,
+      "code": "ZDB-046",
+      "enabled": true
+    },
+    {
+      "id": 47,
+      "code": "ZDB-047",
+      "enabled": false
+    },
+    {
+      "id": 48,
+      "code": "ZDB-048",
+      "enabled": true
+    },
+    {
+      "id": 49,
+      "code": "ZDB-049",
+      "enabled": false
+    },
+    {
+      "id": 50,
+      "code": "ZDB-050",
+      "enabled": true
+    },
+    {
+      "id": 51,
+      "code": "ZDB-051",
+      "enabled": false
+    },
+    {
+      "id": 52,
+      "code": "ZDB-052",
+      "enabled": true
+    },
+    {
+      "id": 53,
+      "code": "ZDB-053",
+      "enabled": false
+    },
+    {
+      "id": 54,
+      "code": "ZDB-054",
+      "enabled": true
+    },
+    {
+      "id": 55,
+      "code": "ZDB-055",
+      "enabled": false
+    },
+    {
+      "id": 56,
+      "code": "ZDB-056",
+      "enabled": true
+    },
+    {
+      "id": 57,
+      "code": "ZDB-057",
+      "enabled": false
+    },
+    {
+      "id": 58,
+      "code": "ZDB-058",
+      "enabled": true
+    },
+    {
+      "id": 59,
+      "code": "ZDB-059",
+      "enabled": false
+    },
+    {
+      "id": 60,
+      "code": "ZDB-060",
+      "enabled": true
+    },
+    {
+      "id": 61,
+      "code": "ZDB-061",
+      "enabled": false
+    },
+    {
+      "id": 62,
+      "code": "ZDB-062",
+      "enabled": true
+    },
+    {
+      "id": 63,
+      "code": "ZDB-063",
+      "enabled": false
+    },
+    {
+      "id": 64,
+      "code": "ZDB-064",
+      "enabled": true
+    }
+  ]
+}

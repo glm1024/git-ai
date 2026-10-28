@@ -1,0 +1,11 @@
+ZDA-H01 | baseline stable alpha
+ZDA-H02 | round2 replaced baseline beta
+ZDA-H03 | baseline stable gamma
+ZDA-H04 | baseline stable delta
+ZDA-H05 | baseline stable epsilon
+ZDA-H06 | baseline stable zeta
+ZDA-A01 | round2 rewrote alpha
+ZDA-A02 | human override after round1
+ZDA-H07 | human insertion after round1
+ZDA-A04 | round2 edited delta
+ZDA-A05 | round1 epsilon preserved through amend

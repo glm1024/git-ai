@@ -93,7 +93,7 @@ CLI 的成功回执仅确认传输接收；后台随后异步准入/应用，缺
 - 第一笔提交的上传被另一个大型历史任务阻塞，事件已经生成但未尝试上传。已优化分块 JSON 字节预算、前移锁内大包校验，并隔离历史计算与 outbox 上传；await 已使用代次屏障保留多调用者等待语义；deferred commit 单测 18 项、telemetry 单测 41 项、TestRepo 集成 5 项全部通过。大型历史报告仍受原 64 MiB 上限约束，不声称已清空历史积压。没有删除队列或主动重放历史任务。
 
 - 最终测试版通过 `task dev` 安装，原 reporting 配置逐字节保持一致。R3 会话 `session_175e42aff92fe0ad348936d3a0829e3e` 使用 Bash 新增 UTF-8 fixture、两次原生 Edit 更新已有测试；模型和提供商均与 R2 一致。6 项 Python 单测由 ZCode 执行并独立复验通过。
-- R3 提交 `0c89941cc8b3f28ac521f20f2fd1bde36e41a287` 仅包含两个指定路径，新增 12 行。Git note/逐行 blame/后端四个候选一致：fixture 第 1 行、测试第 2、7、28—34 行共 10 行归 ZCode；第 8—9 两个分隔空行保留 Unknown，原有 26 行未重复归为本次新增。管理端展示 AI 10 / 人工 0 / Unknown 2，与原始事实一致。
+- R3 提交 `0c89941cc8b3f28ac521f20f2fd1bde36e41a287` 仅包含两个指定路径，新增 12 行。Git note/逐行 blame/后端四个候选一致：fixture 第 1 行、测试第 2、7、28—34 行共 10 行归 ZCode；第 8—9 两个分隔空行保留 Unknown，原有 26 行未重复归为本次新增。管理端展示 AI 10 / 人工 0 / Unknown 2，与原始事实一致。8/8 个新增非空行均已归因。两空白 Unknown 源于通用 checkpoint diff 与 Git commit diff 对重复空白的不同对齐：前者把空白增量对齐为第 5—6 行，后者为第 8—9 行；提交归因只认双方新增坐标与 AI 证据交集，不扩大猜测。第 28—34 行范围包含另外两条成功归因的空白，所以不是全局忽略空白，也不能声称 12/12 归因。
 - R3 原 outbox 事件在 12:02:36 生成、12:02:37 自然送达，后端 Event 1 投影成功；这是最终安装版上传调度的实机证据。没有手动 flush/reingest、重置事件键或修改队列数据库。
 - fixture 有意保留首尾空格以测试 normalize_text，`git diff --cached --check` 对该夹具的 trailing whitespace 提示符合测试设计；两个适配源仓库的 diff check 通过。
 
@@ -109,8 +109,8 @@ ZCode SQLite 原始 model_usage、Git AI 已准入 source/day bucket、后端最
 
 缓存写入均为 0；输出已包含 reasoning，不再次相加。最新 td5 快照 sequence=23，原生上传队列内该日快照无待发送项，不将其他历史积压计为这两轮失败。
 
-R3 最后标题请求在主回复结束约 18 秒后完成落库；现有后台扫描于 12:07:21 自然读入，较标题完成晚约 4 分 24 秒。这是更新延迟而非永久漏采。后续短窗口补采改进：验证中。
+R3 最后标题请求在主回复结束约 18 秒后完成落库；现有后台扫描于 12:07:21 自然读入，较标题完成晚约 4 分 24 秒。这是更新延迟而非永久漏采。已增加已登记 ZCode 会话的有限补采：名义初读后约 5/20/60 秒追加读取，同会话合并，之后停止；补采和常规周期扫描均不自续期开窗，进程首次恢复只为持久登记源恢复一轮，激活边界不变。调度拥塞和有限失败重试可使读取后移，不是硬实时保证。先以 Stop 空批次未安排补采的断言复现，再完成修复；全部 stream_worker 单测 33/33 通过，覆盖 Stop 后 18 秒标题落库、20 秒补采、历史排除、去重、窗口终止、多会话独立及启动恢复。独立审查无阻塞项。该新调度时序由确定性自动化验证；上面真实标题完整计数来自安装此改进前的自然扫描，不混称新策略的真实请求验收。最终已再次通过 `task dev` 安装，daemon 就绪、原配置逐字节不变；安装日志及二进制备份位于上述备份目录的 `late-title-update/`。安装后自然恢复补采的末次读取发生在 12:19:07，12:19:53 再核水位不再推进，证明有限窗口已停止；R3 仍为单游标、原激活边界、12 请求、零错误。两轮客户端及后端仍恰 23 请求 / sequence 23 / 735571 Token，日快照无待发项且后端同来源仅一条事实，没有重复累计。
 
-截图：[ZCode 执行与提交结果](zcode-acceptance-20261028/zcode-test-result.png)、[管理端 ZCode 独立用量](zcode-acceptance-20261028/token-model-detail.png)。
+截图：[ZCode 执行与提交结果](zcode-acceptance-20261028/zcode-test-result.png)、[管理端 ZCode 独立用量](zcode-acceptance-20261028/token-model-detail.png)、[提交归因审计](zcode-acceptance-20261028/commit-attribution.png)。
 
 验收边界：仅本机 macOS ZCode 3.16.3、指定 provider/model、Write/Edit/Bash 实际运行；ApplyPatch、子会话及 Windows 仍只有对应自动化/静态证据。两个测试提交均未推送，所以管理端候选处于“等待目标分支扫描确认”，不冒充正式 AI 确认入库。保留 Babel 原有未暂存修改及并行 DSH 测试内容；没有部署或迁移生产。

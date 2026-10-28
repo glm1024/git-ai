@@ -44,6 +44,69 @@ pub fn resolve_session_context(
     .map_err(sql_error)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZCodeBashTerminal {
+    PermissionDenied,
+    Cancelled,
+}
+
+/// Read metadata for exactly one observed call. The source interval must
+/// contain its frozen pre, and conflicting/reused call records fail closed.
+pub(crate) fn terminal_bash_call(
+    path: &Path,
+    session_id: &str,
+    call_id: &str,
+    pre_started_at_millis: i64,
+    observed_at_millis: i64,
+    trace_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<Option<ZCodeBashTerminal>, StreamError> {
+    let conn = open_readonly(path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT trace_id, turn_id, started_at, completed_at,
+        tool_name,status,error_type,cancelled_by_user FROM tool_usage
+        WHERE session_id=?1 AND tool_call_id=?2 LIMIT 2",
+        )
+        .map_err(sql_error)?;
+    let rows = stmt
+        .query_map(params![session_id, call_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, bool>(7)?,
+            ))
+        })
+        .map_err(sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_error)?;
+    let [(actual_trace, actual_turn, started, Some(completed), tool, status, error, cancelled)] =
+        rows.as_slice()
+    else {
+        return Ok(None);
+    };
+    if tool != "Bash"
+        || status != "error"
+        || *started > pre_started_at_millis
+        || *completed < pre_started_at_millis
+        || *completed > observed_at_millis
+        || trace_id.is_some_and(|expected| actual_trace.as_deref() != Some(expected))
+        || turn_id.is_some_and(|expected| actual_turn.as_deref() != Some(expected))
+    {
+        return Ok(None);
+    }
+    Ok(match error.as_deref() {
+        Some("permission_denied") => Some(ZCodeBashTerminal::PermissionDenied),
+        Some("tool_cancelled") if *cancelled => Some(ZCodeBashTerminal::Cancelled),
+        _ => None,
+    })
+}
+
 fn sql_error(error: rusqlite::Error) -> StreamError {
     if let rusqlite::Error::SqliteFailure(ref failure, _) = error
         && matches!(
@@ -465,6 +528,60 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use serde_json::json;
+
+    #[test]
+    fn zcode_terminal_metadata_requires_unique_call_and_exact_pre_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.sqlite");
+        let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+        conn.execute_batch("CREATE TABLE tool_usage(session_id TEXT,tool_call_id TEXT,trace_id TEXT,turn_id TEXT,
+            tool_name TEXT,status TEXT,error_type TEXT,started_at INTEGER,completed_at INTEGER,cancelled_by_user INTEGER);
+            INSERT INTO tool_usage VALUES('s','call','trace','turn','Bash','error','permission_denied',100,200,0);").unwrap();
+        let read = |session, call, pre, observed, trace, turn| {
+            terminal_bash_call(&path, session, call, pre, observed, trace, turn).unwrap()
+        };
+        assert_eq!(
+            read("s", "call", 150, 250, Some("trace"), Some("turn")),
+            Some(ZCodeBashTerminal::PermissionDenied)
+        );
+        for (session, call, pre, observed, trace, turn) in [
+            ("other", "call", 150, 250, Some("trace"), Some("turn")),
+            ("s", "other", 150, 250, Some("trace"), Some("turn")),
+            ("s", "call", 99, 250, Some("trace"), Some("turn")),
+            ("s", "call", 201, 250, Some("trace"), Some("turn")),
+            ("s", "call", 150, 199, Some("trace"), Some("turn")),
+            ("s", "call", 150, 250, Some("different"), Some("turn")),
+            ("s", "call", 150, 250, Some("trace"), Some("different")),
+        ] {
+            assert_eq!(read(session, call, pre, observed, trace, turn), None);
+        }
+        conn.execute_batch(
+            "UPDATE tool_usage SET error_type='tool_cancelled',cancelled_by_user=1;",
+        )
+        .unwrap();
+        assert_eq!(
+            read("s", "call", 150, 250, None, None),
+            Some(ZCodeBashTerminal::Cancelled)
+        );
+        conn.execute_batch("UPDATE tool_usage SET cancelled_by_user=0;")
+            .unwrap();
+        assert_eq!(read("s", "call", 150, 250, None, None), None);
+        conn.execute_batch("UPDATE tool_usage SET error_type='generic_error',cancelled_by_user=1;")
+            .unwrap();
+        assert_eq!(read("s", "call", 150, 250, None, None), None);
+        conn.execute_batch("UPDATE tool_usage SET error_type='permission_denied';
+            INSERT INTO tool_usage VALUES('s','call','trace','turn','Bash','completed',NULL,100,200,0);").unwrap();
+        assert_eq!(
+            read("s", "call", 150, 250, None, None),
+            None,
+            "conflicting success must not be filtered out before uniqueness validation"
+        );
+        conn.execute_batch("DROP TABLE tool_usage;").unwrap();
+        assert!(
+            terminal_bash_call(&path, "s", "call", 150, 250, None, None).is_err(),
+            "schema failure must not manufacture a terminal"
+        );
+    }
 
     fn fixture(path: &Path) -> Connection {
         let conn = crate::sqlite::open_with_memory_limits(path).unwrap();

@@ -538,12 +538,15 @@ fn execute_event(
         ParsedHookEvent::PostBashCall(e) => execute_post_bash_call(e, strict_errors),
         ParsedHookEvent::KnownHumanEdit(e) => execute_known_human_edit(e),
         ParsedHookEvent::UntrackedEdit(e) => execute_untracked_edit(e),
-        ParsedHookEvent::SessionActivity(e) => execute_session_activity(e),
+        ParsedHookEvent::SessionActivity(e) => execute_session_activity(e, strict_errors),
         ParsedHookEvent::FailedToolCall(e) => execute_failed_tool_call(e, strict_errors),
     }
 }
 
-fn execute_session_activity(e: SessionActivity) -> Result<Vec<CheckpointRequest>, GitAiError> {
+fn execute_session_activity(
+    e: SessionActivity,
+    strict_errors: bool,
+) -> Result<Vec<CheckpointRequest>, GitAiError> {
     use crate::daemon::{
         DaemonConfig, control_api::ControlRequest, send_control_request_with_timeout,
     };
@@ -558,7 +561,17 @@ fn execute_session_activity(e: SessionActivity) -> Result<Vec<CheckpointRequest>
             || "daemon rejected agent session registration".to_string(),
         )));
     }
-    Ok(vec![])
+    let failed_tools: Vec<FailedToolCall> = serde_json::from_value(
+        response
+            .data
+            .and_then(|data| data.get("zcode_failed_tools").cloned())
+            .unwrap_or_else(|| serde_json::json!([])),
+    )?;
+    let mut requests = Vec::new();
+    for failed in failed_tools {
+        requests.extend(execute_failed_tool_call(failed, strict_errors)?);
+    }
+    Ok(requests)
 }
 
 fn execute_failed_tool_call(

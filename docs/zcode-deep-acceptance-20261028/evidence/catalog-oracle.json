@@ -1,0 +1,1623 @@
+{
+  "schema": "zcode-independent-batch-verification/v1",
+  "scenario": "zcode-deep-20261028-batch-v1",
+  "repo": "/Users/mark/workspace/babel-zcode-acceptance-20261028",
+  "commit": "20c440ecafa8bc6ebe882616fffeecaef59ce4ab",
+  "file": "tests/fixtures/zcode_deep_20261028_v1/catalog.jsonl",
+  "bindings": {
+    "batch": {
+      "session": "session_20692de393f51830de746c7a8a28bc30",
+      "model": "deepseek-v4.1-flash",
+      "traces": []
+    }
+  },
+  "expected_row_count": 64,
+  "actual_row_count": 64,
+  "canonical_records_sha256": "c6ad9f50abc4644a35e496ed22f598dd9a82f8f244f6865cf0b5f3f505c7a5e7",
+  "expected_records_sha256": "c6ad9f50abc4644a35e496ed22f598dd9a82f8f244f6865cf0b5f3f505c7a5e7",
+  "rows": [
+    {
+      "line": 1,
+      "expected": {
+        "id": 1,
+        "code": "ZDB-001",
+        "enabled": false
+      },
+      "actual": {
+        "id": 1,
+        "code": "ZDB-001",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 2,
+      "expected": {
+        "id": 2,
+        "code": "ZDB-002",
+        "enabled": true
+      },
+      "actual": {
+        "id": 2,
+        "code": "ZDB-002",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 3,
+      "expected": {
+        "id": 3,
+        "code": "ZDB-003",
+        "enabled": false
+      },
+      "actual": {
+        "id": 3,
+        "code": "ZDB-003",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 4,
+      "expected": {
+        "id": 4,
+        "code": "ZDB-004",
+        "enabled": true
+      },
+      "actual": {
+        "id": 4,
+        "code": "ZDB-004",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 5,
+      "expected": {
+        "id": 5,
+        "code": "ZDB-005",
+        "enabled": false
+      },
+      "actual": {
+        "id": 5,
+        "code": "ZDB-005",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 6,
+      "expected": {
+        "id": 6,
+        "code": "ZDB-006",
+        "enabled": true
+      },
+      "actual": {
+        "id": 6,
+        "code": "ZDB-006",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 7,
+      "expected": {
+        "id": 7,
+        "code": "ZDB-007",
+        "enabled": false
+      },
+      "actual": {
+        "id": 7,
+        "code": "ZDB-007",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 8,
+      "expected": {
+        "id": 8,
+        "code": "ZDB-008",
+        "enabled": true
+      },
+      "actual": {
+        "id": 8,
+        "code": "ZDB-008",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 9,
+      "expected": {
+        "id": 9,
+        "code": "ZDB-009",
+        "enabled": false
+      },
+      "actual": {
+        "id": 9,
+        "code": "ZDB-009",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 10,
+      "expected": {
+        "id": 10,
+        "code": "ZDB-010",
+        "enabled": true
+      },
+      "actual": {
+        "id": 10,
+        "code": "ZDB-010",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 11,
+      "expected": {
+        "id": 11,
+        "code": "ZDB-011",
+        "enabled": false
+      },
+      "actual": {
+        "id": 11,
+        "code": "ZDB-011",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 12,
+      "expected": {
+        "id": 12,
+        "code": "ZDB-012",
+        "enabled": true
+      },
+      "actual": {
+        "id": 12,
+        "code": "ZDB-012",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 13,
+      "expected": {
+        "id": 13,
+        "code": "ZDB-013",
+        "enabled": false
+      },
+      "actual": {
+        "id": 13,
+        "code": "ZDB-013",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 14,
+      "expected": {
+        "id": 14,
+        "code": "ZDB-014",
+        "enabled": true
+      },
+      "actual": {
+        "id": 14,
+        "code": "ZDB-014",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 15,
+      "expected": {
+        "id": 15,
+        "code": "ZDB-015",
+        "enabled": false
+      },
+      "actual": {
+        "id": 15,
+        "code": "ZDB-015",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 16,
+      "expected": {
+        "id": 16,
+        "code": "ZDB-016",
+        "enabled": true
+      },
+      "actual": {
+        "id": 16,
+        "code": "ZDB-016",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 17,
+      "expected": {
+        "id": 17,
+        "code": "ZDB-017",
+        "enabled": false
+      },
+      "actual": {
+        "id": 17,
+        "code": "ZDB-017",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 18,
+      "expected": {
+        "id": 18,
+        "code": "ZDB-018",
+        "enabled": true
+      },
+      "actual": {
+        "id": 18,
+        "code": "ZDB-018",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 19,
+      "expected": {
+        "id": 19,
+        "code": "ZDB-019",
+        "enabled": false
+      },
+      "actual": {
+        "id": 19,
+        "code": "ZDB-019",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 20,
+      "expected": {
+        "id": 20,
+        "code": "ZDB-020",
+        "enabled": true
+      },
+      "actual": {
+        "id": 20,
+        "code": "ZDB-020",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 21,
+      "expected": {
+        "id": 21,
+        "code": "ZDB-021",
+        "enabled": false
+      },
+      "actual": {
+        "id": 21,
+        "code": "ZDB-021",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 22,
+      "expected": {
+        "id": 22,
+        "code": "ZDB-022",
+        "enabled": true
+      },
+      "actual": {
+        "id": 22,
+        "code": "ZDB-022",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 23,
+      "expected": {
+        "id": 23,
+        "code": "ZDB-023",
+        "enabled": false
+      },
+      "actual": {
+        "id": 23,
+        "code": "ZDB-023",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 24,
+      "expected": {
+        "id": 24,
+        "code": "ZDB-024",
+        "enabled": true
+      },
+      "actual": {
+        "id": 24,
+        "code": "ZDB-024",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 25,
+      "expected": {
+        "id": 25,
+        "code": "ZDB-025",
+        "enabled": false
+      },
+      "actual": {
+        "id": 25,
+        "code": "ZDB-025",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 26,
+      "expected": {
+        "id": 26,
+        "code": "ZDB-026",
+        "enabled": true
+      },
+      "actual": {
+        "id": 26,
+        "code": "ZDB-026",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 27,
+      "expected": {
+        "id": 27,
+        "code": "ZDB-027",
+        "enabled": false
+      },
+      "actual": {
+        "id": 27,
+        "code": "ZDB-027",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 28,
+      "expected": {
+        "id": 28,
+        "code": "ZDB-028",
+        "enabled": true
+      },
+      "actual": {
+        "id": 28,
+        "code": "ZDB-028",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 29,
+      "expected": {
+        "id": 29,
+        "code": "ZDB-029",
+        "enabled": false
+      },
+      "actual": {
+        "id": 29,
+        "code": "ZDB-029",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 30,
+      "expected": {
+        "id": 30,
+        "code": "ZDB-030",
+        "enabled": true
+      },
+      "actual": {
+        "id": 30,
+        "code": "ZDB-030",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 31,
+      "expected": {
+        "id": 31,
+        "code": "ZDB-031",
+        "enabled": false
+      },
+      "actual": {
+        "id": 31,
+        "code": "ZDB-031",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 32,
+      "expected": {
+        "id": 32,
+        "code": "ZDB-032",
+        "enabled": true
+      },
+      "actual": {
+        "id": 32,
+        "code": "ZDB-032",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 33,
+      "expected": {
+        "id": 33,
+        "code": "ZDB-033",
+        "enabled": false
+      },
+      "actual": {
+        "id": 33,
+        "code": "ZDB-033",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 34,
+      "expected": {
+        "id": 34,
+        "code": "ZDB-034",
+        "enabled": true
+      },
+      "actual": {
+        "id": 34,
+        "code": "ZDB-034",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 35,
+      "expected": {
+        "id": 35,
+        "code": "ZDB-035",
+        "enabled": false
+      },
+      "actual": {
+        "id": 35,
+        "code": "ZDB-035",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 36,
+      "expected": {
+        "id": 36,
+        "code": "ZDB-036",
+        "enabled": true
+      },
+      "actual": {
+        "id": 36,
+        "code": "ZDB-036",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 37,
+      "expected": {
+        "id": 37,
+        "code": "ZDB-037",
+        "enabled": false
+      },
+      "actual": {
+        "id": 37,
+        "code": "ZDB-037",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 38,
+      "expected": {
+        "id": 38,
+        "code": "ZDB-038",
+        "enabled": true
+      },
+      "actual": {
+        "id": 38,
+        "code": "ZDB-038",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 39,
+      "expected": {
+        "id": 39,
+        "code": "ZDB-039",
+        "enabled": false
+      },
+      "actual": {
+        "id": 39,
+        "code": "ZDB-039",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 40,
+      "expected": {
+        "id": 40,
+        "code": "ZDB-040",
+        "enabled": true
+      },
+      "actual": {
+        "id": 40,
+        "code": "ZDB-040",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 41,
+      "expected": {
+        "id": 41,
+        "code": "ZDB-041",
+        "enabled": false
+      },
+      "actual": {
+        "id": 41,
+        "code": "ZDB-041",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 42,
+      "expected": {
+        "id": 42,
+        "code": "ZDB-042",
+        "enabled": true
+      },
+      "actual": {
+        "id": 42,
+        "code": "ZDB-042",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 43,
+      "expected": {
+        "id": 43,
+        "code": "ZDB-043",
+        "enabled": false
+      },
+      "actual": {
+        "id": 43,
+        "code": "ZDB-043",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 44,
+      "expected": {
+        "id": 44,
+        "code": "ZDB-044",
+        "enabled": true
+      },
+      "actual": {
+        "id": 44,
+        "code": "ZDB-044",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 45,
+      "expected": {
+        "id": 45,
+        "code": "ZDB-045",
+        "enabled": false
+      },
+      "actual": {
+        "id": 45,
+        "code": "ZDB-045",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 46,
+      "expected": {
+        "id": 46,
+        "code": "ZDB-046",
+        "enabled": true
+      },
+      "actual": {
+        "id": 46,
+        "code": "ZDB-046",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 47,
+      "expected": {
+        "id": 47,
+        "code": "ZDB-047",
+        "enabled": false
+      },
+      "actual": {
+        "id": 47,
+        "code": "ZDB-047",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 48,
+      "expected": {
+        "id": 48,
+        "code": "ZDB-048",
+        "enabled": true
+      },
+      "actual": {
+        "id": 48,
+        "code": "ZDB-048",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 49,
+      "expected": {
+        "id": 49,
+        "code": "ZDB-049",
+        "enabled": false
+      },
+      "actual": {
+        "id": 49,
+        "code": "ZDB-049",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 50,
+      "expected": {
+        "id": 50,
+        "code": "ZDB-050",
+        "enabled": true
+      },
+      "actual": {
+        "id": 50,
+        "code": "ZDB-050",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 51,
+      "expected": {
+        "id": 51,
+        "code": "ZDB-051",
+        "enabled": false
+      },
+      "actual": {
+        "id": 51,
+        "code": "ZDB-051",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 52,
+      "expected": {
+        "id": 52,
+        "code": "ZDB-052",
+        "enabled": true
+      },
+      "actual": {
+        "id": 52,
+        "code": "ZDB-052",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 53,
+      "expected": {
+        "id": 53,
+        "code": "ZDB-053",
+        "enabled": false
+      },
+      "actual": {
+        "id": 53,
+        "code": "ZDB-053",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 54,
+      "expected": {
+        "id": 54,
+        "code": "ZDB-054",
+        "enabled": true
+      },
+      "actual": {
+        "id": 54,
+        "code": "ZDB-054",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 55,
+      "expected": {
+        "id": 55,
+        "code": "ZDB-055",
+        "enabled": false
+      },
+      "actual": {
+        "id": 55,
+        "code": "ZDB-055",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 56,
+      "expected": {
+        "id": 56,
+        "code": "ZDB-056",
+        "enabled": true
+      },
+      "actual": {
+        "id": 56,
+        "code": "ZDB-056",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 57,
+      "expected": {
+        "id": 57,
+        "code": "ZDB-057",
+        "enabled": false
+      },
+      "actual": {
+        "id": 57,
+        "code": "ZDB-057",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 58,
+      "expected": {
+        "id": 58,
+        "code": "ZDB-058",
+        "enabled": true
+      },
+      "actual": {
+        "id": 58,
+        "code": "ZDB-058",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 59,
+      "expected": {
+        "id": 59,
+        "code": "ZDB-059",
+        "enabled": false
+      },
+      "actual": {
+        "id": 59,
+        "code": "ZDB-059",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 60,
+      "expected": {
+        "id": 60,
+        "code": "ZDB-060",
+        "enabled": true
+      },
+      "actual": {
+        "id": 60,
+        "code": "ZDB-060",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 61,
+      "expected": {
+        "id": 61,
+        "code": "ZDB-061",
+        "enabled": false
+      },
+      "actual": {
+        "id": 61,
+        "code": "ZDB-061",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 62,
+      "expected": {
+        "id": 62,
+        "code": "ZDB-062",
+        "enabled": true
+      },
+      "actual": {
+        "id": 62,
+        "code": "ZDB-062",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 63,
+      "expected": {
+        "id": 63,
+        "code": "ZDB-063",
+        "enabled": false
+      },
+      "actual": {
+        "id": 63,
+        "code": "ZDB-063",
+        "enabled": false
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    },
+    {
+      "line": 64,
+      "expected": {
+        "id": 64,
+        "code": "ZDB-064",
+        "enabled": true
+      },
+      "actual": {
+        "id": 64,
+        "code": "ZDB-064",
+        "enabled": true
+      },
+      "source": {
+        "kind": "ai",
+        "author_id": "s_5e1506af1b460d::checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "session_key": "s_5e1506af1b460d",
+        "trace": "checkpoint-job:742a5d763623e79d2e5ee85f7e66097c941f6da7e887b0a84e40c9b84c7a55e1",
+        "tool": "zcode",
+        "session": "session_20692de393f51830de746c7a8a28bc30",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "passed": true,
+      "errors": []
+    }
+  ],
+  "errors": [],
+  "passed": true,
+  "oracle_sha256": "c81536f5aa0b1c367ff4b74e54fffd75ec101c0b6d9ae0f93ce4467fbbed7721"
+}

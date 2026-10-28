@@ -131,6 +131,18 @@ impl AgentPreset for ZCodePreset {
         if let Some(model) = model_context.as_ref() {
             metadata.insert("model_provider".into(), model.provider.clone());
         }
+        metadata.insert("zcode_hook_event".into(), event.into());
+        if let Some(path) = source_path.as_ref() {
+            metadata.insert("zcode_database_path".into(), path.display().to_string());
+        }
+        for (key, aliases) in [
+            ("zcode_runtime_trace_id", ["traceId", "trace_id"]),
+            ("zcode_runtime_turn_id", ["turnId", "turn_id"]),
+        ] {
+            if let Some(value) = text(&value, &aliases)? {
+                metadata.insert(key.into(), value.into());
+            }
+        }
         let context = PresetContext {
             agent_id: AgentId {
                 tool: "zcode".into(),

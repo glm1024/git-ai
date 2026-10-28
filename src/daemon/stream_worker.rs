@@ -26,6 +26,9 @@ use tokio::time::{Duration, interval};
 type StreamTaskKey = (PathBuf, String, String);
 
 const TRIGGERED_SWEEP_COOLDOWN: Duration = Duration::from_secs(30);
+// Three extra reads, nominally 5/20/60 seconds after the hook's initial read.
+// A catchup advances this finite sequence; only a genuine hook or startup resumes it.
+const ZCODE_CATCHUP_DELAYS_SECS: [u64; 3] = [5, 15, 40];
 
 fn canonicalize_stream_path(path: &Path) -> PathBuf {
     // Enrollment can precede source DB creation. Resolve the existing ancestor
@@ -96,6 +99,8 @@ pub(super) struct ProcessingTask {
     pub(super) canonical_path: PathBuf,
     pub(super) repo_work_dir: Option<PathBuf>,
     pub(super) retry_count: u32,
+    #[cfg_attr(test, serde(default))]
+    pub(super) zcode_catchup_attempt: Option<usize>,
     #[cfg_attr(test, serde(skip))]
     pub(super) next_retry_at: Option<std::time::Instant>,
 }
@@ -236,6 +241,30 @@ pub struct StreamWorkerHandle {
 }
 
 impl StreamWorkerHandle {
+    pub(crate) fn zcode_activation_boundary(
+        &self,
+        source: &StreamSource,
+    ) -> Result<Option<i64>, String> {
+        let path = canonicalize_stream_path(&source.path).display().to_string();
+        let Some(record) = self
+            .streams_db
+            .get_stream(&source.session_id, "transcript", &path)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        if record.tool != "zcode" || record.external_session_id != source.external_session_id {
+            return Ok(None);
+        }
+        let watermark = WatermarkType::ZCodeUsage
+            .deserialize(&record.watermark_value)
+            .map_err(|error| error.to_string())?;
+        Ok(watermark
+            .as_any()
+            .downcast_ref::<crate::streams::watermark::ZCodeWatermark>()
+            .map(|value| value.activated_at_millis))
+    }
+
     /// Notify the worker that a checkpoint was recorded.
     #[allow(clippy::too_many_arguments)]
     pub fn notify_checkpoint(
@@ -424,6 +453,7 @@ struct StreamWorker {
     sweep_coordinator: crate::daemon::sweep_coordinator::SweepCoordinator, // NEW
     priority_queue: BinaryHeap<ProcessingTask>,
     delayed_tasks: Vec<ProcessingTask>,
+    recovery_sweep_complete: bool,
     in_flight: HashSet<StreamTaskKey>,
     telemetry_handle: DaemonTelemetryWorkerHandle,
     shutdown_notify: Arc<Notify>,
@@ -459,6 +489,7 @@ impl StreamWorker {
             sweep_coordinator, // NEW
             priority_queue: BinaryHeap::new(),
             delayed_tasks: Vec::new(),
+            recovery_sweep_complete: false,
             in_flight: HashSet::new(),
             telemetry_handle,
             shutdown_notify,
@@ -616,6 +647,8 @@ impl StreamWorker {
             .run_sweep()
             .map_err(|e| e.to_string())?;
 
+        let resume_enrolled = !self.recovery_sweep_complete;
+        self.recovery_sweep_complete = true;
         tracing::info!(discovered = items.len(), "sweep completed");
 
         for (i, item) in items.iter().enumerate().take(10) {
@@ -681,7 +714,10 @@ impl StreamWorker {
                         &mut enqueued_this_sweep,
                     );
 
-                    for task in tasks {
+                    for mut task in tasks {
+                        if resume_enrolled && task.tool == "zcode" {
+                            task.zcode_catchup_attempt = Some(0);
+                        }
                         self.priority_queue.push(task);
                     }
                 }
@@ -741,6 +777,7 @@ impl StreamWorker {
                         canonical_path,
                         repo_work_dir: None,
                         retry_count: 0,
+                        zcode_catchup_attempt: None,
                         next_retry_at: None,
                     });
                 }
@@ -769,7 +806,10 @@ impl StreamWorker {
             &mut enqueued,
         );
 
-        for task in tasks {
+        for mut task in tasks {
+            if task.tool == "zcode" {
+                task.zcode_catchup_attempt = Some(0);
+            }
             self.priority_queue.push(task);
         }
 
@@ -884,6 +924,7 @@ impl StreamWorker {
                 canonical_path: canonical,
                 repo_work_dir: notification.repo_work_dir.clone(),
                 retry_count: 0,
+                zcode_catchup_attempt: None,
                 next_retry_at: None,
             });
         }
@@ -968,6 +1009,7 @@ impl StreamWorker {
                 canonical_path: stream_path,
                 repo_work_dir: repo_work_dir.map(|p| p.to_path_buf()),
                 retry_count: 0,
+                zcode_catchup_attempt: None,
                 next_retry_at: None,
             });
         }
@@ -1119,8 +1161,8 @@ impl StreamWorker {
         // Handle result
         match result {
             Ok(Ok(())) => {
-                // Success - task is done.
                 self.notify_token_usage(&task);
+                self.schedule_zcode_catchup(&task, Instant::now());
             }
             Ok(Err(e)) => {
                 // Error - handle retry logic
@@ -1499,8 +1541,42 @@ impl StreamWorker {
                 }
                 Ok(Ok(())) => {
                     self.notify_token_usage(&task);
+                    self.schedule_zcode_catchup(&task, Instant::now());
                 }
             }
+        }
+    }
+
+    /// Re-read only this enrolled SQLite session for bounded post-Stop writes.
+    /// No discovery, activation change, or self-renewing polling is involved.
+    fn schedule_zcode_catchup(&mut self, task: &ProcessingTask, now: Instant) {
+        if task.tool != "zcode" {
+            return;
+        }
+        let Some(attempt) = task.zcode_catchup_attempt else {
+            return;
+        };
+        let Some(delay) = ZCODE_CATCHUP_DELAYS_SECS.get(attempt) else {
+            return;
+        };
+        let mut next = task.clone();
+        next.priority = Priority::Low;
+        next.retry_count = 0;
+        next.zcode_catchup_attempt = Some(attempt + 1);
+        next.next_retry_at = Some(now + Duration::from_secs(*delay));
+        if let Some(existing) = self.delayed_tasks.iter_mut().find(|existing| {
+            existing.dedup_key() == next.dedup_key()
+                && existing.retry_count == 0
+                && existing.zcode_catchup_attempt.is_some()
+        }) {
+            // Genuine repeated hooks merge into one finite window; never delay
+            // an already scheduled read. Failed-task backoff remains separate.
+            existing.zcode_catchup_attempt = existing
+                .zcode_catchup_attempt
+                .min(next.zcode_catchup_attempt);
+            existing.next_retry_at = existing.next_retry_at.min(next.next_retry_at);
+        } else {
+            self.delayed_tasks.push(next);
         }
     }
 
@@ -1702,8 +1778,193 @@ mod scheduling_tests {
             canonical_path: PathBuf::from(format!("/test/{session_id}")),
             repo_work_dir: None,
             retry_count: 0,
+            zcode_catchup_attempt: None,
             next_retry_at,
         }
+    }
+
+    #[tokio::test]
+    async fn zcode_stop_schedules_bounded_catchup_for_late_usage() {
+        let (temp, mut worker, _shutdown, _sender) = make_worker();
+        let source = temp.path().join("zcode.sqlite");
+        let conn = crate::sqlite::open_with_memory_limits(&source).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_usage(id TEXT PRIMARY KEY, logical_request_id TEXT,
+            session_id TEXT, turn_id TEXT, trace_id TEXT, assistant_message_id TEXT,
+            parent_user_message_id TEXT, provider_id TEXT, model_id TEXT, status TEXT,
+            started_at INTEGER, input_tokens INTEGER, output_tokens INTEGER,
+            cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER);",
+        )
+        .unwrap();
+        worker
+            .handle_checkpoint_notification(CheckpointNotification {
+                session_id: "internal-late".into(),
+                tool: "zcode".into(),
+                trace_id: "stop".into(),
+                tool_use_id: None,
+                stream_path: source.clone(),
+                repo_work_dir: None,
+                external_session_id: "late".into(),
+                external_parent_session_id: None,
+            })
+            .await;
+        worker.process_next_task().await;
+        assert_eq!(
+            worker.delayed_tasks.len(),
+            1,
+            "Stop must schedule a bounded late-usage read"
+        );
+        let origin = worker.delayed_tasks[0].next_retry_at.unwrap() - Duration::from_secs(5);
+        let canonical_source = std::fs::canonicalize(&source).unwrap();
+        let record = worker
+            .streams_db
+            .get_stream(
+                "internal-late",
+                "transcript",
+                canonical_source.to_str().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let mut watermark = WatermarkType::ZCodeUsage
+            .deserialize(&record.watermark_value)
+            .unwrap();
+        let activation = watermark
+            .as_any()
+            .downcast_ref::<crate::streams::watermark::ZCodeWatermark>()
+            .unwrap()
+            .activated_at_millis;
+        let agent = crate::streams::agent::get_agent("zcode").unwrap();
+
+        worker.promote_ready_delayed_tasks(origin + Duration::from_secs(5));
+        let first = worker.priority_queue.pop().unwrap();
+        let batch = agent.read_incremental(&source, watermark, "late").unwrap();
+        assert!(batch.events.is_empty());
+        watermark = batch.new_watermark;
+        worker.schedule_zcode_catchup(&first, origin + Duration::from_secs(5));
+
+        // The title transaction lands 18 seconds after Stop. No new hook occurs.
+        worker.promote_ready_delayed_tasks(origin + Duration::from_secs(18));
+        assert!(worker.priority_queue.is_empty());
+        conn.execute(
+            "INSERT INTO model_usage VALUES('title','title-request','late',NULL,NULL,NULL,NULL,
+            'provider','model','completed',?1,497,160,0,0)",
+            [activation + 18_000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO model_usage VALUES('history','old-request','late',NULL,NULL,NULL,NULL,
+            'provider','model','completed',?1,999,999,0,0)",
+            [activation - 1],
+        )
+        .unwrap();
+        worker.promote_ready_delayed_tasks(origin + Duration::from_secs(20));
+        let second = worker.priority_queue.pop().unwrap();
+        let batch = agent.read_incremental(&source, watermark, "late").unwrap();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0]["zcode_usage"]["id"], "title");
+        // Drain the batch terminator just as process_session_blocking does.
+        let batch = agent
+            .read_incremental(&source, batch.new_watermark, "late")
+            .unwrap();
+        assert!(batch.events.is_empty());
+        watermark = batch.new_watermark;
+        worker.schedule_zcode_catchup(&second, origin + Duration::from_secs(20));
+
+        worker.promote_ready_delayed_tasks(origin + Duration::from_secs(60));
+        let last = worker.priority_queue.pop().unwrap();
+        let batch = agent.read_incremental(&source, watermark, "late").unwrap();
+        assert!(
+            batch.events.is_empty(),
+            "same request must not be counted twice"
+        );
+        assert_eq!(
+            batch
+                .new_watermark
+                .as_any()
+                .downcast_ref::<crate::streams::watermark::ZCodeWatermark>()
+                .unwrap()
+                .activated_at_millis,
+            activation
+        );
+        worker.schedule_zcode_catchup(&last, origin + Duration::from_secs(60));
+        worker.promote_ready_delayed_tasks(origin + Duration::from_secs(3600));
+        assert!(worker.delayed_tasks.is_empty());
+        assert!(
+            worker.priority_queue.is_empty(),
+            "catchup must never renew itself"
+        );
+
+        // A new worker's first sweep resumes persisted enrollment, with the
+        // original activation. Later periodic sweeps must not renew the window.
+        worker.run_sweep(Priority::Low).await.unwrap();
+        let recovered = worker
+            .priority_queue
+            .iter()
+            .find(|task| task.session_id == "internal-late")
+            .unwrap();
+        assert_eq!(recovered.zcode_catchup_attempt, Some(0));
+        worker.priority_queue.clear();
+        worker.run_sweep(Priority::Low).await.unwrap();
+        let periodic = worker
+            .priority_queue
+            .iter()
+            .find(|task| task.session_id == "internal-late")
+            .unwrap();
+        assert_eq!(periodic.zcode_catchup_attempt, None);
+        let recovered_record = worker
+            .streams_db
+            .get_stream(
+                "internal-late",
+                "transcript",
+                canonical_source.to_str().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_record.watermark_value, record.watermark_value);
+    }
+
+    #[test]
+    fn zcode_catchup_coalesces_per_session_and_only_hooks_restart_the_window() {
+        let (_temp, mut worker, _shutdown, _sender) = make_worker();
+        let now = Instant::now();
+        let mut first = task("first", None);
+        first.tool = "zcode".into();
+        first.canonical_path = PathBuf::from("/shared.sqlite");
+        first.zcode_catchup_attempt = Some(0);
+        worker.schedule_zcode_catchup(&first, now);
+        worker.schedule_zcode_catchup(&first, now + Duration::from_secs(1));
+        assert_eq!(worker.delayed_tasks.len(), 1);
+        assert_eq!(worker.delayed_tasks[0].priority, Priority::Low);
+        assert_eq!(
+            worker.delayed_tasks[0].next_retry_at,
+            Some(now + Duration::from_secs(5))
+        );
+        let mut other = first.clone();
+        other.session_id = "second".into();
+        worker.schedule_zcode_catchup(&other, now);
+        assert_eq!(
+            worker.delayed_tasks.len(),
+            2,
+            "shared SQLite sessions remain independent"
+        );
+        worker.delayed_tasks.clear();
+        let mut exhausted = first.clone();
+        exhausted.zcode_catchup_attempt = Some(3);
+        worker.schedule_zcode_catchup(&exhausted, now);
+        assert!(worker.delayed_tasks.is_empty());
+        let mut periodic = first.clone();
+        periodic.zcode_catchup_attempt = None;
+        worker.schedule_zcode_catchup(&periodic, now);
+        assert!(
+            worker.delayed_tasks.is_empty(),
+            "ordinary sweep must not start a new window"
+        );
+        worker.schedule_zcode_catchup(&first, now);
+        assert_eq!(
+            worker.delayed_tasks.len(),
+            1,
+            "genuine hook can open a fresh finite window"
+        );
     }
 
     #[test]

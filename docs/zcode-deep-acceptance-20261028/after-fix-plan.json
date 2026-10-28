@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "frozen_before_execution": true,
+  "root": "/Users/mark/workspace/babel-zcode-acceptance-20261028",
+  "scenarios": [
+    {
+      "name": "cancel-with-live-pre",
+      "file": "tests/fixtures/zcode_deep_20261028_v1/cancelled-after-fix.txt",
+      "content": "ZDC-C02 | partial write cancelled on fixed adapter\n",
+      "expected_ai": 0,
+      "expected_unknown": 1,
+      "action": "One foreground Bash writes exact line and sleeps 60 seconds. Observe file then stop before completion. Next genuine same-session readonly prompt triggers boundary."
+    },
+    {
+      "name": "denied-write-then-success",
+      "file": "tests/fixtures/zcode_deep_20261028_v1/rejected-after-fix.txt",
+      "content": "ZDD-D01 | this command must be denied\n",
+      "expected_exists": false,
+      "action": "Deny exact scoped Bash write once; next same-session foreground Bash writes only recovery-success.txt."
+    },
+    {
+      "name": "success-after-denial",
+      "file": "tests/fixtures/zcode_deep_20261028_v1/recovery-success.txt",
+      "content": "ZDD-S01 | successful write after denied command\n",
+      "expected_ai": 1,
+      "expected_unknown": 0
+    }
+  ]
+}

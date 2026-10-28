@@ -1,0 +1,14 @@
+{
+  "schema": "zcode-cancellation-oracle/v1",
+  "file": "tests/fixtures/zcode_deep_20261028_v1/cancelled.txt",
+  "content": "ZDC-C01 | written before cancellation\n",
+  "operation": "One foreground shell tool writes the marker and then waits 60 seconds. Observe real marker creation before clicking Stop in ZCode. Do not replay hooks.",
+  "expected_on_cancelled_tool": {
+    "line_count": 1,
+    "ai_lines": 0,
+    "known_human_lines": 0,
+    "unknown_lines": 1,
+    "successful_ai_checkpoint_count": 0
+  },
+  "verification": "Actual tool terminal status, persistent hook jobs, local commit note and backend independent facts; if cancellation races completion do not label the run as cancelled."
+}

@@ -71,6 +71,10 @@ pub enum ControlRequest {
     BashSnapshotQuery {
         session_id: String,
         tool_use_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_started_at_ns: Option<u128>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_start_trace_id: Option<String>,
     },
     #[serde(rename = "bash_hook_attempt.start")]
     BashHookAttemptStart {

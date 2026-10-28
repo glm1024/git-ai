@@ -8292,6 +8292,227 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
+    fn finish_zcode_terminal_pre_without_snapshot(
+        &self,
+        worktree: &str,
+        session: &str,
+        family: &str,
+        pre: crate::daemon::bash_sessions::ZCodeBashPre,
+    ) -> Result<(), GitAiError> {
+        let _lifecycle = self
+            .zcode_bash_lifecycle_lock
+            .lock()
+            .map_err(|_| GitAiError::Generic("ZCode Bash lifecycle lock poisoned".into()))?;
+        let mut state = self
+            .bash_sessions
+            .lock()
+            .map_err(|_| GitAiError::Generic("Bash sessions lock poisoned".into()))?;
+        match state.get_session(session, &pre.tool_use_id) {
+            Some(current)
+                if pre.has_snapshot
+                    && current.started_at_ns == pre.started_at_ns
+                    && current.start_trace_id == pre.start_trace_id
+                    && current.repo_work_dir == worktree
+                    && current.agent_id.tool == "zcode"
+                    && current.agent_id.id == session
+                    && current.stat_snapshot.invocation_key
+                        == format!("{session}:{}", pre.tool_use_id) => {}
+            None if !pre.has_snapshot => {}
+            _ => return Ok(()),
+        }
+        let db = crate::daemon::bash_history_db::BashHistoryDatabase::global()?;
+        let mut db = db
+            .lock()
+            .map_err(|_| GitAiError::Generic("Bash history lock poisoned".into()))?;
+        if !db.zcode_pre_has_state(
+            worktree,
+            session,
+            &pre.tool_use_id,
+            &pre.start_trace_id,
+            pre.started_at_ns,
+            false,
+        )? {
+            return Ok(());
+        }
+        let mut metadata = pre.metadata;
+        metadata.insert("tool_outcome".into(), "failed".into());
+        metadata.insert("snapshot_without_checkpoint".into(), "true".into());
+        metadata.insert(
+            "zcode_terminal_source".into(),
+            "tool_usage.non_success".into(),
+        );
+        // This is exactly the existing failed/no-checkpoint terminal. Keep the
+        // frozen pre and pending scope if durable persistence cannot succeed.
+        db.record_end(&crate::daemon::bash_history_db::BashCallEnd {
+            original_cwd: worktree.into(),
+            repo_work_dir: Some(worktree.into()),
+            repo_discovery_error: None,
+            session_id: session.into(),
+            tool_use_id: pre.tool_use_id.clone(),
+            agent_id: pre.agent_id,
+            start_trace_id: Some(pre.start_trace_id.clone()),
+            end_trace_id: pre.start_trace_id,
+            started_at_ns: Some(pre.started_at_ns),
+            ended_at_ns: crate::daemon::bash_history_db::unix_time_ns(),
+            command: None,
+            metadata,
+        })?;
+        drop(db);
+        state.end_session(session, &pre.tool_use_id);
+        drop(state);
+        self.clear_pending_zcode_edit(family, session, &pre.tool_use_id);
+        Ok(())
+    }
+
+    /// Hook control path only: reconcile explicit source terminal evidence for
+    /// already observed pres. No trace2 I/O or source-history discovery.
+    async fn reconcile_zcode_terminal_bash_calls(
+        &self,
+        activity: &crate::commands::checkpoint_agent::presets::SessionActivity,
+    ) -> Result<Vec<crate::commands::checkpoint_agent::presets::FailedToolCall>, GitAiError> {
+        use crate::streams::agents::zcode::ZCodeBashTerminal;
+        if activity.context.agent_id.tool != "zcode"
+            || !matches!(
+                activity
+                    .context
+                    .metadata
+                    .get("zcode_hook_event")
+                    .map(String::as_str),
+                Some("Stop" | "UserPromptSubmit" | "PreToolUse")
+            )
+        {
+            return Ok(vec![]);
+        }
+        let Some(repo) = crate::git::repo_state::worktree_root_for_path(&activity.context.cwd)
+        else {
+            return Ok(vec![]);
+        };
+        let worktree = Self::worktree_state_key(&repo);
+        let mut candidates = self
+            .bash_sessions
+            .lock()
+            .map_err(|_| GitAiError::Generic("Bash sessions lock poisoned".into()))?
+            .zcode_pres_for_session(&worktree, &activity.context.external_session_id);
+        let activation = self
+            .stream_worker
+            .as_ref()
+            .map(|worker| worker.zcode_activation_boundary(&activity.stream_source))
+            .transpose()
+            .map_err(GitAiError::Generic)?
+            .flatten();
+        if let Some(activation) = activation.filter(|value| *value >= 0) {
+            let db = crate::daemon::bash_history_db::BashHistoryDatabase::global()?;
+            let persisted = db
+                .lock()
+                .map_err(|_| GitAiError::Generic("Bash history lock poisoned".into()))?
+                .open_zcode_pres(
+                    &worktree,
+                    &activity.context.external_session_id,
+                    activation as u128 * 1_000_000,
+                )?;
+            for pre in persisted {
+                if !candidates
+                    .iter()
+                    .any(|current| current.tool_use_id == pre.tool_use_id)
+                {
+                    candidates.push(pre);
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+        if candidates.len() > 64 {
+            return Err(GitAiError::Generic(
+                "ZCode terminal reconciliation exceeds 64 observed calls; preserving pre evidence"
+                    .into(),
+            ));
+        }
+        let source = activity.stream_source.path.clone();
+        let source_key = source.display().to_string();
+        let session = activity.context.external_session_id.clone();
+        let observed = activity.observed_at_millis;
+        let terminal = tokio::task::spawn_blocking(move || -> Result<Vec<_>, GitAiError> {
+            let mut terminal = Vec::new();
+            for pre in candidates {
+                // Older persisted pres have no source-path metadata. They are
+                // eligible only through the existing enrolled-session boundary.
+                if pre
+                    .metadata
+                    .get("zcode_database_path")
+                    .is_some_and(|path| path != &source_key)
+                    || (pre.has_snapshot && !pre.metadata.contains_key("zcode_database_path"))
+                {
+                    continue;
+                }
+                let Ok(pre_ms) = i64::try_from(pre.started_at_ns / 1_000_000) else {
+                    continue;
+                };
+                if let Some(outcome) = crate::streams::agents::zcode::terminal_bash_call(
+                    &source,
+                    &session,
+                    &pre.tool_use_id,
+                    pre_ms,
+                    observed,
+                    pre.metadata
+                        .get("zcode_runtime_trace_id")
+                        .map(String::as_str),
+                    pre.metadata
+                        .get("zcode_runtime_turn_id")
+                        .map(String::as_str),
+                )
+                .map_err(|error| GitAiError::Generic(error.to_string()))?
+                {
+                    terminal.push((pre, outcome));
+                }
+            }
+            Ok(terminal)
+        })
+        .await
+        .map_err(|error| {
+            GitAiError::Generic(format!(
+                "ZCode terminal reconciliation task failed: {error}"
+            ))
+        })??;
+        let mut failed_tools = Vec::new();
+        let family = self.backend.resolve_family(Path::new(&worktree))?.0;
+        for (mut pre, outcome) in terminal {
+            if outcome == ZCodeBashTerminal::PermissionDenied || !pre.has_snapshot {
+                self.finish_zcode_terminal_pre_without_snapshot(
+                    &worktree,
+                    &activity.context.external_session_id,
+                    &family,
+                    pre,
+                )?;
+            } else {
+                pre.metadata.insert("tool_outcome".into(), "failed".into());
+                pre.metadata.insert(
+                    "zcode_expected_pre_started_at_ns".into(),
+                    pre.started_at_ns.to_string(),
+                );
+                pre.metadata.insert(
+                    "zcode_expected_pre_trace_id".into(),
+                    pre.start_trace_id.clone(),
+                );
+                failed_tools.push(crate::commands::checkpoint_agent::presets::FailedToolCall {
+                    context: crate::commands::checkpoint_agent::presets::PresetContext {
+                        agent_id: pre.agent_id,
+                        external_session_id: activity.context.external_session_id.clone(),
+                        trace_id: activity.context.trace_id.clone(),
+                        cwd: PathBuf::from(&worktree),
+                        metadata: pre.metadata,
+                    },
+                    tool_use_id: pre.tool_use_id,
+                    file_paths: vec![],
+                    bash: true,
+                    command: None,
+                    stream_source: Some(activity.stream_source.clone()),
+                });
+            }
+        }
+        Ok(failed_tools)
+    }
+
     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
         let result = match request {
             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
@@ -8299,25 +8520,45 @@ impl ActorDaemonCoordinator {
                 "checkpoint.run requires the framed checkpoint transport".to_string(),
             )),
             ControlRequest::AgentSessionActivity { activity } => {
-                match self.stream_worker.as_ref() {
-                    Some(worker) => {
-                        let repo =
-                            crate::git::repo_state::worktree_root_for_path(&activity.context.cwd);
-                        worker
-                            .notify_session_activity(
-                                activity.stream_source,
-                                activity.context,
-                                activity.observed_at_millis,
-                                repo,
-                            )
-                            .await
-                            .map(|_| ControlResponse::ok(None, None))
-                            .map_err(GitAiError::Generic)
+                if activity.context.agent_id.tool != "zcode"
+                    || activity.context.agent_id.id != activity.context.external_session_id
+                    || activity.stream_source.external_session_id
+                        != activity.context.external_session_id
+                    || activity.stream_source.session_id
+                        != crate::authorship::authorship_log_serialization::generate_session_id(
+                            &activity.context.external_session_id,
+                            "zcode",
+                        )
+                    || activity.stream_source.format
+                        != crate::commands::checkpoint_agent::presets::StreamFormat::ZCodeSqlite
+                    || !activity.stream_source.path.is_absolute()
+                {
+                    return ControlResponse::err("invalid ZCode session activity identity");
+                }
+                if let Some(worker) = self.stream_worker.as_ref() {
+                    let repo =
+                        crate::git::repo_state::worktree_root_for_path(&activity.context.cwd);
+                    if let Err(error) = worker
+                        .notify_session_activity(
+                            activity.stream_source.clone(),
+                            activity.context.clone(),
+                            activity.observed_at_millis,
+                            repo,
+                        )
+                        .await
+                    {
+                        return ControlResponse::err(error);
                     }
-                    None => Ok(ControlResponse::ok(
-                        None,
-                        Some(serde_json::json!({"skipped": "transcript_streaming_disabled"})),
-                    )),
+                }
+                match self.reconcile_zcode_terminal_bash_calls(&activity).await {
+                    Ok(failed_tools) => {
+                        let mut data = json!({"zcode_failed_tools":failed_tools});
+                        if self.stream_worker.is_none() {
+                            data["skipped"] = json!("transcript_streaming_disabled");
+                        }
+                        Ok(ControlResponse::ok(None, Some(data)))
+                    }
+                    Err(error) => Err(error),
                 }
             }
             ControlRequest::SyncFamily { repo_working_dir } => {
@@ -8495,8 +8736,59 @@ impl ActorDaemonCoordinator {
                     None
                 };
                 let mut state = self.bash_sessions.lock().unwrap();
-                let session = state.end_session(&session_id, &tool_use_id);
-                drop(state);
+                if let Some(expected) = metadata
+                    .get("zcode_expected_pre_started_at_ns")
+                    .and_then(|value| value.parse::<u128>().ok())
+                {
+                    if let Some(current) = state.get_session(&session_id, &tool_use_id) {
+                        if current.started_at_ns != expected
+                            || metadata
+                                .get("zcode_expected_pre_trace_id")
+                                .is_some_and(|trace| current.start_trace_id != *trace)
+                            || current.repo_work_dir
+                                != Self::worktree_state_key(Path::new(&repo_work_dir))
+                            || current.agent_id.id != session_id
+                            || current.agent_id.tool != "zcode"
+                        {
+                            return ControlResponse::err(
+                                "ZCode Bash frozen pre changed before terminal",
+                            );
+                        }
+                    } else {
+                        // A repeated boundary after an already persisted terminal
+                        // is a no-op, never an invitation to invent a new pre.
+                        let terminal = crate::daemon::bash_history_db::BashHistoryDatabase::global(
+                        )
+                        .and_then(|db| {
+                            db.lock()
+                                .map_err(|_| {
+                                    GitAiError::Generic("Bash history lock poisoned".into())
+                                })?
+                                .zcode_pre_has_state(
+                                    &Self::worktree_state_key(Path::new(&repo_work_dir)),
+                                    &session_id,
+                                    &tool_use_id,
+                                    metadata
+                                        .get("zcode_expected_pre_trace_id")
+                                        .map(String::as_str)
+                                        .unwrap_or(&trace_id),
+                                    expected,
+                                    true,
+                                )
+                        });
+                        return match terminal {
+                            Ok(true) => ControlResponse::ok(None, None),
+                            _ => ControlResponse::err("ZCode Bash frozen pre is unavailable"),
+                        };
+                    }
+                }
+                let keep_frozen_until_persisted = agent_id.tool == "zcode";
+                let ending_key = (session_id.clone(), tool_use_id.clone());
+                let session = if keep_frozen_until_persisted {
+                    state.get_session(&session_id, &tool_use_id).cloned()
+                } else {
+                    state.end_session(&session_id, &tool_use_id)
+                };
 
                 let worktree_key = session
                     .as_ref()
@@ -8567,6 +8859,10 @@ impl ActorDaemonCoordinator {
                     }
                     tracing::debug!("failed to persist bash session end: {}", error);
                 }
+                if keep_frozen_until_persisted {
+                    state.end_session(&ending_key.0, &ending_key.1);
+                }
+                drop(state);
                 if let Some((worktree, session, call)) = cleanup_call
                     && let Ok(family) = self.backend.resolve_family(Path::new(&worktree))
                 {
@@ -8694,9 +8990,20 @@ impl ActorDaemonCoordinator {
             ControlRequest::BashSnapshotQuery {
                 session_id,
                 tool_use_id,
+                expected_started_at_ns,
+                expected_start_trace_id,
             } => {
                 let state = self.bash_sessions.lock().unwrap();
-                let response = match state.get_snapshot(&session_id, &tool_use_id) {
+                let snapshot = state
+                    .get_session(&session_id, &tool_use_id)
+                    .filter(|pre| {
+                        expected_started_at_ns.is_none_or(|expected| pre.started_at_ns == expected)
+                            && expected_start_trace_id
+                                .as_deref()
+                                .is_none_or(|expected| pre.start_trace_id == expected)
+                    })
+                    .map(|pre| &pre.stat_snapshot);
+                let response = match snapshot {
                     Some(snapshot) => {
                         let data = serde_json::to_value(BashSnapshotQueryResponse {
                             found: true,
@@ -11236,35 +11543,49 @@ mod tests {
             PresetContext, SessionActivity, StreamFormat, StreamSource,
         };
         let coordinator = ActorDaemonCoordinator::new();
+        let activity = SessionActivity {
+            context: PresetContext {
+                agent_id: crate::authorship::working_log::AgentId {
+                    tool: "zcode".into(),
+                    id: "session".into(),
+                    model: "unknown".into(),
+                },
+                external_session_id: "session".into(),
+                trace_id: "trace".into(),
+                cwd: std::env::temp_dir(),
+                metadata: HashMap::new(),
+            },
+            stream_source: StreamSource {
+                path: std::env::temp_dir().join("missing-zcode.db"),
+                format: StreamFormat::ZCodeSqlite,
+                session_id: crate::authorship::authorship_log_serialization::generate_session_id(
+                    "session", "zcode",
+                ),
+                external_session_id: "session".into(),
+                external_parent_session_id: None,
+            },
+            observed_at_millis: 0,
+        };
         let response = coordinator
             .handle_control_request(ControlRequest::AgentSessionActivity {
-                activity: SessionActivity {
-                    context: PresetContext {
-                        agent_id: crate::authorship::working_log::AgentId {
-                            tool: "zcode".into(),
-                            id: "session".into(),
-                            model: "unknown".into(),
-                        },
-                        external_session_id: "session".into(),
-                        trace_id: "trace".into(),
-                        cwd: std::env::temp_dir(),
-                        metadata: HashMap::new(),
-                    },
-                    stream_source: StreamSource {
-                        path: std::env::temp_dir().join("missing-zcode.db"),
-                        format: StreamFormat::ZCodeSqlite,
-                        session_id: "s_test".into(),
-                        external_session_id: "session".into(),
-                        external_parent_session_id: None,
-                    },
-                    observed_at_millis: 0,
-                },
+                activity: activity.clone(),
             })
             .await;
         assert!(response.ok);
         assert_eq!(
             response.data.unwrap()["skipped"],
             "transcript_streaming_disabled"
+        );
+        let mut mismatched = activity;
+        mismatched.stream_source.external_session_id = "another-session".into();
+        let rejected = coordinator
+            .handle_control_request(ControlRequest::AgentSessionActivity {
+                activity: mismatched,
+            })
+            .await;
+        assert!(
+            !rejected.ok,
+            "disabled streaming must not permit cross-session cleanup"
         );
     }
 

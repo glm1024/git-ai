@@ -1,0 +1,12 @@
+ZDA-H01 | baseline stable alpha
+ZDA-H02 | baseline to be changed by round2
+ZDA-H03 | baseline stable gamma
+ZDA-H04 | baseline stable delta
+ZDA-H05 | baseline stable epsilon
+ZDA-H06 | baseline stable zeta
+ZDA-A01 | round1 alpha to be rewritten by round2
+ZDA-A02 | round1 beta to be overwritten by human
+ZDA-A03 | round1 gamma to be deleted by round2
+ZDA-A04 | round1 delta to be edited by round2
+ZDA-A05 | round1 epsilon preserved through amend
+ZDA-A06 | round1 zeta staged only for amend

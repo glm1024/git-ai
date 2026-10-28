@@ -1491,15 +1491,15 @@ fn select_best_bash_candidate<'a>(
     timestamps: &[u128],
     existing_commit_sessions: &HashSet<String>,
     target_repo_work_dir: &str,
-    committed_file_path: Option<&str>,
+    _committed_file_path: Option<&str>,
 ) -> Option<BashCandidateSelection<'a>> {
     candidates
         .iter()
         .filter_map(|candidate| {
-            if candidate.agent_id.tool == "zcode"
-                && !committed_file_path
-                    .is_some_and(|path| zcode_bash_scope_contains(candidate, path))
-            {
+            // ZCode already records exact pre/post snapshots. A successful
+            // call and whole-file scope cannot prove which Unknown lines it
+            // wrote, including manual/failed bytes present before its pre.
+            if candidate.agent_id.tool == "zcode" {
                 return None;
             }
             // A nearby timestamp is only a correlation signal.  Do not let a
@@ -1572,24 +1572,6 @@ impl BashCandidateTier {
     }
 }
 
-fn zcode_bash_scope_contains(candidate: &BashCheckpointCall, file_path: &str) -> bool {
-    use crate::commands::checkpoint_agent::bash_tool::canonical_bash_scope_path;
-    let Some(file_path) = canonical_bash_scope_path(file_path) else {
-        return false;
-    };
-    let Some(scope) = candidate.metadata.get("bash_changed_paths") else {
-        return false;
-    };
-    let Ok(paths) = serde_json::from_str::<Vec<String>>(scope) else {
-        return false;
-    };
-    !paths.is_empty()
-        && paths
-            .iter()
-            .all(|path| canonical_bash_scope_path(path).as_ref() == Some(path))
-        && paths.contains(&file_path)
-}
-
 fn bash_candidate_tier(
     candidate: &BashCheckpointCall,
     existing_commit_sessions: &HashSet<String>,
@@ -1628,6 +1610,11 @@ fn select_best_session_event_candidate<'a>(
     let matching_candidates = candidates
         .iter()
         .filter_map(|candidate| {
+            // Token/model metadata proves usage, never which Unknown bytes
+            // were written. ZCode uses its exact hook snapshot evidence only.
+            if candidate.tool == "zcode" {
+                return None;
+            }
             let distance_ns = session_event_distance(candidate, timestamps)?;
             if distance_ns > SESSION_EVENT_RECOVERY_WINDOW_NS {
                 return None;
@@ -2379,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn zcode_bash_recovery_requires_the_actual_committed_file_in_observed_scope() {
+    fn zcode_bash_scope_never_proves_unknown_line_authorship() {
         let mut candidate = bash_call(1, "session", "call", "/repo", 1_000, Some(2_000));
         candidate.agent_id.tool = "zcode".into();
         candidate
@@ -2390,7 +2377,7 @@ mod tests {
             (Some("[]"), false),
             (Some("not-json"), false),
             (Some(r#"["src/other.rs"]"#), false),
-            (Some(r#"["src/file.rs"]"#), true),
+            (Some(r#"["src/file.rs"]"#), false),
             (Some(r#"["src/file.rs", "../outside.rs"]"#), false),
             (Some(r#"["/src/file.rs"]"#), false),
         ] {
@@ -2444,7 +2431,7 @@ mod tests {
             (Some(2_000), Some("failed"), false),
             (Some(2_000), Some("backgrounded"), false),
             (None, Some("succeeded"), false),
-            (Some(2_000), Some("succeeded"), true),
+            (Some(2_000), Some("succeeded"), false),
         ] {
             let mut candidate = bash_call(1, "session", "call", "/repo", 1_000, end);
             candidate.agent_id.tool = "zcode".into();
@@ -2468,7 +2455,8 @@ mod tests {
         }
         let legacy = bash_call(2, "legacy", "call", "/repo", 1_000, None);
         assert!(
-            select_best_bash_candidate(&[legacy], &[1_500], &HashSet::new(), "/repo", None).is_some()
+            select_best_bash_candidate(&[legacy], &[1_500], &HashSet::new(), "/repo", None)
+                .is_some()
         );
     }
 
@@ -2624,7 +2612,8 @@ mod tests {
         ];
 
         assert!(
-            select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/repo", None).is_none(),
+            select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/repo", None)
+                .is_none(),
             "time proximity alone must not turn an unrelated repository write into AI code"
         );
     }
@@ -2650,6 +2639,37 @@ mod tests {
             )
             .is_none(),
             "path ancestry does not prove that nested repositories were inside the observed worktree scope"
+        );
+    }
+
+    #[test]
+    fn zcode_token_metadata_never_proves_unknown_line_authorship() {
+        let mut candidate = session_event_candidate(
+            1,
+            "s_zcode",
+            "external-zcode",
+            1_700_000_001,
+            Some("https://github.com/acme/repo"),
+        );
+        candidate.tool = "zcode".into();
+        assert!(
+            select_best_session_event_candidate(
+                &[candidate.clone()],
+                &[1_700_000_001_500_000_000],
+                "https://github.com/acme/repo"
+            )
+            .is_none(),
+            "a genuine model request supplies no line-level write evidence"
+        );
+        candidate.tool = "codex".into();
+        assert!(
+            select_best_session_event_candidate(
+                &[candidate],
+                &[1_700_000_001_500_000_000],
+                "https://github.com/acme/repo"
+            )
+            .is_some(),
+            "legacy recovery behavior is unchanged"
         );
     }
 

@@ -1,0 +1,109 @@
+{
+  "schema": "zcode-independent-failure-recovery/v1",
+  "repo": "/Users/mark/workspace/babel-zcode-acceptance-20261028",
+  "commit": "b3d129e0eaa024e559020150c4b189023558f18b",
+  "bindings": {
+    "success": {
+      "session": "session_c0ea22aefc4a20124ba4fbd449e3df0c",
+      "model": "deepseek-v4.1-flash",
+      "traces": []
+    }
+  },
+  "git_read_count": 4,
+  "expected_absent": [
+    "tests/fixtures/zcode_deep_20261028_v1/rejected-after-fix.txt"
+  ],
+  "actual_fixture_files": [
+    "tests/fixtures/zcode_deep_20261028_v1/cancelled-after-fix.txt",
+    "tests/fixtures/zcode_deep_20261028_v1/cancelled.txt",
+    "tests/fixtures/zcode_deep_20261028_v1/catalog.jsonl",
+    "tests/fixtures/zcode_deep_20261028_v1/lineage.txt",
+    "tests/fixtures/zcode_deep_20261028_v1/recovery-success.txt"
+  ],
+  "actual_changed_files": {
+    "tests/fixtures/zcode_deep_20261028_v1/cancelled-after-fix.txt": "A",
+    "tests/fixtures/zcode_deep_20261028_v1/cancelled.txt": "A",
+    "tests/fixtures/zcode_deep_20261028_v1/recovery-success.txt": "A"
+  },
+  "expected_counts": {
+    "ai": 1,
+    "unknown": 2,
+    "known_human": 0
+  },
+  "actual_counts": {
+    "ai": 1,
+    "unknown": 2,
+    "known_human": 0,
+    "unresolved": 0
+  },
+  "rows": [
+    {
+      "file": "tests/fixtures/zcode_deep_20261028_v1/cancelled-after-fix.txt",
+      "line": 1,
+      "expected_text": "ZDC-C02 | partial write cancelled on fixed adapter\n",
+      "actual_text": "ZDC-C02 | partial write cancelled on fixed adapter\n",
+      "expected": {
+        "kind": "unknown",
+        "generation": "success",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "all_line_attestations": [],
+      "passed": true,
+      "errors": []
+    },
+    {
+      "file": "tests/fixtures/zcode_deep_20261028_v1/cancelled.txt",
+      "line": 1,
+      "expected_text": "ZDC-C01 | written before cancellation\n",
+      "actual_text": "ZDC-C01 | written before cancellation\n",
+      "expected": {
+        "kind": "unknown",
+        "generation": "success",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "unknown",
+        "evidence": "no-line-attestation"
+      },
+      "all_line_attestations": [],
+      "passed": true,
+      "errors": []
+    },
+    {
+      "file": "tests/fixtures/zcode_deep_20261028_v1/recovery-success.txt",
+      "line": 1,
+      "expected_text": "ZDD-S01 | successful write after denied command\n",
+      "actual_text": "ZDD-S01 | successful write after denied command\n",
+      "expected": {
+        "kind": "ai",
+        "generation": "success",
+        "tool": "zcode"
+      },
+      "actual": {
+        "kind": "ai",
+        "author_id": "s_af019ac47ae172::checkpoint-job:39e600ae18d9bc01abbb996f15beda09c938d770ea6f5057ee85d59815e674c3",
+        "session_key": "s_af019ac47ae172",
+        "trace": "checkpoint-job:39e600ae18d9bc01abbb996f15beda09c938d770ea6f5057ee85d59815e674c3",
+        "tool": "zcode",
+        "session": "session_c0ea22aefc4a20124ba4fbd449e3df0c",
+        "model": "deepseek-v4.1-flash",
+        "model_evidence": "trace"
+      },
+      "all_line_attestations": [
+        "s_af019ac47ae172::checkpoint-job:39e600ae18d9bc01abbb996f15beda09c938d770ea6f5057ee85d59815e674c3"
+      ],
+      "passed": true,
+      "errors": []
+    }
+  ],
+  "errors": [],
+  "passed": true,
+  "frozen_plan_sha256": {
+    "after-fix-plan.json": "a80c5071a666ecb4db2aeac0e485fc4f5037ec49c7fd5c30004c24eefce04ce4",
+    "cancellation-plan.json": "7aa6f8ddd05a73d8af2b3c8a27aad24c58ab4602aebb919a897be7e868c29086"
+  }
+}

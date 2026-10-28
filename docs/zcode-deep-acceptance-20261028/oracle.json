@@ -1,0 +1,331 @@
+{
+  "schema": "zcode-independent-line-oracle/v1",
+  "scenario_id": "zcode-deep-20261028-v1",
+  "file": "tests/fixtures/zcode_deep_20261028_v1/lineage.txt",
+  "suggested_repo": "/Users/mark/workspace/babel-zcode-acceptance-20261028",
+  "base": "0c89941",
+  "branch": "test/zcode-deep-20261028",
+  "rules": [
+    "Expectations are frozen from planned edits, never inferred from notes or blame.",
+    "All nonempty fixture lines have unique stable ZDA IDs.",
+    "Manual filesystem overwrites and insertions are Unknown, never KnownHuman.",
+    "Round/session bindings must come from the actual ZCode UI/session source, not note inference.",
+    "Only the declared fixture file is verified; unrelated files are outside this oracle.",
+    "Both partial commits and the amended final commit require actual note evidence."
+  ],
+  "model_defaults": {
+    "round1": "deepseek-v4.1-flash",
+    "round2": "deepseek-v4.1-flash"
+  },
+  "require_trace_models": true,
+  "phases": {
+    "baseline": {
+      "actor": "manual",
+      "action": "Create the six-line untracked fixture; do not stage or commit.",
+      "lines": [
+        "ZDA-H01 | baseline stable alpha",
+        "ZDA-H02 | baseline to be changed by round2",
+        "ZDA-H03 | baseline stable gamma",
+        "ZDA-H04 | baseline stable delta",
+        "ZDA-H05 | baseline stable epsilon",
+        "ZDA-H06 | baseline stable zeta"
+      ],
+      "text_sha256": "a559b76b2e1f9e6bdaacf0c09cc187b9c1fa5e02f6630c76d058b563d63e3420"
+    },
+    "round1": {
+      "actor": "zcode-round1",
+      "action": "Naturally choose tools; preserve baseline and append A01..A06; do not stage or commit.",
+      "lines": [
+        "ZDA-H01 | baseline stable alpha",
+        "ZDA-H02 | baseline to be changed by round2",
+        "ZDA-H03 | baseline stable gamma",
+        "ZDA-H04 | baseline stable delta",
+        "ZDA-H05 | baseline stable epsilon",
+        "ZDA-H06 | baseline stable zeta",
+        "ZDA-A01 | round1 alpha to be rewritten by round2",
+        "ZDA-A02 | round1 beta to be overwritten by human",
+        "ZDA-A03 | round1 gamma to be deleted by round2",
+        "ZDA-A04 | round1 delta to be edited by round2",
+        "ZDA-A05 | round1 epsilon preserved through amend",
+        "ZDA-A06 | round1 zeta staged only for amend"
+      ],
+      "text_sha256": "dd79ffd31f0dba5511b110d323b6d1830519f5071363b61d810767e1b94bd7d1"
+    },
+    "human": {
+      "actor": "manual",
+      "action": "Overwrite A02 and insert H07 immediately after A03; do not stage.",
+      "lines": [
+        "ZDA-H01 | baseline stable alpha",
+        "ZDA-H02 | baseline to be changed by round2",
+        "ZDA-H03 | baseline stable gamma",
+        "ZDA-H04 | baseline stable delta",
+        "ZDA-H05 | baseline stable epsilon",
+        "ZDA-H06 | baseline stable zeta",
+        "ZDA-A01 | round1 alpha to be rewritten by round2",
+        "ZDA-A02 | human override after round1",
+        "ZDA-A03 | round1 gamma to be deleted by round2",
+        "ZDA-H07 | human insertion after round1",
+        "ZDA-A04 | round1 delta to be edited by round2",
+        "ZDA-A05 | round1 epsilon preserved through amend",
+        "ZDA-A06 | round1 zeta staged only for amend"
+      ],
+      "text_sha256": "619dfe456cf2a67638cd2f2cc8d5e484dd2cd50df247981cec1a7ed095acde1d"
+    },
+    "commit1": {
+      "actor": "partial-index",
+      "action": "Commit only this ten-line index view, leaving A04/A05/A06 in the worktree unstaged.",
+      "lines": [
+        "ZDA-H01 | baseline stable alpha",
+        "ZDA-H02 | baseline to be changed by round2",
+        "ZDA-H03 | baseline stable gamma",
+        "ZDA-H04 | baseline stable delta",
+        "ZDA-H05 | baseline stable epsilon",
+        "ZDA-H06 | baseline stable zeta",
+        "ZDA-A01 | round1 alpha to be rewritten by round2",
+        "ZDA-A02 | human override after round1",
+        "ZDA-A03 | round1 gamma to be deleted by round2",
+        "ZDA-H07 | human insertion after round1"
+      ],
+      "text_sha256": "7e809960aa212d02ba11f2a694790d8e76869fa3289d2706a0678fe42fc1eea4",
+      "expectations": [
+        {
+          "id": "ZDA-H01",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H02",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H03",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H04",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H05",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H06",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-A01",
+          "kind": "ai",
+          "generation": "round1",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-A02",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-A03",
+          "kind": "ai",
+          "generation": "round1",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-H07",
+          "kind": "unknown"
+        }
+      ],
+      "expected_counts": {
+        "ai": 2,
+        "unknown": 8,
+        "known_human": 0
+      }
+    },
+    "round2": {
+      "actor": "zcode-round2",
+      "action": "Naturally choose tools: rewrite H02 and A01, delete A03, edit A04, append B01; preserve all other text; do not stage or commit.",
+      "lines": [
+        "ZDA-H01 | baseline stable alpha",
+        "ZDA-H02 | round2 replaced baseline beta",
+        "ZDA-H03 | baseline stable gamma",
+        "ZDA-H04 | baseline stable delta",
+        "ZDA-H05 | baseline stable epsilon",
+        "ZDA-H06 | baseline stable zeta",
+        "ZDA-A01 | round2 rewrote alpha",
+        "ZDA-A02 | human override after round1",
+        "ZDA-H07 | human insertion after round1",
+        "ZDA-A04 | round2 edited delta",
+        "ZDA-A05 | round1 epsilon preserved through amend",
+        "ZDA-A06 | round1 zeta staged only for amend",
+        "ZDA-B01 | round2 new line staged only for amend"
+      ],
+      "text_sha256": "5c5849ee6d2b2a409efc8a1a0a4b5f8fc956ed69193539659244949d82ae3292"
+    },
+    "commit2": {
+      "actor": "partial-index",
+      "action": "Commit this eleven-line index view, leaving A06 and B01 unstaged.",
+      "lines": [
+        "ZDA-H01 | baseline stable alpha",
+        "ZDA-H02 | round2 replaced baseline beta",
+        "ZDA-H03 | baseline stable gamma",
+        "ZDA-H04 | baseline stable delta",
+        "ZDA-H05 | baseline stable epsilon",
+        "ZDA-H06 | baseline stable zeta",
+        "ZDA-A01 | round2 rewrote alpha",
+        "ZDA-A02 | human override after round1",
+        "ZDA-H07 | human insertion after round1",
+        "ZDA-A04 | round2 edited delta",
+        "ZDA-A05 | round1 epsilon preserved through amend"
+      ],
+      "text_sha256": "7c5d2be346ea68c3ee76d055e2f8a27c9c15f1ea8be5c50d37a0dc9997b3f287",
+      "expectations": [
+        {
+          "id": "ZDA-H01",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H02",
+          "kind": "ai",
+          "generation": "round2",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-H03",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H04",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H05",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H06",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-A01",
+          "kind": "ai",
+          "generation": "round2",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-A02",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H07",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-A04",
+          "kind": "ai",
+          "generation": "round2",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-A05",
+          "kind": "ai",
+          "generation": "round1",
+          "tool": "zcode"
+        }
+      ],
+      "expected_counts": {
+        "ai": 4,
+        "unknown": 7,
+        "known_human": 0
+      }
+    },
+    "amend": {
+      "actor": "amend-index",
+      "action": "Stage the remaining A06/B01 and amend commit2 with --no-edit; final text equals round2.",
+      "lines": [
+        "ZDA-H01 | baseline stable alpha",
+        "ZDA-H02 | round2 replaced baseline beta",
+        "ZDA-H03 | baseline stable gamma",
+        "ZDA-H04 | baseline stable delta",
+        "ZDA-H05 | baseline stable epsilon",
+        "ZDA-H06 | baseline stable zeta",
+        "ZDA-A01 | round2 rewrote alpha",
+        "ZDA-A02 | human override after round1",
+        "ZDA-H07 | human insertion after round1",
+        "ZDA-A04 | round2 edited delta",
+        "ZDA-A05 | round1 epsilon preserved through amend",
+        "ZDA-A06 | round1 zeta staged only for amend",
+        "ZDA-B01 | round2 new line staged only for amend"
+      ],
+      "text_sha256": "5c5849ee6d2b2a409efc8a1a0a4b5f8fc956ed69193539659244949d82ae3292",
+      "expectations": [
+        {
+          "id": "ZDA-H01",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H02",
+          "kind": "ai",
+          "generation": "round2",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-H03",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H04",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H05",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H06",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-A01",
+          "kind": "ai",
+          "generation": "round2",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-A02",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-H07",
+          "kind": "unknown"
+        },
+        {
+          "id": "ZDA-A04",
+          "kind": "ai",
+          "generation": "round2",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-A05",
+          "kind": "ai",
+          "generation": "round1",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-A06",
+          "kind": "ai",
+          "generation": "round1",
+          "tool": "zcode"
+        },
+        {
+          "id": "ZDA-B01",
+          "kind": "ai",
+          "generation": "round2",
+          "tool": "zcode"
+        }
+      ],
+      "expected_counts": {
+        "ai": 6,
+        "unknown": 7,
+        "known_human": 0
+      }
+    }
+  }
+}
