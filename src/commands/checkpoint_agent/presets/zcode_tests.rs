@@ -27,7 +27,16 @@ fn zcode_preserves_real_identity_and_does_not_register_temporary_transcript() {
     assert_eq!(event.context.agent_id.model, "unknown");
     assert_eq!(event.tool_use_id.as_deref(), Some("call-1"));
     assert!(!event.context.metadata.contains_key("transcript_path"));
-    assert!(event.stream_source.is_none());
+    // An installed ZCode may already have its SQLite database. The invariant
+    // is that the ephemeral hook transcript is never used as the source.
+    if let Some(source) = &event.stream_source {
+        assert_eq!(source.format, super::StreamFormat::ZCodeSqlite);
+        assert_ne!(
+            source.path,
+            std::path::PathBuf::from("/missing/zcode-hook/transcript.jsonl")
+        );
+        assert_eq!(source.external_session_id, "zcode-session");
+    }
 }
 
 #[test]

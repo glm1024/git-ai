@@ -54,16 +54,31 @@ pub struct FlushStatus {
 }
 
 struct FlushRequest {
+    required_deferred_generation: u64,
     completion: tokio::sync::oneshot::Sender<FlushStatus>,
 }
 
+#[cfg(test)]
 fn complete_flush_requests(requests: &mut Vec<FlushRequest>, status: Option<FlushStatus>) {
-    for request in requests.drain(..) {
-        // `None` means the blocking flush panicked or was cancelled. Dropping
-        // the sender closes the oneshot so `flush_and_wait` returns an error;
-        // it must never be converted into the all-zero success status.
-        if let Some(status) = status {
-            let _ = request.completion.send(status);
+    complete_flush_requests_through(requests, status, u64::MAX);
+}
+
+fn complete_flush_requests_through(
+    requests: &mut Vec<FlushRequest>,
+    status: Option<FlushStatus>,
+    completed_generation: u64,
+) {
+    for request in std::mem::take(requests) {
+        if request.completion.is_closed() {
+            continue;
+        }
+        if status.is_none() || request.required_deferred_generation <= completed_generation {
+            // Missing status closes the oneshot rather than certifying an empty queue.
+            if let Some(status) = status {
+                let _ = request.completion.send(status);
+            }
+        } else {
+            requests.push(request);
         }
     }
 }
@@ -459,6 +474,7 @@ impl DaemonTelemetryWorkerHandle {
     pub fn request_flush(&self) {
         let (completion_tx, _completion_rx) = tokio::sync::oneshot::channel();
         let _ = self.flush_tx.send(FlushRequest {
+            required_deferred_generation: 0,
             completion: completion_tx,
         });
     }
@@ -468,6 +484,7 @@ impl DaemonTelemetryWorkerHandle {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         self.flush_tx
             .send(FlushRequest {
+                required_deferred_generation: 0,
                 completion: completion_tx,
             })
             .map_err(|_| GitAiError::Generic("telemetry worker has stopped".to_string()))?;
@@ -831,17 +848,24 @@ async fn telemetry_flush_loop(
     // Reclaim telemetry-owned durable queues immediately after restart.
     // Durable checkpoints are actor-owned and are recovered separately through
     // the repository-family sequencer.
-    let _ = tokio::task::spawn_blocking(|| {
-        crate::metrics::deferred_commit_jobs::process_periodic_jobs();
-        crate::metrics::deferred_lifecycle_jobs::process_periodic_jobs();
-        flush_pending_metrics();
-    })
+    let mut deferred_job_task = DeferredMetricProcessor::default();
+    let _ = flush_then_schedule_deferred(
+        &mut deferred_job_task,
+        FlushMode::Periodic,
+        0,
+        flush_pending_metrics,
+        || {
+            crate::metrics::deferred_commit_jobs::process_periodic_jobs();
+            crate::metrics::deferred_lifecycle_jobs::process_periodic_jobs();
+        },
+    )
     .await;
 
     loop {
         tokio::select! {
             _ = sleep_until(next_telemetry_flush_at(Instant::now())) => {}
-            Some(request) = flush_rx.recv() => {
+            Some(mut request) = flush_rx.recv() => {
+                request.required_deferred_generation = deferred_job_task.started_generation + 1;
                 flush_requests.push(request);
             }
             Some(request) = metrics_reingest_rx.recv() => {
@@ -900,8 +924,28 @@ async fn telemetry_flush_loop(
         // Flush in a blocking task since the underlying HTTP clients are synchronous.
         let daemon_id_for_flush = daemon_id.clone();
         let flush_started_at = std::time::Instant::now();
-        let flush_result = tokio::task::spawn_blocking(move || {
-            match flush_mode {
+        let required_generation = flush_requests
+            .iter()
+            .map(|request| request.required_deferred_generation)
+            .max()
+            .unwrap_or(0);
+        let flush_result = flush_then_schedule_deferred(
+            &mut deferred_job_task,
+            flush_mode,
+            required_generation,
+            move || {
+                #[cfg(feature = "test-support")]
+                maybe_stall_telemetry_upload_for_test();
+                let requeue_daemon_logs = if let Some(snapshot) = snapshot {
+                    flush_telemetry_batch(snapshot, &daemon_id_for_flush)
+                } else {
+                    flush_pending_metrics();
+                    Vec::new()
+                };
+                let await_status = collect_await_flush_status(flush_mode);
+                (requeue_daemon_logs, await_status)
+            },
+            move || match flush_mode {
                 FlushMode::Periodic => {
                     crate::metrics::deferred_commit_jobs::process_periodic_jobs();
                     crate::metrics::deferred_lifecycle_jobs::process_periodic_jobs();
@@ -910,19 +954,8 @@ async fn telemetry_flush_loop(
                     crate::metrics::deferred_commit_jobs::process_jobs_for_await();
                     crate::metrics::deferred_lifecycle_jobs::process_jobs_for_await();
                 }
-            }
-
-            #[cfg(feature = "test-support")]
-            maybe_stall_telemetry_upload_for_test();
-            let requeue_daemon_logs = if let Some(snapshot) = snapshot {
-                flush_telemetry_batch(snapshot, &daemon_id_for_flush)
-            } else {
-                flush_pending_metrics();
-                Vec::new()
-            };
-            let await_status = collect_await_flush_status(flush_mode);
-            (requeue_daemon_logs, await_status)
-        })
+            },
+        )
         .await
         .unwrap_or_else(|e| {
             tracing::error!(%e, "telemetry flush task panicked");
@@ -938,8 +971,13 @@ async fn telemetry_flush_loop(
         }
 
         let (requeue_daemon_logs, await_status) = flush_result;
-
-        complete_flush_requests(&mut flush_requests, await_status);
+        // Only callers covered by a completed pass may observe its following
+        // upload. A caller received during that pass needs the next generation.
+        complete_flush_requests_through(
+            &mut flush_requests,
+            await_status,
+            deferred_job_task.completed_await_generation,
+        );
 
         if !requeue_daemon_logs.is_empty() {
             buffer
@@ -948,6 +986,67 @@ async fn telemetry_flush_loop(
                 .requeue_failed_daemon_logs(requeue_daemon_logs);
         }
     }
+}
+
+/// Historical computation must never occupy the flush loop between uploads.
+/// Keep one processor on the existing bounded telemetry runtime; a slow job
+/// leaves subsequent upload/persistence cycles free to use the other blocking
+/// thread. Durable outstanding counts continue to keep `await` non-idle.
+/// The daemon's existing shutdown deadline and persisted leases govern exit;
+/// no new runtime or shutdown-time join is introduced.
+struct DeferredMetricTask {
+    mode: FlushMode,
+    generation: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct DeferredMetricProcessor {
+    task: Option<DeferredMetricTask>,
+    started_generation: u64,
+    completed_await_generation: u64,
+}
+
+async fn flush_then_schedule_deferred<Flush, Process, T>(
+    processor: &mut DeferredMetricProcessor,
+    mode: FlushMode,
+    required_generation: u64,
+    flush: Flush,
+    process: Process,
+) -> Result<T, tokio::task::JoinError>
+where
+    Flush: FnOnce() -> T + Send + 'static,
+    Process: FnOnce() + Send + 'static,
+    T: Send + 'static,
+{
+    // Observe completion before uploading, so its produced events are eligible
+    // for this flush. A later caller cannot reuse a pass started before arrival.
+    if processor
+        .task
+        .as_ref()
+        .is_some_and(|task| task.handle.is_finished())
+    {
+        let completed = processor.task.take().expect("finished task exists");
+        if let Err(error) = completed.handle.await {
+            tracing::warn!(%error, "deferred metric processor panicked; durable jobs remain retryable");
+        }
+        if completed.mode == FlushMode::Await {
+            processor.completed_await_generation = completed.generation;
+        }
+    }
+    let output = tokio::task::spawn_blocking(flush).await?;
+    if processor.task.is_none()
+        && (mode == FlushMode::Periodic
+            || processor.completed_await_generation < required_generation)
+    {
+        processor.started_generation += 1;
+        processor.task = Some(DeferredMetricTask {
+            mode,
+            generation: processor.started_generation,
+            handle: tokio::task::spawn_blocking(process),
+        });
+    }
+    Ok(output)
 }
 
 fn reingest_metrics_in_db(from_ts: Option<u32>, to_ts: Option<u32>) -> Result<usize, GitAiError> {
@@ -2200,6 +2299,257 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_deferred_computation_does_not_block_consecutive_outbox_flushes() {
+        let mut deferred = DeferredMetricProcessor::default();
+        let uploads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_uploads = uploads.clone();
+        let first_starts = starts.clone();
+        flush_then_schedule_deferred(
+            &mut deferred,
+            FlushMode::Periodic,
+            0,
+            move || {
+                first_uploads.fetch_add(1, Ordering::SeqCst);
+            },
+            move || {
+                first_starts.fetch_add(1, Ordering::SeqCst);
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            let cycle_uploads = uploads.clone();
+            let cycle_starts = starts.clone();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                flush_then_schedule_deferred(
+                    &mut deferred,
+                    FlushMode::Periodic,
+                    0,
+                    move || {
+                        cycle_uploads.fetch_add(1, Ordering::SeqCst);
+                    },
+                    move || {
+                        cycle_starts.fetch_add(1, Ordering::SeqCst);
+                    },
+                ),
+            )
+            .await
+            .expect("a running historical job must not delay the next upload")
+            .unwrap();
+        }
+        assert_eq!(uploads.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "only one deferred processor may run"
+        );
+        release_tx.send(()).unwrap();
+        deferred.task.take().unwrap().handle.await.unwrap();
+        let recovered = starts.clone();
+        flush_then_schedule_deferred(
+            &mut deferred,
+            FlushMode::Periodic,
+            0,
+            || {},
+            move || {
+                recovered.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap();
+        deferred.task.take().unwrap().handle.await.unwrap();
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "later passes resume normal durable processing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn awaited_deferred_pass_is_fenced_before_its_final_outbox_flush() {
+        let mut deferred = DeferredMetricProcessor::default();
+        let stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let process_stage = stage.clone();
+        flush_then_schedule_deferred(
+            &mut deferred,
+            FlushMode::Await,
+            1,
+            || {},
+            move || {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                process_stage.store(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deferred.completed_await_generation, 0,
+            "await cannot certify a just-started pass"
+        );
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        flush_then_schedule_deferred(
+            &mut deferred,
+            FlushMode::Await,
+            1,
+            || {},
+            || panic!("must not overlap processors"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deferred.completed_await_generation, 0);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !deferred.task.as_ref().unwrap().handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let final_stage = stage.clone();
+        flush_then_schedule_deferred(
+            &mut deferred,
+            FlushMode::Await,
+            1,
+            move || {
+                assert_eq!(final_stage.load(Ordering::SeqCst), 1);
+                final_stage.store(2, Ordering::SeqCst);
+            },
+            || panic!("a completed await does not start another unbounded pass"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deferred.completed_await_generation, 1);
+        assert_eq!(stage.load(Ordering::SeqCst), 2);
+        assert!(deferred.task.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn later_await_caller_cannot_reuse_an_already_started_pass() {
+        for old_mode in [FlushMode::Periodic, FlushMode::Await] {
+            let handle = tokio::task::spawn_blocking(|| {});
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let mut processor = DeferredMetricProcessor {
+                task: Some(DeferredMetricTask {
+                    mode: old_mode,
+                    generation: 1,
+                    handle,
+                }),
+                started_generation: 1,
+                completed_await_generation: 0,
+            };
+            let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+            let (later_tx, mut later_rx) = tokio::sync::oneshot::channel();
+            let mut requests = Vec::new();
+            if old_mode == FlushMode::Await {
+                requests.push(FlushRequest {
+                    required_deferred_generation: 1,
+                    completion: first_tx,
+                });
+            } else {
+                drop(first_tx);
+            }
+            // This request arrives after the old pass started, even if that
+            // pass finished before the loop had a chance to harvest it.
+            requests.push(FlushRequest {
+                required_deferred_generation: processor.started_generation + 1,
+                completion: later_tx,
+            });
+            let status = Some(FlushStatus::default());
+            flush_then_schedule_deferred(&mut processor, FlushMode::Await, 2, || {}, || {})
+                .await
+                .unwrap();
+            complete_flush_requests_through(
+                &mut requests,
+                status,
+                processor.completed_await_generation,
+            );
+            assert!(matches!(
+                later_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                requests.len(),
+                1,
+                "the later caller must remain bound to generation 2"
+            );
+            if old_mode == FlushMode::Await {
+                assert!(first_rx.try_recv().is_ok());
+            }
+            while !processor.task.as_ref().unwrap().handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            flush_then_schedule_deferred(
+                &mut processor,
+                FlushMode::Await,
+                2,
+                || {},
+                || panic!("pass already covered"),
+            )
+            .await
+            .unwrap();
+            complete_flush_requests_through(
+                &mut requests,
+                status,
+                processor.completed_await_generation,
+            );
+            assert!(later_rx.try_recv().is_ok());
+            assert!(requests.is_empty());
+            assert_eq!(processor.completed_await_generation, 2);
+        }
+    }
+
+    #[test]
+    fn timed_out_await_sender_is_removed_without_certifying_uncovered_callers() {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        drop(closed_rx);
+        let (open_tx, mut open_rx) = tokio::sync::oneshot::channel();
+        let mut requests = vec![
+            FlushRequest {
+                required_deferred_generation: 2,
+                completion: closed_tx,
+            },
+            FlushRequest {
+                required_deferred_generation: 3,
+                completion: open_tx,
+            },
+        ];
+        complete_flush_requests_through(&mut requests, Some(FlushStatus::default()), 1);
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            open_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        complete_flush_requests_through(&mut requests, None, 1);
+        assert!(requests.is_empty());
+        assert!(matches!(
+            open_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
     #[test]
     fn telemetry_flush_schedule_is_measured_from_completion() {
         let completed_at = tokio::time::Instant::now();
@@ -2269,7 +2619,10 @@ mod tests {
     #[test]
     fn missing_await_flush_status_cancels_waiter_instead_of_reporting_empty_queues() {
         let (completion, receiver) = tokio::sync::oneshot::channel();
-        let mut requests = vec![FlushRequest { completion }];
+        let mut requests = vec![FlushRequest {
+            required_deferred_generation: 0,
+            completion,
+        }];
 
         complete_flush_requests(&mut requests, None);
 
@@ -2283,7 +2636,10 @@ mod tests {
     #[test]
     fn completed_await_flush_delivers_the_measured_status() {
         let (completion, receiver) = tokio::sync::oneshot::channel();
-        let mut requests = vec![FlushRequest { completion }];
+        let mut requests = vec![FlushRequest {
+            required_deferred_generation: 0,
+            completion,
+        }];
         let expected = FlushStatus {
             metrics_remaining: 3,
             notes_remaining: 4,

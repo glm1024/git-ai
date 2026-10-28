@@ -3141,9 +3141,28 @@ fn refresh_daily_token_outbox(
         parse_token_snapshot_aliases(Some(&supersedes_snapshot_instance_ids_json))?
             .into_iter()
             .collect();
+    let ordinary_input = input.max(0) as u64;
+    let wire_input = if bucket_key.starts_with("td5:") {
+        let inclusive = ordinary_input
+            .checked_add(cache_read.max(0) as u64)
+            .and_then(|value| value.checked_add(cache_write.max(0) as u64))
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or_else(|| {
+                GitAiError::Generic("ZCode inclusive input exceeds BIGINT range".into())
+            })?;
+        inclusive
+            .checked_add(output.max(0) as u64)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or_else(|| {
+                GitAiError::Generic("ZCode total token usage exceeds BIGINT range".into())
+            })?;
+        inclusive
+    } else {
+        ordinary_input
+    };
     let mut values = SessionTokenUsageValues::new(
         bucket_key,
-        input.max(0) as u64,
+        wire_input,
         output.max(0) as u64,
         cache_read.max(0) as u64,
         cache_write.max(0) as u64,
@@ -4230,6 +4249,72 @@ mod tests {
     }
 
     #[test]
+    fn test_zcode_real_r2_exports_total_input_with_cache_once() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/zcode-r2-token-usage.json"
+        ))
+        .unwrap();
+        let (mut db, _temp_dir) = create_test_db();
+        let ts = seconds_ago(60);
+        for request in fixture["requests"].as_array().unwrap() {
+            let mut usage = request.clone();
+            usage["status"] = json!("completed");
+            usage["model_id"] = fixture["model"].clone();
+            usage["provider_id"] = fixture["provider"].clone();
+            let attrs = EventAttributes::with_version("test")
+                .tool("zcode")
+                .session_id("r2-fixture")
+                .external_session_id("r2-fixture")
+                .custom_attributes(r#"{"project_key":"babel"}"#)
+                .to_sparse();
+            let observation =
+                compact_session_event(&json!({"zcode_usage": usage}), ts, attrs, None, None, None);
+            db.insert_session_observations(&[observation]).unwrap();
+        }
+        let expected = &fixture["expected"];
+        let event: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
+        for (position, field) in [
+            ("1", "input"),
+            ("2", "output"),
+            ("3", "cache_read"),
+            ("4", "cache_write"),
+            ("5", "requests"),
+        ] {
+            assert_eq!(event.values[position], expected[field]);
+        }
+        assert_eq!(
+            event.values["1"].as_u64().unwrap() + event.values["2"].as_u64().unwrap(),
+            expected["total"].as_u64().unwrap()
+        );
+        let ordinary: i64 = db
+            .conn
+            .query_row("SELECT input_tokens FROM session_token_daily", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            ordinary as u64,
+            expected["ordinary_input"].as_u64().unwrap()
+        );
+        assert_eq!(event.values["14"], 2);
+    }
+
+    #[test]
+    fn test_zcode_wire_input_overflow_keeps_observation_atomic() {
+        let (mut db, _temp_dir) = create_test_db();
+        let observation = zcode_request_observation(seconds_ago(60), i64::MAX as u64, 1, 0);
+        assert!(db.insert_session_observations(&[observation]).is_err());
+        let sources: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM session_token_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sources, 0);
+        assert!(pending_event_jsons(&db).is_empty());
+    }
+
+    #[test]
     fn test_zcode_usage_replay_model_switch_and_daily_outbox_are_content_free() {
         let (mut db, _temp_dir) = create_test_db();
         let ts = seconds_ago(60);
@@ -4300,8 +4385,8 @@ mod tests {
         assert_eq!(
             totals,
             vec![
-                ("glm-a".to_string(), 60, 25, 30, 10, 1),
-                ("glm-b".to_string(), 60, 10, 30, 10, 1)
+                ("glm-a".to_string(), 100, 25, 30, 10, 1),
+                ("glm-b".to_string(), 100, 10, 30, 10, 1)
             ]
         );
     }
@@ -4366,7 +4451,7 @@ mod tests {
                 .is_empty()
         );
         let event: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
-        assert_eq!(event.values["1"], 40);
+        assert_eq!(event.values["1"], 60);
         assert_eq!(event.values["2"], 10);
         assert_eq!(event.values["3"], 20);
         assert_eq!(event.values["5"], 1);
@@ -4421,7 +4506,7 @@ mod tests {
         assert_eq!(event.values["12"], first_event.values["12"]);
         assert_eq!(first_event.values["14"], 1);
         assert_eq!(event.values["14"], 2);
-        assert_eq!(event.values["1"], 40);
+        assert_eq!(event.values["1"], 60);
         assert_eq!(event.values["2"], 10);
         assert_eq!(event.values["3"], 20);
         assert_eq!(event.values["5"], 1);
@@ -4449,7 +4534,7 @@ mod tests {
         db.insert_session_observations(&[correction]).unwrap();
         let next: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
         assert_eq!(next.values["0"], first.values["0"]);
-        assert_eq!(next.values["1"], 40);
+        assert_eq!(next.values["1"], 60);
         assert_eq!(next.values["5"], 1);
         assert_eq!(next.values["14"], 2);
         assert_eq!(
@@ -4569,7 +4654,7 @@ mod tests {
         );
         db.insert_session_observations(&[correction]).unwrap();
         let known: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
-        assert_eq!(known.values["1"], 110);
+        assert_eq!(known.values["1"], 150);
         assert_eq!(known.values["3"], 40);
         assert_eq!(known.values["5"], 2);
     }
@@ -4622,7 +4707,7 @@ mod tests {
         let pending = pending_event_jsons(&db);
         assert_eq!(pending.len(), 1);
         let merged: MetricEvent = serde_json::from_str(&pending[0]).unwrap();
-        assert_eq!(merged.values["1"], 340);
+        assert_eq!(merged.values["1"], 350);
         assert_eq!(merged.values["2"], 50);
         assert_eq!(merged.values["3"], 10);
         assert_eq!(merged.values["5"], 3);

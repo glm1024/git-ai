@@ -35,7 +35,11 @@ fn canonicalize_stream_path(path: &Path) -> PathBuf {
         if let Ok(canonical) = std::fs::canonicalize(ancestor)
             && let Ok(suffix) = path.strip_prefix(ancestor)
         {
-            return canonical.join(suffix);
+            return if suffix.as_os_str().is_empty() {
+                canonical
+            } else {
+                canonical.join(suffix)
+            };
         }
     }
     path.to_path_buf()
@@ -2231,6 +2235,24 @@ mod zcode_activity_tests {
             metadata: HashMap::new(),
         };
         (source, context)
+    }
+
+    #[test]
+    fn zcode_source_path_is_stable_before_and_after_file_creation_without_trailing_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite");
+        let expected = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("source.sqlite");
+        let before = canonicalize_stream_path(&source);
+        assert_eq!(before.as_os_str(), expected.as_os_str());
+        std::fs::write(&source, []).unwrap();
+        let after = canonicalize_stream_path(&source);
+        assert_eq!(after.as_os_str(), expected.as_os_str());
+        assert_eq!(before.as_os_str(), after.as_os_str());
+        // Path equality may normalize trailing separators. Compare raw OsStr
+        // because the SQLite stream identity is stored as a TEXT primary key.
+        assert_eq!(after.display().to_string(), expected.display().to_string());
     }
 
     #[tokio::test]

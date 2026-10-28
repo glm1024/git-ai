@@ -1,6 +1,6 @@
 # Git AI hooks for ZCode
 
-The ZCode installer registers synchronous native `process` hooks for ZCode 3.16.3's user configuration. It does not start or modify the ZCode application package. Start a new ZCode session after installing or updating hooks.
+The ZCode installer registers synchronous native `process` hooks for ZCode 3.16.3's user configuration. It does not start or modify the ZCode application package. If ZCode is running when hooks are installed or updated, fully quit and reopen ZCode, then start a new session. Creating another task inside the already-running desktop runtime does not reliably reload hook configuration; this was reproduced with ZCode 3.16.3 during live acceptance.
 
 The default configuration path on Windows, macOS, and Linux is `~/.zcode/cli/config.json`. If ZCode is launched with a different user config, set `GIT_AI_ZCODE_CONFIG_PATH` to that complete path when running Git AI's hook installer. `~/` is expanded against the current user's home. This variable configures Git AI only; the ZCode launch configuration must select the same file. ZCode's `ZCODE_DATA_BASE_DIR` is not a replacement for the CLI user config path.
 

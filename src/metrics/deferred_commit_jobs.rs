@@ -319,11 +319,14 @@ fn complete_global(
         .iter()
         .map(serde_json::to_string)
         .collect::<Result<Vec<_>, _>>()?;
+    // Validation parses/hashes the potentially large bundle. Finish all CPU
+    // work before locking the shared outbox connection.
+    let validated = validate_event_bundle(job, &event_jsons)?;
     let db = MetricsDatabase::global()?;
     let mut db = db
         .lock()
         .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
-    complete_on_connection(db.deferred_jobs_connection(), job, &event_jsons, now)
+    complete_validated_on_connection(db.deferred_jobs_connection(), job, &validated, now)
 }
 
 fn mark_failed_global(
@@ -469,57 +472,58 @@ fn build_bundled_events(
     hunks: Vec<crate::commands::diff::DiffJsonHunk>,
 ) -> Result<Vec<MetricEvent>, GitAiError> {
     let total_hunk_count = hunks.len();
+    validate_bundle_totals(bundle_id, 0, total_hunk_count, 0, 0)?;
     let mut chunks: Vec<Vec<crate::commands::diff::DiffJsonHunk>> = Vec::new();
     let mut current = Vec::new();
 
+    // HUNKS is itself a JSON string in the event. Measure the invariant
+    // envelope (including a possibly very large note) once. Each serialized
+    // hunk contributes only its escaped string-content bytes plus one comma.
+    // This preserves the old greedy boundaries without cloning/serializing
+    // the growing hunk prefix and the entire note for every appended hunk.
+    let empty = bundled_event(
+        &base_values,
+        &attrs,
+        event_ts,
+        bundle_id,
+        u32::MAX,
+        u32::MAX,
+        full_hunks_sha256,
+        &[],
+    )?;
+    let fixed_bytes = serialized_single_event_batch_bytes(&empty)?;
+    let mut current_bytes = fixed_bytes;
     for hunk in hunks {
-        current.push(hunk);
-        let within_count = current.len() <= MAX_HUNKS_PER_BUNDLE_CHUNK;
-        let within_bytes = if within_count {
-            let candidate = bundled_event(
-                &base_values,
-                &attrs,
-                event_ts,
-                bundle_id,
-                u32::MAX,
-                u32::MAX,
-                full_hunks_sha256,
-                &current,
-            )?;
-            serialized_single_event_batch_bytes(&candidate)?
-                < crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES
-        } else {
-            false
-        };
-        if within_count && within_bytes {
-            continue;
-        }
-
-        let last = current
-            .pop()
-            .expect("the current chunk contains the hunk just appended");
-        if !current.is_empty() {
-            chunks.push(std::mem::take(&mut current));
-        }
-        current.push(last);
-
-        let single = bundled_event(
-            &base_values,
-            &attrs,
-            event_ts,
-            bundle_id,
-            u32::MAX,
-            u32::MAX,
-            full_hunks_sha256,
-            &current,
-        )?;
-        let single_bytes = serialized_single_event_batch_bytes(&single)?;
+        let hunk_bytes = bundled_hunk_wire_bytes(&hunk)?;
+        let single_bytes = fixed_bytes.checked_add(hunk_bytes).ok_or_else(|| {
+            GitAiError::Generic(format!(
+                "deferred commit metric bundle {bundle_id} size overflowed"
+            ))
+        })?;
         if single_bytes >= crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES {
             return Err(GitAiError::Generic(format!(
                 "deferred commit metric bundle {bundle_id} contains a hunk that cannot fit in one upload event ({single_bytes} bytes, limit is strictly below {} bytes)",
                 crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES
             )));
         }
+        let candidate_bytes = current_bytes
+            .checked_add(hunk_bytes)
+            .and_then(|bytes| bytes.checked_add(usize::from(!current.is_empty())))
+            .ok_or_else(|| {
+                GitAiError::Generic(format!(
+                    "deferred commit metric bundle {bundle_id} size overflowed"
+                ))
+            })?;
+        if !current.is_empty()
+            && (current.len() == MAX_HUNKS_PER_BUNDLE_CHUNK
+                || candidate_bytes >= crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES)
+        {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = single_bytes;
+        } else {
+            current_bytes = candidate_bytes;
+        }
+        current.push(hunk);
     }
 
     if !current.is_empty() {
@@ -613,6 +617,15 @@ fn bundled_event(
         attrs.clone(),
         Some(event_ts),
     ))
+}
+
+fn bundled_hunk_wire_bytes(
+    hunk: &crate::commands::diff::DiffJsonHunk,
+) -> Result<usize, GitAiError> {
+    let hunk_json = serde_json::to_string(hunk)?;
+    // Exclude the outer string quotes: the empty envelope already includes
+    // the HUNKS string's quotes and the array's opening/closing brackets.
+    Ok(serde_json::to_vec(&hunk_json)?.len() - 2)
 }
 
 fn serialized_single_event_batch_bytes(event: &MetricEvent) -> Result<usize, GitAiError> {
@@ -1230,14 +1243,23 @@ pub(crate) fn mark_failed_on_connection(
     Ok(updated == 1)
 }
 
+#[cfg(test)]
 pub(crate) fn complete_on_connection(
     conn: &mut Connection,
     job: &ClaimedDeferredCommitMetricJob,
     event_jsons: &[String],
     now: u64,
 ) -> Result<bool, GitAiError> {
-    validate_event_bundle(job, event_jsons)?;
+    let validated = validate_event_bundle(job, event_jsons)?;
+    complete_validated_on_connection(conn, job, &validated, now)
+}
 
+fn complete_validated_on_connection(
+    conn: &mut Connection,
+    job: &ClaimedDeferredCommitMetricJob,
+    validated: &ValidatedCommitEvents<'_>,
+    now: u64,
+) -> Result<bool, GitAiError> {
     let tx = conn.transaction()?;
     let owns_lease: bool = tx.query_row(
         r#"
@@ -1255,23 +1277,12 @@ pub(crate) fn complete_on_connection(
         return Ok(false);
     }
 
-    let mut metric_ids = Vec::with_capacity(event_jsons.len());
-    for event_json in event_jsons {
-        let value: Value = serde_json::from_str(event_json)?;
-        let event_ts = value.get("t").and_then(Value::as_u64).unwrap_or(0);
-        let event_kind = value.get("e").and_then(Value::as_u64).unwrap_or(0);
-        if event_kind != u64::from(MetricEventId::Committed as u16) {
-            return Err(GitAiError::Generic(format!(
-                "deferred commit job produced non-committed event kind {event_kind}"
-            )));
-        }
+    let mut metric_ids = Vec::with_capacity(validated.event_jsons.len());
+    for (event_json, (event_ts, event_kind)) in validated.event_jsons.iter().zip(&validated.headers)
+    {
         tx.execute(
             "INSERT INTO metrics (event_json, event_ts, event_kind) VALUES (?1, ?2, ?3)",
-            params![
-                event_json,
-                u64_to_sqlite(event_ts),
-                u64_to_sqlite(event_kind)
-            ],
+            params![event_json, i64::from(*event_ts), i64::from(*event_kind)],
         )?;
         metric_ids.push(tx.last_insert_rowid());
     }
@@ -1369,12 +1380,21 @@ pub(crate) fn compact_done_payloads_on_connection(
     Ok(compacted)
 }
 
-fn validate_event_bundle(
+#[derive(Debug)]
+struct ValidatedCommitEvents<'a> {
+    event_jsons: &'a [String],
+    headers: Vec<(u32, u16)>,
+}
+
+fn validate_event_bundle<'a>(
     job: &ClaimedDeferredCommitMetricJob,
-    event_jsons: &[String],
-) -> Result<(), GitAiError> {
+    event_jsons: &'a [String],
+) -> Result<ValidatedCommitEvents<'a>, GitAiError> {
     if event_jsons.is_empty() {
-        return Ok(());
+        return Ok(ValidatedCommitEvents {
+            event_jsons,
+            headers: Vec::new(),
+        });
     }
     if event_jsons.len() > MAX_COMMIT_BUNDLE_CHUNKS {
         return Err(GitAiError::Generic(format!(
@@ -1412,6 +1432,7 @@ fn validate_event_bundle(
     let mut chunks: Vec<Option<Vec<crate::commands::diff::DiffJsonHunk>>> =
         vec![None; event_jsons.len()];
 
+    let mut headers = Vec::with_capacity(event_jsons.len());
     for event_json in event_jsons {
         let event: MetricEvent = serde_json::from_str(event_json)?;
         if event.event_id != MetricEventId::Committed as u16 {
@@ -1420,6 +1441,7 @@ fn validate_event_bundle(
                 event.event_id
             )));
         }
+        headers.push((event.timestamp, event.event_id));
         let event_bytes = serialized_single_event_batch_bytes(&event)?;
         if event_bytes >= crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES {
             return Err(GitAiError::Generic(format!(
@@ -1572,7 +1594,10 @@ fn validate_event_bundle(
         )));
     }
 
-    Ok(())
+    Ok(ValidatedCommitEvents {
+        event_jsons,
+        headers,
+    })
 }
 
 fn required_bundle_string<'a>(
@@ -1804,6 +1829,32 @@ mod tests {
             claim_due_on_connection(&mut conn, 35, 60)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn prevalidated_completion_keeps_headers_and_still_checks_current_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut conn = test_connection(&temp.path().join("metrics.db"));
+        enqueue_on_connection(&mut conn, &spec(DeferredCommitMetricKind::SingleParent), 10)
+            .unwrap();
+        let stale = claim_due_on_connection(&mut conn, 20, 10).unwrap().unwrap();
+        let raw = vec![committed_event_json(&stale)];
+        let validated = validate_event_bundle(&stale, &raw).unwrap();
+        let current = claim_due_on_connection(&mut conn, 30, 10).unwrap().unwrap();
+        assert!(!complete_validated_on_connection(&mut conn, &stale, &validated, 31).unwrap());
+        assert!(complete_validated_on_connection(&mut conn, &current, &validated, 32).unwrap());
+        let metadata: (i64, i64) = conn
+            .query_row("SELECT event_ts,event_kind FROM metrics", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(metadata, (100, MetricEventId::Committed as i64));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM metrics", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 
@@ -2070,6 +2121,138 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "processing");
+    }
+
+    #[test]
+    fn hunk_wire_budget_matches_real_nested_json_escaping() {
+        let base = crate::metrics::CommittedValues::new().authorship_note("large\n\"note\\中文");
+        let attrs = EventAttributes::with_version("test")
+            .repo_url("https://example.test/中文")
+            .to_sparse();
+        let mut hunks = Vec::new();
+        let empty = bundled_event(
+            &base,
+            &attrs,
+            100,
+            "bundle",
+            u32::MAX,
+            u32::MAX,
+            "digest",
+            &hunks,
+        )
+        .unwrap();
+        let fixed = serialized_single_event_batch_bytes(&empty).unwrap();
+        let mut contribution = 0;
+        for (index, path) in [
+            "normal.rs",
+            "quote\"slash\\newline\n.rs",
+            "中文/控制\u{0001}.rs",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut hunk = json_hunk("commit", index as u32);
+            hunk.file_path = path.to_string();
+            contribution += bundled_hunk_wire_bytes(&hunk).unwrap();
+            hunks.push(hunk);
+            let candidate = bundled_event(
+                &base,
+                &attrs,
+                100,
+                "bundle",
+                u32::MAX,
+                u32::MAX,
+                "digest",
+                &hunks,
+            )
+            .unwrap();
+            assert_eq!(
+                fixed + contribution + hunks.len() - 1,
+                serialized_single_event_batch_bytes(&candidate).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn large_note_bundle_keeps_strict_upload_byte_boundary() {
+        let empty_base = crate::metrics::CommittedValues::new().authorship_note("");
+        let empty = bundled_event(
+            &empty_base,
+            &SparseArray::new(),
+            100,
+            "bundle",
+            u32::MAX,
+            u32::MAX,
+            "digest",
+            &[],
+        )
+        .unwrap();
+        let overhead = serialized_single_event_batch_bytes(&empty).unwrap();
+        let hunk = json_hunk("commit", 0);
+        let hunk_bytes = bundled_hunk_wire_bytes(&hunk).unwrap();
+        let limit = crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES;
+        let note_len = limit - overhead - hunk_bytes - 1;
+        let fits = crate::metrics::CommittedValues::new().authorship_note("n".repeat(note_len));
+        let events = build_bundled_events(
+            fits,
+            SparseArray::new(),
+            100,
+            "bundle",
+            "digest",
+            vec![hunk.clone(), hunk.clone()],
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert!(serialized_single_event_batch_bytes(&event).unwrap() < limit);
+        }
+        let at_limit =
+            crate::metrics::CommittedValues::new().authorship_note("n".repeat(note_len + 1));
+        assert!(
+            build_bundled_events(
+                at_limit,
+                SparseArray::new(),
+                100,
+                "bundle",
+                "digest",
+                vec![hunk]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot fit in one upload event")
+        );
+    }
+
+    #[test]
+    fn large_note_bundle_does_not_reserialize_the_note_for_every_hunk() {
+        let base = crate::metrics::CommittedValues::new()
+            .authorship_note("n".repeat(1_000_000))
+            .commit_subject("large note with many small hunks");
+        let hunks = (0..640)
+            .map(|index| json_hunk("commit", index))
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let events =
+            build_bundled_events(base, SparseArray::new(), 100, "bundle", "digest", hunks).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "building a 1 MB note with 640 hunks took {elapsed:?}; repeated full-note serialization starves upload"
+        );
+        assert_eq!(events.len(), 2);
+        let mut observed = Vec::new();
+        for event in events {
+            assert!(
+                serialized_single_event_batch_bytes(&event).unwrap()
+                    < crate::metrics::db::MAX_METRICS_UPLOAD_BODY_BYTES
+            );
+            let chunk: Vec<crate::commands::diff::DiffJsonHunk> = serde_json::from_str(
+                required_bundle_string(&event, committed_pos::HUNKS, "hunks").unwrap(),
+            )
+            .unwrap();
+            observed.extend(chunk.into_iter().map(|hunk| hunk.start_line));
+        }
+        assert_eq!(observed, (1..=640).collect::<Vec<_>>());
     }
 
     #[test]

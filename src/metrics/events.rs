@@ -2180,7 +2180,11 @@ pub mod session_token_usage_pos {
 /// response, reasoning, tool input/output, file contents, or raw transcript.
 ///
 /// Enterprise wire revisions td1 through td4 retain their existing monotonic
-/// counter contract. ZCode uses td5:<stable-dimension-hash> and optional position
+/// counter contract. In td5 position 1 is total input INCLUDING cache reads and
+/// writes; positions 3/4 are subsets and must not be added to total input again.
+/// Total usage is position 1 plus output (position 2). Internal ZCode source/day
+/// counters retain ordinary input, so only the exporter joins cache components.
+/// ZCode uses td5:<stable-dimension-hash> and optional position
 /// 14 (`snapshot_sequence`): a positive, persisted per-day-bucket sequence. A
 /// higher sequence replaces the entire snapshot, including decreases, cache
 /// reclassification and zero totals. Equal or older sequences cannot overwrite

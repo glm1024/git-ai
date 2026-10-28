@@ -104,8 +104,9 @@ fn extract_token_snapshot(
 ) -> Option<TokenSnapshot> {
     // ZCode's canonical model_usage rows are request-attempt facts. Input
     // already includes cache reads/writes, and output already includes reasoning.
-    // The enterprise wire contract carries ordinary input plus separate cache
-    // categories, so subtract cache once instead of inflating total usage.
+    // Internal source/day accounting keeps ordinary input and cache components
+    // separately for exact signed corrections and cost calculations. The td5
+    // enterprise exporter restores inclusive input once; cache stays a subset.
     if tool == "zcode" {
         let usage = raw.get("zcode_usage")?;
         if !matches!(
