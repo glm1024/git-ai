@@ -659,7 +659,7 @@ unknown 6
 }
 
 #[test]
-fn test_commit_metadata_recovery_skips_when_edge_expansion_recovers_all_unknown_lines() {
+fn test_commit_metadata_recovery_preserves_explicit_ai_and_recovers_unknown_lines() {
     let mut repo = TestRepo::new();
     repo.patch_git_ai_config(|patch| {
         patch.exclude_prompts_in_repositories = Some(vec![]);
@@ -704,7 +704,7 @@ edge 3
 
     let commit = repo
         .stage_all_and_commit(
-            "Edge should win before metadata\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+            "Preserve checkpoint evidence before metadata recovery\n\nCo-authored-by: Claude <noreply@anthropic.com>",
         )
         .expect("commit should succeed");
 
@@ -720,11 +720,21 @@ edge 3
         &commit.authorship_log,
         "metadata-edge-skip.txt",
         &expected_session_id,
-        &[2, 3, 4, 5],
+        &[2],
     );
-    assert!(
-        session_ids_for_tool(&commit.authorship_log, "claude").is_empty(),
-        "commit metadata should not synthesize a Claude session after edge recovery removes all unknown lines"
+    // The explicit Codex checkpoint owns only its observed edit. The Claude
+    // trailer independently recovers the remaining lines under its own trace.
+    let claude_sessions = session_ids_for_tool(&commit.authorship_log, "claude");
+    assert_eq!(
+        claude_sessions.len(),
+        1,
+        "the trailer should recover a Claude session"
+    );
+    assert_session_attests_lines(
+        &commit.authorship_log,
+        "metadata-edge-skip.txt",
+        &claude_sessions[0],
+        &[3, 4, 5],
     );
 }
 

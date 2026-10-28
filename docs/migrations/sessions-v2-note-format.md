@@ -62,6 +62,25 @@ A new `"sessions"` map appears in the metadata JSON alongside `"prompts"` and `"
 
 **Parsing note:** `"sessions"` may be absent on older notes. Treat it as an empty map when missing.
 
+### Per-checkpoint model identity
+
+A conversation can switch models without becoming a different session. Session
+records may therefore contain an optional `trace_models` map, keyed by the trace
+ID from the attestation (for example, `"t_9f8e7d6c5b4a32": "gpt-5"`). Resolve an
+attestation's model from this map first, falling back to `agent_id.model` when its
+trace is absent. The session's tool and external conversation ID still come from
+`agent_id`, and the deterministic session ID does not include the model.
+
+New checkpoints record their observed model per trace. Merging notes or carrying
+uncommitted lines forward preserves these mappings. Newly generated notes and
+INITIAL records retain only trace mappings referenced by their own attestations
+or carried line attributions; the legacy session default is kept. This cleanup
+does not alter historical notes during reading or generic serialization.
+Older notes and INITIAL
+records without the field remain readable using their original explicit session
+model; this does not reconstruct or correct model history already lost by an
+older writer. The schema version remains `authorship/3.0.0`.
+
 ## Change 2: New attestation key format with trace IDs
 
 Attestation lines in the note header now use a composite `session_id::trace_id` format for new-format checkpoints. This gives per-checkpoint granularity -- the same session can have multiple distinct attestation entries, one per tool invocation/edit.

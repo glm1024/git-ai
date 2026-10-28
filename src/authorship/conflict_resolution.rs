@@ -139,6 +139,7 @@ fn merge_authorship_metadata(target: &mut AuthorshipLog, source: &AuthorshipLog)
             .metadata
             .sessions
             .entry(key.clone())
+            .and_modify(|existing| existing.merge_from(record))
             .or_insert_with(|| record.clone());
     }
 }

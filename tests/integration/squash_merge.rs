@@ -540,10 +540,10 @@ fn test_prepare_working_log_squash_multiple_sessions_standard_human() {
     // "footer" gets AI attribution — git's diff includes it in the hunk
     // (trailing newline changed when AI session 2 appended after it).
     file.assert_lines_and_blame(crate::lines![
-        "header".human(),
+        "header".unattributed_human(),
         "// AI session 1".ai(),
-        "body".human(),
-        "// Human addition".human(),
+        "body".unattributed_human(),
+        "// Human addition".unattributed_human(),
         "footer".ai(),
         "// AI session 2".ai()
     ]);
@@ -559,10 +559,13 @@ fn test_prepare_working_log_squash_multiple_sessions_standard_human() {
     );
     assert_eq!(stats.ai_accepted, 3, "3 AI lines accepted without edits");
     assert_eq!(
-        stats.human_additions, 1,
-        "1 recovered KnownHuman-attested line"
+        stats.human_additions, 0,
+        "a legacy human checkpoint is not positive KnownHuman evidence"
     );
-    assert_eq!(stats.unknown_additions, 0, "no unattested lines remain");
+    assert_eq!(
+        stats.unknown_additions, 1,
+        "the legacy human addition stays unknown"
+    );
 }
 
 crate::reuse_tests_in_worktree!(

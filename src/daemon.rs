@@ -3277,6 +3277,13 @@ struct TraceIngressState {
 }
 
 #[doc(hidden)]
+struct PendingZCodeEdit {
+    registered_at_ns: u128,
+    file_paths: HashSet<String>,
+}
+
+type PendingZCodeEditsByFamily = HashMap<String, HashMap<(String, String), PendingZCodeEdit>>;
+
 pub struct ActorDaemonCoordinator {
     backend: Arc<crate::daemon::git_backend::SystemGitBackend>,
     coordinator:
@@ -3294,6 +3301,8 @@ pub struct ActorDaemonCoordinator {
     /// Files with an in-flight AI edit (PreFileEdit received, PostFileEdit not yet completed).
     /// Outer key: family. Inner key: absolute file path string. Value: registration timestamp (nanos).
     pending_ai_edits_by_family: Mutex<HashMap<String, HashMap<String, u128>>>,
+    pending_zcode_edits_by_family: Mutex<PendingZCodeEditsByFamily>,
+    zcode_bash_lifecycle_lock: Mutex<()>,
     family_sequencers_by_family: Mutex<HashMap<String, FamilySequencerState>>,
     pending_root_slots_by_root: Mutex<HashMap<String, PendingRootSlot>>,
     commit_file_timestamp_snapshots_by_root:
@@ -3423,6 +3432,8 @@ impl ActorDaemonCoordinator {
             pending_squash_merge_by_worktree: Mutex::new(HashMap::new()),
             inflight_effects_by_family: Mutex::new(HashMap::new()),
             pending_ai_edits_by_family: Mutex::new(HashMap::new()),
+            pending_zcode_edits_by_family: Mutex::new(HashMap::new()),
+            zcode_bash_lifecycle_lock: Mutex::new(()),
             family_sequencers_by_family: Mutex::new(HashMap::new()),
             pending_root_slots_by_root: Mutex::new(HashMap::new()),
             commit_file_timestamp_snapshots_by_root: Mutex::new(HashMap::new()),
@@ -3900,6 +3911,14 @@ impl ActorDaemonCoordinator {
                 }
                 map.retain(|_, family_map| !family_map.is_empty());
             }
+            if let Ok(mut map) = self.pending_zcode_edits_by_family.lock() {
+                for calls in map.values_mut() {
+                    calls.retain(|_, call| {
+                        gc_now_ns.saturating_sub(call.registered_at_ns) < PENDING_AI_EDIT_TIMEOUT_NS
+                    });
+                }
+                map.retain(|_, calls| !calls.is_empty());
+            }
         }
     }
 
@@ -3932,18 +3951,83 @@ impl ActorDaemonCoordinator {
         }
     }
 
+    fn register_pending_zcode_edit(
+        &self,
+        family: &str,
+        session: &str,
+        call: &str,
+        paths: &[String],
+    ) {
+        if let Ok(mut map) = self.pending_zcode_edits_by_family.lock() {
+            let pending = map
+                .entry(family.into())
+                .or_default()
+                .entry((session.into(), call.into()))
+                .or_insert_with(|| PendingZCodeEdit {
+                    registered_at_ns: now_unix_nanos(),
+                    file_paths: HashSet::new(),
+                });
+            pending
+                .file_paths
+                .extend(paths.iter().map(|path| Self::canonicalize_path(path)));
+        }
+    }
+
+    fn register_pending_zcode_edit_if_open(
+        &self,
+        family: &str,
+        session: &str,
+        call: &str,
+        paths: &[String],
+        terminal_check: impl FnOnce() -> Result<bool, GitAiError>,
+    ) -> Result<(), GitAiError> {
+        // This is the same lock held by BashSessionEnd while it persists the
+        // terminal and clears pending state. Either registration precedes that
+        // cleanup, or the persisted terminal prevents a late registration.
+        let _lifecycle = self
+            .zcode_bash_lifecycle_lock
+            .lock()
+            .map_err(|_| GitAiError::Generic("ZCode Bash lifecycle lock poisoned".into()))?;
+        if !terminal_check()? {
+            self.register_pending_zcode_edit(family, session, call, paths);
+        }
+        Ok(())
+    }
+
+    fn clear_pending_zcode_edit(&self, family: &str, session: &str, call: &str) {
+        if let Ok(mut map) = self.pending_zcode_edits_by_family.lock()
+            && let Some(calls) = map.get_mut(family)
+        {
+            calls.remove(&(session.into(), call.into()));
+            if calls.is_empty() {
+                map.remove(family);
+            }
+        }
+    }
+
     fn file_has_pending_ai_edit(&self, family: &str, file_path: &str) -> bool {
         const PENDING_AI_EDIT_TIMEOUT_NS: u128 = 10_000_000_000; // 10 seconds
         let now_ns = now_unix_nanos();
         let canonical = Self::canonicalize_path(file_path);
         if let Ok(map) = self.pending_ai_edits_by_family.lock()
             && let Some(family_map) = map.get(family)
-        {
-            return family_map.get(&canonical).is_some_and(|registered_at| {
+            && family_map.get(&canonical).is_some_and(|registered_at| {
                 now_ns.saturating_sub(*registered_at) < PENDING_AI_EDIT_TIMEOUT_NS
-            });
+            })
+        {
+            return true;
         }
-        false
+        self.pending_zcode_edits_by_family
+            .lock()
+            .map(|map| {
+                map.get(family).is_some_and(|calls| {
+                    calls.values().any(|call| {
+                        now_ns.saturating_sub(call.registered_at_ns) < PENDING_AI_EDIT_TIMEOUT_NS
+                            && call.file_paths.contains(&canonical)
+                    })
+                })
+            })
+            .unwrap_or(true)
     }
 
     fn trace_invocation_participates_in_family_sequencer(
@@ -5734,6 +5818,20 @@ impl ActorDaemonCoordinator {
                     let checkpoint_trace_id = request.trace_id.clone();
                     let checkpoint_path_role = request.path_role;
                     let checkpoint_has_agent = request.agent_id.is_some();
+                    let zcode_call = request
+                        .agent_id
+                        .as_ref()
+                        .filter(|agent| agent.tool == "zcode")
+                        .and_then(|agent| {
+                            request
+                                .metadata
+                                .get("tool_use_id")
+                                .map(|call| (agent.id.clone(), call.clone()))
+                        });
+                    let terminal_failed_tool = matches!(
+                        request.metadata.get("tool_outcome").map(String::as_str),
+                        Some("failed" | "backgrounded")
+                    );
                     let checkpoint_kind_str = format!("{:?}", checkpoint_kind);
                     let is_human_checkpoint = checkpoint_kind == CheckpointKind::Human;
 
@@ -5741,9 +5839,33 @@ impl ActorDaemonCoordinator {
                     // pre-edit snapshot. This signals that an AI edit is in-flight.
                     // Identified by: WillEdit path_role + agent_id present (only AI
                     // agent presets have an agent_id on their pre-edit checkpoints).
-                    if checkpoint_path_role == PreparedPathRole::WillEdit && checkpoint_has_agent {
-                        self.register_pending_ai_edits(family, &checkpoint_file_paths);
-                    }
+                    let pending_registration = if checkpoint_path_role == PreparedPathRole::WillEdit
+                        && checkpoint_has_agent
+                    {
+                        if let Some((session, call)) = &zcode_call {
+                            if request.metadata.get("edit_kind").map(String::as_str) == Some("bash")
+                            {
+                                self.register_pending_zcode_edit_if_open(family, session, call, &checkpoint_file_paths, || {
+                                    let db = crate::daemon::bash_history_db::BashHistoryDatabase::global()?;
+                                    let db = db.lock().map_err(|_| GitAiError::Generic("bash history lock poisoned".into()))?;
+                                    db.zcode_call_ended_without_checkpoint(session, call)
+                                })
+                            } else {
+                                self.register_pending_zcode_edit(
+                                    family,
+                                    session,
+                                    call,
+                                    &checkpoint_file_paths,
+                                );
+                                Ok(())
+                            }
+                        } else {
+                            self.register_pending_ai_edits(family, &checkpoint_file_paths);
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    };
 
                     // Filter out files with pending AI edits from KnownHuman checkpoints.
                     // These are spurious IDE save events that fire between pre/post-edit.
@@ -5822,6 +5944,7 @@ impl ActorDaemonCoordinator {
                     let checkpoint_recovery_owner = self.checkpoint_recovery_owner.clone();
                     let checkpoint_request = {
                         let future = async {
+                            pending_registration?;
                             let seq = if !repo_wd.is_empty() {
                                 self.coordinator
                                     .apply_checkpoint(Path::new(&repo_wd))
@@ -5909,12 +6032,22 @@ impl ActorDaemonCoordinator {
                             "checkpoint failed"
                         );
                     }
+                    if result.is_err()
+                        && checkpoint_path_role == PreparedPathRole::WillEdit
+                        && let Some((session, call)) = &zcode_call
+                    {
+                        self.clear_pending_zcode_edit(family, session, call);
+                    }
                     if result.is_ok() {
                         // Clear pending AI edit state once the PostFileEdit completes.
-                        if checkpoint_kind.is_ai()
+                        if (checkpoint_kind.is_ai() || terminal_failed_tool)
                             && checkpoint_path_role == PreparedPathRole::Edited
                         {
-                            self.clear_pending_ai_edits(family, &checkpoint_file_paths);
+                            if let Some((session, call)) = &zcode_call {
+                                self.clear_pending_zcode_edit(family, session, call);
+                            } else {
+                                self.clear_pending_ai_edits(family, &checkpoint_file_paths);
+                            }
                         }
                         let per_file = if !checkpoint_file_paths.is_empty() {
                             compute_watermarks_from_stat(&repo_wd, &checkpoint_file_paths)
@@ -8165,6 +8298,28 @@ impl ActorDaemonCoordinator {
             ControlRequest::CheckpointRun { .. } => Err(GitAiError::Generic(
                 "checkpoint.run requires the framed checkpoint transport".to_string(),
             )),
+            ControlRequest::AgentSessionActivity { activity } => {
+                match self.stream_worker.as_ref() {
+                    Some(worker) => {
+                        let repo =
+                            crate::git::repo_state::worktree_root_for_path(&activity.context.cwd);
+                        worker
+                            .notify_session_activity(
+                                activity.stream_source,
+                                activity.context,
+                                activity.observed_at_millis,
+                                repo,
+                            )
+                            .await
+                            .map(|_| ControlResponse::ok(None, None))
+                            .map_err(GitAiError::Generic)
+                    }
+                    None => Ok(ControlResponse::ok(
+                        None,
+                        Some(serde_json::json!({"skipped": "transcript_streaming_disabled"})),
+                    )),
+                }
+            }
             ControlRequest::SyncFamily { repo_working_dir } => {
                 self.sync_family(repo_working_dir).await.and_then(|status| {
                     serde_json::to_value(status)
@@ -8266,25 +8421,42 @@ impl ActorDaemonCoordinator {
                 started_at_ns,
                 command,
             } => {
+                let _lifecycle_guard = if agent_id.tool == "zcode" {
+                    match self.zcode_bash_lifecycle_lock.lock() {
+                        Ok(guard) => Some(guard),
+                        Err(_) => {
+                            return ControlResponse::err("ZCode Bash lifecycle lock poisoned");
+                        }
+                    }
+                } else {
+                    None
+                };
                 let worktree_key = Self::worktree_state_key(Path::new(&repo_work_dir));
                 let original_cwd = original_cwd.unwrap_or_else(|| repo_work_dir.clone());
-                if let Ok(db) = crate::daemon::bash_history_db::BashHistoryDatabase::global()
-                    && let Ok(mut db_lock) = db.lock()
-                    && let Err(e) =
-                        db_lock.record_start(&crate::daemon::bash_history_db::BashCallStart {
-                            original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
-                            repo_work_dir: Some(worktree_key.clone()),
-                            repo_discovery_error: None,
-                            session_id: session_id.clone(),
-                            tool_use_id: tool_use_id.clone(),
-                            agent_id: agent_id.clone(),
-                            start_trace_id: trace_id.clone(),
-                            started_at_ns,
-                            command: command.clone(),
-                            metadata: metadata.clone(),
-                        })
-                {
-                    tracing::debug!("failed to persist bash session start: {}", e);
+                let strict_history = agent_id.tool == "zcode";
+                let persisted = (|| -> Result<(), GitAiError> {
+                    let db = crate::daemon::bash_history_db::BashHistoryDatabase::global()?;
+                    let mut db_lock = db
+                        .lock()
+                        .map_err(|_| GitAiError::Generic("bash history lock poisoned".into()))?;
+                    db_lock.record_start(&crate::daemon::bash_history_db::BashCallStart {
+                        original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
+                        repo_work_dir: Some(worktree_key.clone()),
+                        repo_discovery_error: None,
+                        session_id: session_id.clone(),
+                        tool_use_id: tool_use_id.clone(),
+                        agent_id: agent_id.clone(),
+                        start_trace_id: trace_id.clone(),
+                        started_at_ns,
+                        command: command.clone(),
+                        metadata: metadata.clone(),
+                    })
+                })();
+                if let Err(error) = persisted {
+                    if strict_history {
+                        return ControlResponse::err(error.to_string());
+                    }
+                    tracing::debug!("failed to persist bash session start: {}", error);
                 }
 
                 let mut state = self.bash_sessions.lock().unwrap();
@@ -8312,6 +8484,16 @@ impl ActorDaemonCoordinator {
                 ended_at_ns,
                 command,
             } => {
+                let _lifecycle_guard = if agent_id.tool == "zcode" {
+                    match self.zcode_bash_lifecycle_lock.lock() {
+                        Ok(guard) => Some(guard),
+                        Err(_) => {
+                            return ControlResponse::err("ZCode Bash lifecycle lock poisoned");
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mut state = self.bash_sessions.lock().unwrap();
                 let session = state.end_session(&session_id, &tool_use_id);
                 drop(state);
@@ -8326,10 +8508,16 @@ impl ActorDaemonCoordinator {
                 let start_trace_id = session.as_ref().map(|s| s.start_trace_id.clone());
                 let started_at_ns = session.as_ref().map(|s| s.started_at_ns);
                 let command = command.or_else(|| session.as_ref().and_then(|s| s.command.clone()));
-                let agent_id = session
-                    .as_ref()
-                    .map(|s| s.agent_id.clone())
-                    .unwrap_or(agent_id);
+                // ZCode resolves the exact generating model on the post hook;
+                // its pre hook can arrive before that message is committed.
+                let agent_id = if agent_id.tool == "zcode" {
+                    agent_id
+                } else {
+                    session
+                        .as_ref()
+                        .map(|s| s.agent_id.clone())
+                        .unwrap_or(agent_id)
+                };
                 let metadata = if metadata.is_empty() {
                     session
                         .as_ref()
@@ -8338,25 +8526,51 @@ impl ActorDaemonCoordinator {
                 } else {
                     metadata
                 };
-                if let Ok(db) = crate::daemon::bash_history_db::BashHistoryDatabase::global()
-                    && let Ok(mut db_lock) = db.lock()
-                    && let Err(e) =
-                        db_lock.record_end(&crate::daemon::bash_history_db::BashCallEnd {
-                            original_cwd,
-                            repo_work_dir: Some(worktree_key),
-                            repo_discovery_error: None,
-                            session_id,
-                            tool_use_id,
-                            agent_id,
-                            start_trace_id,
-                            end_trace_id: trace_id,
-                            started_at_ns,
-                            ended_at_ns,
-                            command,
-                            metadata,
-                        })
+                let cleanup_call = if agent_id.tool == "zcode"
+                    && metadata
+                        .get("snapshot_without_checkpoint")
+                        .map(String::as_str)
+                        == Some("true")
                 {
-                    tracing::debug!("failed to persist bash session end: {}", e);
+                    Some((
+                        worktree_key.clone(),
+                        session_id.clone(),
+                        tool_use_id.clone(),
+                    ))
+                } else {
+                    None
+                };
+                let strict_history = agent_id.tool == "zcode";
+                let persisted = (|| -> Result<(), GitAiError> {
+                    let db = crate::daemon::bash_history_db::BashHistoryDatabase::global()?;
+                    let mut db_lock = db
+                        .lock()
+                        .map_err(|_| GitAiError::Generic("bash history lock poisoned".into()))?;
+                    db_lock.record_end(&crate::daemon::bash_history_db::BashCallEnd {
+                        original_cwd,
+                        repo_work_dir: Some(worktree_key),
+                        repo_discovery_error: None,
+                        session_id,
+                        tool_use_id,
+                        agent_id,
+                        start_trace_id,
+                        end_trace_id: trace_id,
+                        started_at_ns,
+                        ended_at_ns,
+                        command,
+                        metadata,
+                    })
+                })();
+                if let Err(error) = persisted {
+                    if strict_history {
+                        return ControlResponse::err(error.to_string());
+                    }
+                    tracing::debug!("failed to persist bash session end: {}", error);
+                }
+                if let Some((worktree, session, call)) = cleanup_call
+                    && let Ok(family) = self.backend.resolve_family(Path::new(&worktree))
+                {
+                    self.clear_pending_zcode_edit(&family.0, &session, &call);
                 }
                 Ok(ControlResponse::ok(None, None))
             }
@@ -8376,23 +8590,30 @@ impl ActorDaemonCoordinator {
                     .as_deref()
                     .map(Path::new)
                     .map(Self::worktree_state_key);
-                if let Ok(db) = crate::daemon::bash_history_db::BashHistoryDatabase::global()
-                    && let Ok(mut db_lock) = db.lock()
-                    && let Err(e) =
-                        db_lock.record_start(&crate::daemon::bash_history_db::BashCallStart {
-                            original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
-                            repo_work_dir: discovered_repo_work_dir,
-                            repo_discovery_error,
-                            session_id,
-                            tool_use_id,
-                            agent_id,
-                            start_trace_id: trace_id,
-                            started_at_ns,
-                            command,
-                            metadata,
-                        })
-                {
-                    tracing::debug!("failed to persist bash hook attempt start: {}", e);
+                let strict_history = agent_id.tool == "zcode";
+                let persisted = (|| -> Result<(), GitAiError> {
+                    let db = crate::daemon::bash_history_db::BashHistoryDatabase::global()?;
+                    let mut db_lock = db
+                        .lock()
+                        .map_err(|_| GitAiError::Generic("bash history lock poisoned".into()))?;
+                    db_lock.record_start(&crate::daemon::bash_history_db::BashCallStart {
+                        original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
+                        repo_work_dir: discovered_repo_work_dir,
+                        repo_discovery_error,
+                        session_id,
+                        tool_use_id,
+                        agent_id,
+                        start_trace_id: trace_id,
+                        started_at_ns,
+                        command,
+                        metadata,
+                    })
+                })();
+                if let Err(error) = persisted {
+                    if strict_history {
+                        return ControlResponse::err(error.to_string());
+                    }
+                    tracing::debug!("failed to persist bash hook attempt start: {}", error);
                 }
                 Ok(ControlResponse::ok(None, None))
             }
@@ -8412,25 +8633,32 @@ impl ActorDaemonCoordinator {
                     .as_deref()
                     .map(Path::new)
                     .map(Self::worktree_state_key);
-                if let Ok(db) = crate::daemon::bash_history_db::BashHistoryDatabase::global()
-                    && let Ok(mut db_lock) = db.lock()
-                    && let Err(e) =
-                        db_lock.record_end(&crate::daemon::bash_history_db::BashCallEnd {
-                            original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
-                            repo_work_dir: discovered_repo_work_dir,
-                            repo_discovery_error,
-                            session_id,
-                            tool_use_id,
-                            agent_id,
-                            start_trace_id: None,
-                            end_trace_id: trace_id,
-                            started_at_ns: None,
-                            ended_at_ns,
-                            command,
-                            metadata,
-                        })
-                {
-                    tracing::debug!("failed to persist bash hook attempt end: {}", e);
+                let strict_history = agent_id.tool == "zcode";
+                let persisted = (|| -> Result<(), GitAiError> {
+                    let db = crate::daemon::bash_history_db::BashHistoryDatabase::global()?;
+                    let mut db_lock = db
+                        .lock()
+                        .map_err(|_| GitAiError::Generic("bash history lock poisoned".into()))?;
+                    db_lock.record_end(&crate::daemon::bash_history_db::BashCallEnd {
+                        original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
+                        repo_work_dir: discovered_repo_work_dir,
+                        repo_discovery_error,
+                        session_id,
+                        tool_use_id,
+                        agent_id,
+                        start_trace_id: None,
+                        end_trace_id: trace_id,
+                        started_at_ns: None,
+                        ended_at_ns,
+                        command,
+                        metadata,
+                    })
+                })();
+                if let Err(error) = persisted {
+                    if strict_history {
+                        return ControlResponse::err(error.to_string());
+                    }
+                    tracing::debug!("failed to persist bash hook attempt end: {}", error);
                 }
                 Ok(ControlResponse::ok(None, None))
             }
@@ -11001,6 +11229,141 @@ mod stream_worker_tests;
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn zcode_activity_respects_disabled_stream_worker() {
+        use crate::commands::checkpoint_agent::presets::{
+            PresetContext, SessionActivity, StreamFormat, StreamSource,
+        };
+        let coordinator = ActorDaemonCoordinator::new();
+        let response = coordinator
+            .handle_control_request(ControlRequest::AgentSessionActivity {
+                activity: SessionActivity {
+                    context: PresetContext {
+                        agent_id: crate::authorship::working_log::AgentId {
+                            tool: "zcode".into(),
+                            id: "session".into(),
+                            model: "unknown".into(),
+                        },
+                        external_session_id: "session".into(),
+                        trace_id: "trace".into(),
+                        cwd: std::env::temp_dir(),
+                        metadata: HashMap::new(),
+                    },
+                    stream_source: StreamSource {
+                        path: std::env::temp_dir().join("missing-zcode.db"),
+                        format: StreamFormat::ZCodeSqlite,
+                        session_id: "s_test".into(),
+                        external_session_id: "session".into(),
+                        external_parent_session_id: None,
+                    },
+                    observed_at_millis: 0,
+                },
+            })
+            .await;
+        assert!(response.ok);
+        assert_eq!(
+            response.data.unwrap()["skipped"],
+            "transcript_streaming_disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn zcode_no_changes_terminal_prevents_delayed_family_pre_registration() {
+        use crate::daemon::bash_history_db::{BashCallEnd, BashHistoryDatabase};
+        let directory = tempfile::tempdir().unwrap();
+        let mut history =
+            BashHistoryDatabase::open_at_path(&directory.path().join("bash.db")).unwrap();
+        let coordinator = ActorDaemonCoordinator::new();
+        let mut end = BashCallEnd {
+            original_cwd: "/repo".into(),
+            repo_work_dir: Some("/repo".into()),
+            repo_discovery_error: None,
+            session_id: "session".into(),
+            tool_use_id: "ended".into(),
+            agent_id: crate::authorship::working_log::AgentId {
+                tool: "zcode".into(),
+                id: "session".into(),
+                model: "model".into(),
+            },
+            start_trace_id: None,
+            end_trace_id: "post".into(),
+            started_at_ns: None,
+            ended_at_ns: 2_000,
+            command: None,
+            metadata: HashMap::from([
+                ("tool_outcome".into(), "succeeded".into()),
+                ("snapshot_without_checkpoint".into(), "true".into()),
+            ]),
+        };
+        // The asynchronous pre is still queued when NoChanges completes.
+        history.record_end(&end).unwrap();
+        coordinator
+            .register_pending_zcode_edit_if_open(
+                "family",
+                "session",
+                "ended",
+                &["/ended".into()],
+                || {
+                    assert!(
+                        coordinator.zcode_bash_lifecycle_lock.try_lock().is_err(),
+                        "terminal check and registration must share the end lock"
+                    );
+                    history.zcode_call_ended_without_checkpoint("session", "ended")
+                },
+            )
+            .unwrap();
+        assert!(!coordinator.file_has_pending_ai_edit("family", "/ended"));
+        // A changed post has a checkpoint still to apply, so its late pre must
+        // retain the ordinary pending guard until FIFO applies that checkpoint.
+        end.tool_use_id = "changed".into();
+        end.metadata.remove("snapshot_without_checkpoint");
+        history.record_end(&end).unwrap();
+        coordinator
+            .register_pending_zcode_edit_if_open(
+                "family",
+                "session",
+                "changed",
+                &["/changed".into()],
+                || history.zcode_call_ended_without_checkpoint("session", "changed"),
+            )
+            .unwrap();
+        assert!(coordinator.file_has_pending_ai_edit("family", "/changed"));
+        coordinator.clear_pending_zcode_edit("family", "session", "changed");
+        assert!(!coordinator.file_has_pending_ai_edit("family", "/changed"));
+    }
+
+    #[tokio::test]
+    async fn zcode_pending_cleanup_keeps_overlapping_calls_and_legacy_state() {
+        let coordinator = ActorDaemonCoordinator::new();
+        coordinator.register_pending_zcode_edit(
+            "family",
+            "session",
+            "first",
+            &["/shared".into(), "/first".into()],
+        );
+        coordinator.register_pending_zcode_edit("family", "session", "second", &["/shared".into()]);
+        coordinator.register_pending_ai_edits("family", &["/legacy".into()]);
+        coordinator.clear_pending_zcode_edit("family", "session", "first");
+        assert!(!coordinator.file_has_pending_ai_edit("family", "/first"));
+        assert!(coordinator.file_has_pending_ai_edit("family", "/shared"));
+        assert!(coordinator.file_has_pending_ai_edit("family", "/legacy"));
+        coordinator.clear_pending_zcode_edit("family", "session", "second");
+        assert!(!coordinator.file_has_pending_ai_edit("family", "/shared"));
+        assert!(coordinator.file_has_pending_ai_edit("family", "/legacy"));
+    }
+
+    #[tokio::test]
+    async fn zcode_pending_cleanup_is_scoped_to_family_and_session() {
+        let coordinator = ActorDaemonCoordinator::new();
+        coordinator.register_pending_zcode_edit("family", "session-a", "call", &["/one".into()]);
+        coordinator.register_pending_zcode_edit("family", "session-b", "call", &["/two".into()]);
+        coordinator.register_pending_zcode_edit("other", "session-a", "call", &["/three".into()]);
+        coordinator.clear_pending_zcode_edit("family", "session-a", "call");
+        assert!(!coordinator.file_has_pending_ai_edit("family", "/one"));
+        assert!(coordinator.file_has_pending_ai_edit("family", "/two"));
+        assert!(coordinator.file_has_pending_ai_edit("other", "/three"));
+    }
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;

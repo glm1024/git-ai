@@ -40,6 +40,7 @@ pub enum StreamFormat {
     CodexJsonl,
     AmpThreadJson,
     OpenCodeSqlite,
+    ZCodeSqlite,
     PiJsonl,
     CopilotOtelSqlite,
 }
@@ -58,6 +59,7 @@ impl std::fmt::Display for StreamFormat {
             Self::CodexJsonl => write!(f, "CodexJsonl"),
             Self::AmpThreadJson => write!(f, "AmpThreadJson"),
             Self::OpenCodeSqlite => write!(f, "OpenCodeSqlite"),
+            Self::ZCodeSqlite => write!(f, "ZCodeSqlite"),
             Self::PiJsonl => write!(f, "PiJsonl"),
             Self::CopilotOtelSqlite => write!(f, "CopilotOtelSqlite"),
         }
@@ -78,6 +80,7 @@ impl StreamFormat {
             "CodexJsonl" => Self::CodexJsonl,
             "AmpThreadJson" => Self::AmpThreadJson,
             "OpenCodeSqlite" => Self::OpenCodeSqlite,
+            "ZCodeSqlite" => Self::ZCodeSqlite,
             "PiJsonl" => Self::PiJsonl,
             "CopilotOtelSqlite" => Self::CopilotOtelSqlite,
             _ => return None,
@@ -99,6 +102,7 @@ impl StreamFormat {
                 WatermarkType::RecordIndex
             }
             Self::OpenCodeSqlite => WatermarkType::Timestamp,
+            Self::ZCodeSqlite => WatermarkType::ZCodeUsage,
             Self::CopilotOtelSqlite => WatermarkType::TimestampCursor,
         }
     }

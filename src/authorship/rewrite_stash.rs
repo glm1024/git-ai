@@ -595,7 +595,13 @@ fn merge_initial_replacing_paths(
     target.file_blobs.extend(source.file_blobs.drain());
     target.prompts.extend(source.prompts.drain());
     target.humans.extend(source.humans);
-    target.sessions.extend(source.sessions);
+    for (id, record) in source.sessions {
+        target
+            .sessions
+            .entry(id)
+            .and_modify(|existing| existing.merge_from(&record))
+            .or_insert(record);
+    }
     working_log.write_initial(target)?;
     Ok(())
 }

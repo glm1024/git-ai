@@ -570,10 +570,8 @@ pub fn accepted_lines_from_attestations(
             if entry.hash.starts_with("s_") {
                 let session_key = entry.hash.split("::").next().unwrap_or(&entry.hash);
                 if let Some(session_record) = log.metadata.sessions.get(session_key) {
-                    let tool_model = format!(
-                        "{}::{}",
-                        session_record.agent_id.tool, session_record.agent_id.model
-                    );
+                    let agent_id = session_record.agent_id_for_author(&entry.hash);
+                    let tool_model = format!("{}::{}", agent_id.tool, agent_id.model);
                     *per_tool_model.entry(tool_model).or_insert(0) += accepted;
                 }
             } else if let Some(prompt_record) = log.metadata.prompts.get(&entry.hash) {

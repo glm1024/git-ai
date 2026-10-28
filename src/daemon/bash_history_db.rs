@@ -332,9 +332,58 @@ impl BashHistoryDatabase {
         Ok(())
     }
 
+    fn has_non_success_zcode_terminal(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+    ) -> Result<bool, GitAiError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM bash_checkpoint_calls
+             WHERE agent_tool = 'zcode' AND session_id = ?1 AND tool_use_id = ?2
+               AND end_time_ns IS NOT NULL
+               AND json_extract(metadata_json, '$.tool_outcome') IN ('failed', 'backgrounded'))",
+                params![session_id, tool_use_id],
+                |row| row.get(0),
+            )
+            .map_err(GitAiError::from)
+    }
+
+    pub(crate) fn zcode_call_ended_without_checkpoint(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+    ) -> Result<bool, GitAiError> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM bash_checkpoint_calls
+             WHERE agent_tool = 'zcode' AND session_id = ?1 AND tool_use_id = ?2
+               AND end_time_ns IS NOT NULL
+               AND json_extract(metadata_json, '$.snapshot_without_checkpoint') = 'true')",
+                params![session_id, tool_use_id],
+                |row| row.get(0),
+            )
+            .map_err(GitAiError::from)
+    }
+
     pub fn record_start(&mut self, call: &BashCallStart) -> Result<(), GitAiError> {
         if !self.enabled {
             return Ok(());
+        }
+
+        // A tool call ID identifies one invocation. Replayed pre/success events
+        // must not resurrect a recorded failed, detached, or completed no-change invocation.
+        if call.agent_id.tool == "zcode"
+            && (self.has_non_success_zcode_terminal(&call.session_id, &call.tool_use_id)?
+                || self.zcode_call_ended_without_checkpoint(&call.session_id, &call.tool_use_id)?)
+        {
+            return Err(GitAiError::Generic(
+                "ZCode Bash invocation already has a terminal outcome that forbids restarting"
+                    .into(),
+            ));
         }
 
         self.prune_old_calls_if_due()?;
@@ -390,11 +439,31 @@ impl BashHistoryDatabase {
             return Ok(());
         }
 
+        // A tool call ID identifies one invocation. Replayed pre/success events
+        // must not resurrect a recorded failed, detached, or completed no-change invocation.
+        if call.agent_id.tool == "zcode"
+            && self.has_non_success_zcode_terminal(&call.session_id, &call.tool_use_id)?
+        {
+            return Ok(());
+        }
+
         self.prune_old_calls_if_due()?;
 
         let now = unix_now_secs();
         let metadata_json =
             serde_json::to_string(&call.metadata).unwrap_or_else(|_| "{}".to_string());
+        if call.agent_id.tool == "zcode"
+            && matches!(
+                call.metadata.get("tool_outcome").map(String::as_str),
+                Some("failed" | "backgrounded")
+            )
+        {
+            self.conn.execute(
+                "UPDATE bash_checkpoint_calls SET metadata_json = ?1, updated_at = ?2
+                 WHERE agent_tool = 'zcode' AND session_id = ?3 AND tool_use_id = ?4",
+                params![metadata_json, now as i64, call.session_id, call.tool_use_id],
+            )?;
+        }
         let end_time_ns = ns_to_i64(call.ended_at_ns)?;
 
         let updated = if let Some(start_trace_id) = call.start_trace_id.as_ref() {
@@ -463,6 +532,18 @@ impl BashHistoryDatabase {
         };
 
         if updated > 0 {
+            // ZCode's generating message may only be available on its post
+            // hook. Preserve legacy tools' pre-hook identity semantics.
+            if call.agent_id.tool == "zcode"
+                && call.agent_id.model != "unknown"
+                && !call.agent_id.model.trim().is_empty()
+            {
+                self.conn.execute(
+                    "UPDATE bash_checkpoint_calls SET agent_model = ?1
+                     WHERE agent_tool = 'zcode' AND session_id = ?2 AND tool_use_id = ?3",
+                    params![call.agent_id.model, call.session_id, call.tool_use_id],
+                )?;
+            }
             return Ok(());
         }
 
@@ -712,6 +793,214 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = BashHistoryDatabase::open_at_path(&dir.path().join("bash.db")).unwrap();
         (db, dir)
+    }
+
+    #[test]
+    fn zcode_no_changes_terminal_query_respects_disabled_test_history() {
+        let db = BashHistoryDatabase {
+            conn: rusqlite::Connection::open_in_memory().unwrap(),
+            enabled: false,
+        };
+        assert!(
+            !db.zcode_call_ended_without_checkpoint("session", "call")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn zcode_no_changes_terminal_survives_late_start_replay() {
+        let (mut db, _directory) = test_db();
+        let agent = AgentId {
+            tool: "zcode".into(),
+            id: "session".into(),
+            model: "unknown".into(),
+        };
+        db.record_end(&BashCallEnd {
+            original_cwd: "/repo".into(),
+            repo_work_dir: Some("/repo".into()),
+            repo_discovery_error: None,
+            session_id: "session".into(),
+            tool_use_id: "call".into(),
+            agent_id: agent.clone(),
+            start_trace_id: Some("pre".into()),
+            end_trace_id: "post".into(),
+            started_at_ns: Some(1_000),
+            ended_at_ns: 2_000,
+            command: None,
+            metadata: HashMap::from([
+                ("tool_outcome".into(), "succeeded".into()),
+                ("snapshot_without_checkpoint".into(), "true".into()),
+            ]),
+        })
+        .unwrap();
+        assert!(
+            db.zcode_call_ended_without_checkpoint("session", "call")
+                .unwrap()
+        );
+        assert!(
+            !db.zcode_call_ended_without_checkpoint("other", "call")
+                .unwrap()
+        );
+        assert!(
+            db.record_start(&BashCallStart {
+                original_cwd: "/repo".into(),
+                repo_work_dir: Some("/repo".into()),
+                repo_discovery_error: None,
+                session_id: "session".into(),
+                tool_use_id: "call".into(),
+                agent_id: agent,
+                start_trace_id: "pre".into(),
+                started_at_ns: 1_000,
+                command: None,
+                metadata: HashMap::from([("tool_outcome".into(), "pending".into())]),
+            })
+            .is_err()
+        );
+        assert!(
+            db.zcode_call_ended_without_checkpoint("session", "call")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn zcode_post_model_replaces_unknown_pre_model_without_changing_legacy_calls() {
+        for tool in ["zcode", "codex"] {
+            let (mut db, _dir) = test_db();
+            let mut agent = AgentId {
+                tool: tool.into(),
+                id: "session".into(),
+                model: "unknown".into(),
+            };
+            db.record_start(&BashCallStart {
+                original_cwd: "/repo".into(),
+                repo_work_dir: Some("/repo".into()),
+                repo_discovery_error: None,
+                session_id: "session".into(),
+                tool_use_id: "call".into(),
+                agent_id: agent.clone(),
+                start_trace_id: "pre".into(),
+                started_at_ns: 1_000,
+                command: None,
+                metadata: HashMap::from([("tool_outcome".into(), "pending".into())]),
+            })
+            .unwrap();
+            agent.model = "exact-post-model".into();
+            db.record_end(&BashCallEnd {
+                original_cwd: "/repo".into(),
+                repo_work_dir: Some("/repo".into()),
+                repo_discovery_error: None,
+                session_id: "session".into(),
+                tool_use_id: "call".into(),
+                agent_id: agent,
+                start_trace_id: Some("pre".into()),
+                end_trace_id: "post".into(),
+                started_at_ns: Some(1_000),
+                ended_at_ns: 2_000,
+                command: None,
+                metadata: HashMap::from([("tool_outcome".into(), "succeeded".into())]),
+            })
+            .unwrap();
+            let calls = db.all_calls_for_test().unwrap();
+            assert_eq!(
+                calls[0].agent_id.model,
+                if tool == "zcode" {
+                    "exact-post-model"
+                } else {
+                    "unknown"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn zcode_non_success_terminal_survives_late_pre_and_conflicting_post() {
+        for outcome in ["failed", "backgrounded"] {
+            let (mut db, _dir) = test_db();
+            let agent = AgentId {
+                tool: "zcode".into(),
+                id: "session-1".into(),
+                model: "unknown".into(),
+            };
+            let mut start = BashCallStart {
+                original_cwd: "/repo".into(),
+                repo_work_dir: Some("/repo".into()),
+                repo_discovery_error: None,
+                session_id: "session-1".into(),
+                tool_use_id: "call".into(),
+                agent_id: agent.clone(),
+                start_trace_id: "pre".into(),
+                started_at_ns: 1_000,
+                command: None,
+                metadata: HashMap::from([("tool_outcome".into(), "pending".into())]),
+            };
+            db.record_start(&start).unwrap();
+            let mut end = BashCallEnd {
+                original_cwd: "/repo".into(),
+                repo_work_dir: Some("/repo".into()),
+                repo_discovery_error: None,
+                session_id: "session-1".into(),
+                tool_use_id: "call".into(),
+                agent_id: agent,
+                start_trace_id: Some("pre".into()),
+                end_trace_id: "end".into(),
+                started_at_ns: Some(1_000),
+                ended_at_ns: 2_000,
+                command: None,
+                metadata: HashMap::from([("tool_outcome".into(), outcome.into())]),
+            };
+            db.record_end(&end).unwrap();
+            assert!(db.record_start(&start).is_err());
+            start.start_trace_id = "pre-retry".into();
+            assert!(db.record_start(&start).is_err());
+            end.metadata
+                .insert("tool_outcome".into(), "succeeded".into());
+            db.record_end(&end).unwrap();
+            let calls = db.all_calls_for_test().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].metadata["tool_outcome"], outcome);
+            assert_eq!(calls[0].end_time_ns, Some(2_000));
+        }
+    }
+
+    #[test]
+    fn zcode_terminal_without_pre_prevents_late_pre_recovery_candidate() {
+        let (mut db, _dir) = test_db();
+        let agent = AgentId {
+            tool: "zcode".into(),
+            id: "session-1".into(),
+            model: "unknown".into(),
+        };
+        db.record_end(&BashCallEnd {
+            original_cwd: "/repo".into(),
+            repo_work_dir: Some("/repo".into()),
+            repo_discovery_error: None,
+            session_id: "session-1".into(),
+            tool_use_id: "call".into(),
+            agent_id: agent.clone(),
+            start_trace_id: None,
+            end_trace_id: "end".into(),
+            started_at_ns: None,
+            ended_at_ns: 2_000,
+            command: None,
+            metadata: HashMap::from([("tool_outcome".into(), "failed".into())]),
+        })
+        .unwrap();
+        let rejected = db.record_start(&BashCallStart {
+            original_cwd: "/repo".into(),
+            repo_work_dir: Some("/repo".into()),
+            repo_discovery_error: None,
+            session_id: "session-1".into(),
+            tool_use_id: "call".into(),
+            agent_id: agent,
+            start_trace_id: "late-pre".into(),
+            started_at_ns: 1_000,
+            command: None,
+            metadata: HashMap::from([("tool_outcome".into(), "pending".into())]),
+        });
+        assert!(rejected.is_err());
+        let calls = db.all_calls_for_test().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].metadata["tool_outcome"], "failed");
     }
 
     #[test]

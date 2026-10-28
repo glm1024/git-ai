@@ -1,3 +1,4 @@
+use crate::authorship::attribution_recovery::RecoveryProtection;
 use crate::authorship::attribution_tracker::{
     Attribution, LineAttribution, attributions_to_line_attributions,
     line_attributions_to_attributions,
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 
+#[derive(Clone)]
 pub struct VirtualAttributions {
     repo: Repository,
     base_commit: String,
@@ -35,12 +37,24 @@ pub struct VirtualAttributions {
     // authorship note if they have committed lines in the current commit.
     initial_only_prompt_ids: HashSet<String>,
     pub sessions: BTreeMap<String, SessionRecord>,
+    // Failed tool observations stay Unknown even when another nearby session
+    // or Bash call would otherwise supply broad recovery evidence.
+    failed_tool_snapshots: HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct AuthorshipLogDiffContext<'a> {
     pub precomputed_parent_diff: Option<&'a crate::authorship::rewrite::DiffTreeResult>,
     pub fallback_committed_diff_base: Option<&'a str>,
+    // Only actual checkpoint observations establish preexisting provenance;
+    // a final commit-tree fallback is not a before-edit observation.
+    pub recovery_observed_snapshot: Option<&'a HashMap<String, String>>,
+    // Amend's merged VA also carries commit-tree fallback content. Only real
+    // checkpoint paths may establish additional preexisting protection here;
+    // original blame-source protection is already computed before that merge.
+    pub preexisting_only_from_observed: bool,
+    // Immutable attribution sources are independent from the VA used for INITIAL.
+    pub committed_sources: Option<(&'a VirtualAttributions, &'a VirtualAttributions)>,
 }
 
 impl VirtualAttributions {
@@ -67,6 +81,7 @@ impl VirtualAttributions {
             humans: BTreeMap::new(),
             initial_only_prompt_ids: HashSet::new(),
             sessions: BTreeMap::new(),
+            failed_tool_snapshots: HashMap::new(),
         };
 
         // Process all pathspecs concurrently
@@ -124,7 +139,10 @@ impl VirtualAttributions {
                 .load_sessions_concurrent(&missing_session_ids.into_iter().collect::<Vec<_>>())
                 .await?;
             for (session_id, session_record) in sessions {
-                self.sessions.entry(session_id).or_insert(session_record);
+                self.sessions
+                    .entry(session_id)
+                    .and_modify(|existing| existing.merge_from(&session_record))
+                    .or_insert(session_record);
             }
         }
 
@@ -307,7 +325,13 @@ impl VirtualAttributions {
         // Process results and store in HashMap
         for result in results {
             match result {
-                Ok(Some((file_path, content, char_attrs, line_attrs))) => {
+                Ok(Some((file_path, content, char_attrs, line_attrs, sessions))) => {
+                    for (id, session) in sessions {
+                        self.sessions
+                            .entry(id)
+                            .and_modify(|existing| existing.merge_from(&session))
+                            .or_insert(session);
+                    }
                     self.attributions
                         .insert(file_path.clone(), (char_attrs, line_attrs));
                     self.file_contents.insert(file_path, content);
@@ -392,6 +416,7 @@ impl VirtualAttributions {
         let working_log = repo.storage.working_log_for_base_commit(&base_commit)?;
         let initial_attributions = working_log.read_initial_attributions()?;
         let checkpoints = working_log.read_all_checkpoints()?;
+        let failed_tool_snapshots = collect_failed_tool_snapshots(&checkpoints, &working_log)?;
 
         let mut attributions: HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)> =
             HashMap::new();
@@ -464,13 +489,22 @@ impl VirtualAttributions {
                             &agent_id.tool,
                         );
 
-                    let session_record = SessionRecord {
-                        agent_id: agent_id.clone(),
-                        human_author: human_author.clone(),
-                        custom_attributes: None,
-                    };
-
-                    sessions.insert(session_id.clone(), session_record);
+                    let session_record =
+                        sessions
+                            .entry(session_id.clone())
+                            .or_insert_with(|| SessionRecord {
+                                trace_models: Default::default(),
+                                agent_id: agent_id.clone(),
+                                human_author: human_author.clone(),
+                                custom_attributes: None,
+                            });
+                    session_record.record_trace_model(
+                        checkpoint
+                            .trace_id
+                            .as_deref()
+                            .expect("session checkpoint trace"),
+                        &agent_id.model,
+                    );
 
                     // Track additions/deletions keyed by session_id
                     *session_additions.entry(session_id.clone()).or_insert(0) +=
@@ -588,6 +622,7 @@ impl VirtualAttributions {
             humans,
             initial_only_prompt_ids,
             sessions,
+            failed_tool_snapshots,
         })
     }
 
@@ -602,6 +637,7 @@ impl VirtualAttributions {
         let working_log = repo.storage.working_log_for_base_commit(&base_commit)?;
         let initial_attributions = working_log.read_initial_attributions()?;
         let checkpoints = working_log.read_all_checkpoints()?;
+        let failed_tool_snapshots = collect_failed_tool_snapshots(&checkpoints, &working_log)?;
 
         let mut attributions: HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)> =
             HashMap::new();
@@ -661,13 +697,22 @@ impl VirtualAttributions {
                             &agent_id.tool,
                         );
 
-                    let session_record = SessionRecord {
-                        agent_id: agent_id.clone(),
-                        human_author: human_author.clone(),
-                        custom_attributes: None,
-                    };
-
-                    sessions.insert(session_id.clone(), session_record);
+                    let session_record =
+                        sessions
+                            .entry(session_id.clone())
+                            .or_insert_with(|| SessionRecord {
+                                trace_models: Default::default(),
+                                agent_id: agent_id.clone(),
+                                human_author: human_author.clone(),
+                                custom_attributes: None,
+                            });
+                    session_record.record_trace_model(
+                        checkpoint
+                            .trace_id
+                            .as_deref()
+                            .expect("session checkpoint trace"),
+                        &agent_id.model,
+                    );
 
                     // Track additions/deletions keyed by session_id
                     *session_additions.entry(session_id.clone()).or_insert(0) +=
@@ -772,6 +817,7 @@ impl VirtualAttributions {
             humans,
             initial_only_prompt_ids,
             sessions,
+            failed_tool_snapshots,
         })
     }
 
@@ -787,6 +833,7 @@ impl VirtualAttributions {
         let working_log = repo.storage.working_log_for_base_commit(&base_commit)?;
         let initial_attributions = working_log.read_initial_attributions()?;
         let checkpoints = working_log.read_all_checkpoints()?;
+        let failed_tool_snapshots = collect_failed_tool_snapshots(&checkpoints, &working_log)?;
 
         let mut attributions: HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)> =
             HashMap::new();
@@ -847,13 +894,22 @@ impl VirtualAttributions {
                             &agent_id.tool,
                         );
 
-                    let session_record = SessionRecord {
-                        agent_id: agent_id.clone(),
-                        human_author: human_author.clone(),
-                        custom_attributes: None,
-                    };
-
-                    sessions.insert(session_id.clone(), session_record);
+                    let session_record =
+                        sessions
+                            .entry(session_id.clone())
+                            .or_insert_with(|| SessionRecord {
+                                trace_models: Default::default(),
+                                agent_id: agent_id.clone(),
+                                human_author: human_author.clone(),
+                                custom_attributes: None,
+                            });
+                    session_record.record_trace_model(
+                        checkpoint
+                            .trace_id
+                            .as_deref()
+                            .expect("session checkpoint trace"),
+                        &agent_id.model,
+                    );
 
                     // Track additions/deletions keyed by session_id
                     *session_additions.entry(session_id.clone()).or_insert(0) +=
@@ -947,6 +1003,7 @@ impl VirtualAttributions {
             humans,
             initial_only_prompt_ids,
             sessions,
+            failed_tool_snapshots,
         })
     }
 
@@ -960,7 +1017,29 @@ impl VirtualAttributions {
         blame_start_commit: Option<String>,
         final_state_snapshot: &HashMap<String, String>,
     ) -> Result<Self, GitAiError> {
-        let blame_va = Self::new_for_base_commit(
+        Self::from_working_log_for_commit_snapshot_with_protection(
+            repo,
+            base_commit,
+            pathspecs,
+            human_author,
+            blame_start_commit,
+            final_state_snapshot,
+            final_state_snapshot,
+        )
+        .await
+        .map(|(attributions, _, _, _)| attributions)
+    }
+
+    pub(crate) async fn from_working_log_for_commit_snapshot_with_protection(
+        repo: Repository,
+        base_commit: String,
+        pathspecs: &[String],
+        human_author: Option<String>,
+        blame_start_commit: Option<String>,
+        final_state_snapshot: &HashMap<String, String>,
+        committed_snapshot: &HashMap<String, String>,
+    ) -> Result<(Self, RecoveryProtection, Self, Self), GitAiError> {
+        let mut blame_va = Self::new_for_base_commit(
             repo.clone(),
             base_commit.clone(),
             pathspecs,
@@ -968,8 +1047,102 @@ impl VirtualAttributions {
         )
         .await?;
 
-        let checkpoint_va =
+        let mut checkpoint_va =
             Self::from_persisted_working_log(repo.clone(), base_commit.clone(), human_author)?;
+
+        // Preserve the original sources before reconciling the observed worktree.
+        // Staged code may still match base blame after a later unstaged edit.
+        let committed_checkpoint_source = checkpoint_va.clone();
+        let committed_blame_source = blame_va.clone();
+
+        // Amend is a commit projection, not a live character attribution pass.
+        // Common keywords/punctuation in a manual replacement do not prove that
+        // the replacement line was generated by the old AI checkpoint.
+        let mut protected = RecoveryProtection::default();
+        for source in [&mut checkpoint_va, &mut blame_va] {
+            for (path, failed) in &source.failed_tool_snapshots {
+                let normalized: String = path.nfc().collect();
+                if let Some(committed) = committed_snapshot
+                    .get(path)
+                    .or_else(|| committed_snapshot.get(&normalized))
+                {
+                    protected
+                        .overwritten
+                        .entry(normalized)
+                        .or_default()
+                        .extend(project_failed_tool_lines(failed, committed));
+                }
+            }
+
+            for (path, (char_attrs, line_attrs)) in &mut source.attributions {
+                let normalized: String = path.nfc().collect();
+                let (Some(old), Some(final_content)) = (
+                    source.file_contents.get(path),
+                    final_state_snapshot
+                        .get(path)
+                        .or_else(|| final_state_snapshot.get(&normalized)),
+                ) else {
+                    continue;
+                };
+                let projected = project_committed_lines(old, final_content, line_attrs)?;
+                // Carryover follows the observed worktree, but recovery filters
+                // operate on immutable commit line numbers. An unstaged insert
+                // or replacement must not protect a different committed line.
+                if let Some(committed) = committed_snapshot
+                    .get(path)
+                    .or_else(|| committed_snapshot.get(&normalized))
+                {
+                    let immutable_projection = if committed == final_content {
+                        None
+                    } else {
+                        Some(project_committed_lines(old, committed, line_attrs)?)
+                    };
+                    let protection = immutable_projection.as_ref().unwrap_or(&projected);
+                    protected
+                        .overwritten
+                        .entry(normalized.clone())
+                        .or_default()
+                        .extend(protection.overwritten.iter().copied());
+                    protected
+                        .preexisting
+                        .entry(normalized)
+                        .or_default()
+                        .extend(protection.preexisting.iter().copied());
+                }
+                *line_attrs = projected
+                    .authors
+                    .into_iter()
+                    .flat_map(|(author_id, lines)| {
+                        LineRange::compress_lines(&lines)
+                            .into_iter()
+                            .map(move |range| {
+                                let (start_line, end_line) = match range {
+                                    LineRange::Single(line) => (line, line),
+                                    LineRange::Range(start, end) => (start, end),
+                                };
+                                LineAttribution {
+                                    start_line,
+                                    end_line,
+                                    author_id: author_id.clone(),
+                                    overrode: None,
+                                }
+                            })
+                    })
+                    .collect();
+                *char_attrs =
+                    line_attributions_to_attributions(line_attrs, final_content, source.ts);
+                source
+                    .file_contents
+                    .insert(path.clone(), final_content.clone());
+            }
+        }
+        for map in [&mut protected.overwritten, &mut protected.preexisting] {
+            for lines in map.values_mut() {
+                lines.sort_unstable();
+                lines.dedup();
+            }
+            map.retain(|_, lines| !lines.is_empty());
+        }
 
         // Save session prompt IDs before the merge consumes checkpoint_va.
         // Exclude INITIAL-only prompts from prior commits.
@@ -1015,7 +1188,12 @@ impl VirtualAttributions {
             .sessions
             .retain(|id, _| referenced_session_ids.contains(id));
 
-        Ok(merged_va)
+        Ok((
+            merged_va,
+            protected,
+            committed_checkpoint_source,
+            committed_blame_source,
+        ))
     }
 
     /// Create VirtualAttributions from raw components (used for transformations)
@@ -1037,6 +1215,7 @@ impl VirtualAttributions {
             humans: BTreeMap::new(),
             initial_only_prompt_ids: HashSet::new(),
             sessions: BTreeMap::new(),
+            failed_tool_snapshots: HashMap::new(),
         }
     }
 
@@ -1059,6 +1238,7 @@ impl VirtualAttributions {
             humans: BTreeMap::new(), // TODO(known-human): propagate humans from caller when rebase path is wired (Task 12)
             initial_only_prompt_ids: HashSet::new(),
             sessions: BTreeMap::new(),
+            failed_tool_snapshots: HashMap::new(),
         }
     }
 
@@ -1092,6 +1272,7 @@ impl VirtualAttributions {
 
         authorship_log.attestations = build_attestations_from_attributions(&self.attributions);
 
+        authorship_log.retain_referenced_trace_models();
         Ok(authorship_log)
     }
 }
@@ -2074,6 +2255,246 @@ fn build_carryover_snapshot(
     Ok(carryover_snapshot)
 }
 
+fn collect_failed_tool_snapshots(
+    checkpoints: &[crate::authorship::working_log::Checkpoint],
+    working_log: &crate::git::repo_storage::PersistedWorkingLog,
+) -> Result<HashMap<String, String>, GitAiError> {
+    let mut snapshots = HashMap::new();
+    for checkpoint in checkpoints {
+        if checkpoint.kind != CheckpointKind::Human
+            || checkpoint
+                .agent_id
+                .as_ref()
+                .is_none_or(|agent| agent.tool != "zcode")
+            || !matches!(
+                checkpoint
+                    .agent_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("tool_outcome"))
+                    .map(String::as_str),
+                Some("failed" | "backgrounded")
+            )
+        {
+            continue;
+        }
+        for entry in &checkpoint.entries {
+            snapshots.insert(
+                entry.file.clone(),
+                working_log.get_file_version(&entry.blob_sha)?,
+            );
+        }
+    }
+    Ok(snapshots)
+}
+
+fn project_failed_tool_lines(failed: &str, committed: &str) -> Vec<u32> {
+    use crate::authorship::imara_diff_utils::{DiffOp, capture_diff_slices};
+    let failed = normalize_line_endings(failed);
+    let committed = normalize_line_endings(committed);
+    let old_lines: Vec<_> = failed.lines().collect();
+    let new_lines: Vec<_> = committed.lines().collect();
+    capture_diff_slices(&old_lines, &new_lines)
+        .into_iter()
+        .flat_map(|op| match op {
+            DiffOp::Equal { new_index, len, .. } => (new_index..new_index + len)
+                .map(|index| index as u32 + 1)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// Project checkpoint evidence onto immutable committed content. Carryover is
+/// deliberately biased toward uncommitted edits and cannot prove which text
+/// actually landed in a commit. New content participates as unknown provenance
+/// until line attribution is resolved, rather than dropping it and allowing
+/// surviving AI punctuation/tokens to claim a manually replaced line.
+struct CommittedLineProjection {
+    authors: HashMap<String, Vec<u32>>,
+    overwritten: Vec<u32>,
+    preexisting: Vec<u32>,
+}
+
+fn project_committed_lines(
+    observed: &str,
+    committed: &str,
+    attrs: &[LineAttribution],
+) -> Result<CommittedLineProjection, GitAiError> {
+    use crate::authorship::imara_diff_utils::{DiffOp, capture_diff_slices};
+
+    let original = line_attributions_to_attributions(attrs, observed, 0);
+    let updated = crate::authorship::attribution_tracker::AttributionTracker::new()
+        .update_attributions(
+            observed,
+            committed,
+            &original,
+            &CheckpointKind::Human.to_str(),
+            1,
+        )?;
+    let mut projected: HashMap<String, Vec<u32>> = HashMap::new();
+    for attr in attributions_to_line_attributions(&updated, committed) {
+        projected
+            .entry(attr.author_id)
+            .or_default()
+            .extend(attr.start_line..=attr.end_line);
+    }
+    let observed = normalize_line_endings(observed);
+    let committed = normalize_line_endings(committed);
+    let old_lines: Vec<_> = observed.lines().collect();
+    let new_lines: Vec<_> = committed.lines().collect();
+    let mut authors = HashMap::new();
+    for attr in attrs {
+        for line in attr.start_line..=attr.end_line {
+            authors.insert(line, attr.author_id.as_str());
+        }
+    }
+    let mut overwritten = Vec::new();
+    let mut preexisting = Vec::new();
+    for op in capture_diff_slices(&old_lines, &new_lines) {
+        match op {
+            DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => {
+                for offset in 0..len {
+                    if authors
+                        .get(&((old_index + offset + 1) as u32))
+                        .is_none_or(|author| *author == CheckpointKind::Human.to_str())
+                    {
+                        preexisting.push((new_index + offset + 1) as u32);
+                    }
+                }
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                // A timestamp or session marker must not resurrect provenance
+                // whose observed text was replaced after the checkpoint.
+                if (old_index..old_index + old_len).any(|index| {
+                    authors
+                        .get(&((index + 1) as u32))
+                        .is_some_and(|author| *author != CheckpointKind::Human.to_str())
+                }) {
+                    overwritten
+                        .extend((new_index..new_index + new_len).map(|index| index as u32 + 1));
+                }
+            }
+            DiffOp::Insert { .. } | DiffOp::Delete { .. } => {}
+        }
+    }
+    Ok(CommittedLineProjection {
+        authors: projected,
+        overwritten,
+        preexisting,
+    })
+}
+
+/// Project independent amend sources directly onto commit content. Explicit
+/// checkpoint evidence wins, while untracked gaps may retain exact base-blame
+/// provenance. A pre-edit snapshot alone does not erase existing AI history.
+fn project_committed_sources(
+    sources: [&VirtualAttributions; 2],
+    contents: &HashMap<String, String>,
+    renames: &HashMap<String, String>,
+) -> Result<HashMap<String, HashMap<String, Vec<u32>>>, GitAiError> {
+    let mut owners: BTreeMap<String, BTreeMap<u32, String>> = BTreeMap::new();
+    for source in sources {
+        let mut paths: BTreeMap<String, (&String, &String)> = BTreeMap::new();
+        let has_evidence = |path: &String| {
+            source
+                .attributions
+                .get(path)
+                .is_some_and(|(_, lines)| !lines.is_empty())
+        };
+        for (path, content) in &source.file_contents {
+            let normalized: String = path.nfc().collect();
+            if paths.get(&normalized).is_none_or(|(existing, _)| {
+                let current_has_evidence = has_evidence(path);
+                let existing_has_evidence = has_evidence(existing);
+                (current_has_evidence && !existing_has_evidence)
+                    || (current_has_evidence == existing_has_evidence && path < *existing)
+            }) {
+                paths.insert(normalized, (path, content));
+            }
+        }
+        for (normalized, (path, observed)) in paths {
+            let committed_path = renames.get(&normalized).unwrap_or(&normalized);
+            let Some(committed) = contents.get(committed_path) else {
+                continue;
+            };
+            let attrs = source
+                .attributions
+                .get(path)
+                .or_else(|| source.attributions.get(&normalized))
+                .map(|(_, lines)| lines.as_slice())
+                .unwrap_or_default();
+            let projection = project_committed_lines(observed, committed, attrs)?;
+            let file_owners = owners.entry(committed_path.clone()).or_default();
+            for (author, lines) in projection.authors {
+                // Untracked characters are not evidence against exact base blame.
+                // Explicit KnownHuman (h_) evidence still overrides an older source.
+                if author == CheckpointKind::Human.to_str() {
+                    continue;
+                }
+                for line in lines {
+                    file_owners.entry(line).or_insert_with(|| author.clone());
+                }
+            }
+        }
+    }
+    Ok(owners
+        .into_iter()
+        .map(|(path, lines)| {
+            let mut authors: HashMap<String, Vec<u32>> = HashMap::new();
+            for (line, author) in lines {
+                authors.entry(author).or_default().push(line);
+            }
+            (path, authors)
+        })
+        .collect())
+}
+
+pub(crate) fn committed_projection_contents(
+    repo: &Repository,
+    commit_sha: &str,
+    paths: impl Iterator<Item = String>,
+    renames: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, GitAiError> {
+    let paths: Vec<_> = paths
+        .map(|path| {
+            let normalized: String = path.nfc().collect();
+            let raw = renames.get(&normalized).cloned().unwrap_or(path);
+            let normalized = renames.get(&normalized).cloned().unwrap_or(normalized);
+            (raw, normalized)
+        })
+        .collect();
+    // Git stores byte-exact paths. Try the observed spelling first, with NFC
+    // as a fallback for core.precomposeunicode, within the same batched read.
+    let requests: Vec<_> = paths
+        .iter()
+        .flat_map(|(raw, normalized)| {
+            [
+                (commit_sha.to_string(), raw.clone()),
+                (commit_sha.to_string(), normalized.clone()),
+            ]
+        })
+        .collect();
+    let contents = batch_read_paths_at_treeishes(repo, &requests)?;
+    Ok(paths
+        .into_iter()
+        .filter_map(|(raw, normalized)| {
+            contents
+                .get(&(commit_sha.to_string(), raw))
+                .or_else(|| contents.get(&(commit_sha.to_string(), normalized.clone())))
+                .map(|content| (normalized, content.clone()))
+        })
+        .collect())
+}
+
 impl VirtualAttributions {
     /// Split VirtualAttributions into committed and uncommitted buckets
     ///
@@ -2095,14 +2516,16 @@ impl VirtualAttributions {
         ),
         GitAiError,
     > {
-        self.to_authorship_log_and_initial_working_log_with_precomputed_diff(
-            repo,
-            parent_sha,
-            commit_sha,
-            pathspecs,
-            final_state_snapshot,
-            AuthorshipLogDiffContext::default(),
-        )
+        let (log, initial, contents, _) = self
+            .to_authorship_log_and_initial_working_log_with_precomputed_diff(
+                repo,
+                parent_sha,
+                commit_sha,
+                pathspecs,
+                final_state_snapshot,
+                AuthorshipLogDiffContext::default(),
+            )?;
+        Ok((log, initial, contents))
     }
 
     /// As [`Self::to_authorship_log_and_initial_working_log`], but accepts a
@@ -2127,6 +2550,7 @@ impl VirtualAttributions {
             crate::authorship::authorship_log_serialization::AuthorshipLog,
             crate::git::repo_storage::InitialAttributions,
             HashMap<String, String>,
+            RecoveryProtection,
         ),
         GitAiError,
     > {
@@ -2150,6 +2574,34 @@ impl VirtualAttributions {
             .collect();
         authorship_log.metadata.humans = self.humans.clone();
         authorship_log.metadata.sessions = self.sessions.clone();
+        if let Some((checkpoint, blame)) = diff_context.committed_sources {
+            for source in [checkpoint, blame] {
+                for (id, commits) in &source.prompts {
+                    if let Some(record) = commits.values().next() {
+                        authorship_log
+                            .metadata
+                            .prompts
+                            .entry(id.clone())
+                            .or_insert_with(|| record.clone());
+                    }
+                }
+                for (id, record) in &source.humans {
+                    authorship_log
+                        .metadata
+                        .humans
+                        .entry(id.clone())
+                        .or_insert_with(|| record.clone());
+                }
+                for (id, record) in &source.sessions {
+                    authorship_log
+                        .metadata
+                        .sessions
+                        .entry(id.clone())
+                        .and_modify(|existing| existing.merge_from(record))
+                        .or_insert_with(|| record.clone());
+                }
+            }
+        }
 
         let mut initial_files: StdHashMap<String, Vec<LineAttribution>> = StdHashMap::new();
         let mut referenced_prompts: HashSet<String> = HashSet::new();
@@ -2200,6 +2652,155 @@ impl VirtualAttributions {
         } else {
             collect_committed_hunks(repo, fallback_diff_base, commit_sha, effective_pathspecs)?
         };
+        // One batched object read, never one Git process per file. These are
+        // commit objects, so later worktree edits cannot alter the evidence.
+        // Include observed files with no AI attribution: broad session/commit
+        // markers must not turn an already present manual-only file into AI.
+        let mut observed_contents: BTreeMap<String, (&String, &String)> = BTreeMap::new();
+        let source_priority = |path: &String| {
+            (
+                diff_context
+                    .recovery_observed_snapshot
+                    .is_some_and(|snapshot| snapshot.contains_key(path)),
+                self.attributions
+                    .get(path)
+                    .is_some_and(|(_, lines)| !lines.is_empty()),
+            )
+        };
+        for (path, content) in &self.file_contents {
+            let normalized: String = path.nfc().collect();
+            // Pair content with its raw attribution key. Prefer a real observed
+            // path over a blame alias, then actual line evidence over empty
+            // attribution entries. Tie-break deterministically across aliases.
+            if observed_contents
+                .get(&normalized)
+                .is_none_or(|(existing, _)| {
+                    source_priority(path) > source_priority(existing)
+                        || (source_priority(path) == source_priority(existing) && path < *existing)
+                })
+            {
+                observed_contents.insert(normalized, (path, content));
+            }
+        }
+        if let Some(snapshot) = diff_context.recovery_observed_snapshot {
+            for (path, content) in snapshot {
+                observed_contents
+                    .entry(path.nfc().collect())
+                    .or_insert((path, content));
+            }
+        }
+        for (path, failed) in &self.failed_tool_snapshots {
+            observed_contents
+                .entry(path.nfc().collect())
+                .or_insert((path, failed));
+        }
+        if let Some((checkpoint, blame)) = diff_context.committed_sources {
+            for source in [checkpoint, blame] {
+                for (path, content) in &source.file_contents {
+                    observed_contents
+                        .entry(path.nfc().collect())
+                        .or_insert((path, content));
+                }
+            }
+        }
+        let committed_contents = committed_projection_contents(
+            repo,
+            commit_sha,
+            observed_contents.values().map(|(path, _)| (*path).clone()),
+            &rename_map,
+        )?;
+        let mut protected_lines = RecoveryProtection::default();
+        let preexisting_sources: Option<HashSet<String>> =
+            diff_context.preexisting_only_from_observed.then(|| {
+                diff_context
+                    .recovery_observed_snapshot
+                    .into_iter()
+                    .flat_map(|snapshot| snapshot.keys())
+                    .map(|path| path.nfc().collect())
+                    .collect()
+            });
+        let mut committed_projections = HashMap::new();
+        for (normalized, (path, observed)) in observed_contents {
+            let committed_path = rename_map.get(&normalized).unwrap_or(&normalized);
+            let Some(committed) = committed_contents.get(committed_path) else {
+                continue;
+            };
+            let attrs = self
+                .attributions
+                .get(path)
+                .or_else(|| self.attributions.get(&normalized))
+                .map(|(_, lines)| lines.as_slice())
+                .unwrap_or_default();
+            let projection = project_committed_lines(observed, committed, attrs)?;
+            if let Some(failed) = self
+                .failed_tool_snapshots
+                .get(path)
+                .or_else(|| self.failed_tool_snapshots.get(&normalized))
+            {
+                protected_lines
+                    .overwritten
+                    .entry(committed_path.clone())
+                    .or_default()
+                    .extend(project_failed_tool_lines(failed, committed));
+            }
+
+            protected_lines
+                .overwritten
+                .entry(committed_path.clone())
+                .or_default()
+                .extend(projection.overwritten);
+            if preexisting_sources
+                .as_ref()
+                .is_none_or(|paths| paths.contains(&normalized))
+            {
+                protected_lines
+                    .preexisting
+                    .entry(committed_path.clone())
+                    .or_default()
+                    .extend(projection.preexisting);
+            }
+            committed_projections.insert(normalized, projection.authors);
+        }
+        if let Some((checkpoint, blame)) = diff_context.committed_sources {
+            committed_projections =
+                project_committed_sources([checkpoint, blame], &committed_contents, &rename_map)?;
+        }
+        // Commit output uses only immutable coordinates; the loop below remains
+        // responsible solely for preserving uncommitted INITIAL attribution.
+        let renamed_paths: HashSet<&str> = rename_map.values().map(String::as_str).collect();
+        let mut committed_attributions: HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)> =
+            HashMap::new();
+        for (path, authors) in committed_projections {
+            let committed_path = if diff_context.committed_sources.is_some() {
+                &path // Independent amend sources already use committed paths.
+            } else {
+                rename_map.get(&path).unwrap_or(&path)
+            };
+            let hunks = committed_hunks.get(committed_path);
+            let keep_renamed =
+                rename_map.contains_key(&path) || renamed_paths.contains(committed_path.as_str());
+            let (_, line_attrs) = committed_attributions
+                .entry(committed_path.clone())
+                .or_default();
+            for (author, mut lines) in authors {
+                lines.retain(|line| {
+                    keep_renamed
+                        || hunks
+                            .is_some_and(|ranges| ranges.iter().any(|range| range.contains(*line)))
+                });
+                lines.sort_unstable();
+                lines.dedup();
+                for range in LineRange::compress_lines(&lines) {
+                    let (start, end) = match range {
+                        LineRange::Single(line) => (line, line),
+                        LineRange::Range(start, end) => (start, end),
+                    };
+                    line_attrs.push(LineAttribution::new(start, end, author.clone(), None));
+                }
+            }
+        }
+        authorship_log.attestations = build_attestations_from_attributions(&committed_attributions);
+
         let carryover_snapshot = if let Some(snapshot) = final_state_snapshot {
             Some(build_carryover_snapshot(
                 repo,
@@ -2320,19 +2921,8 @@ impl VirtualAttributions {
                 unstaged_lines.sort_unstable();
             }
 
-            // Split line attributions into committed and uncommitted
-            // VirtualAttributions has line numbers in working directory coordinates,
-            // so we need to convert to commit coordinates before comparing with committed hunks
-            let mut committed_lines_map: StdHashMap<String, Vec<u32>> = StdHashMap::new();
+            // Carryover coordinates are used only for the uncommitted bucket.
             let mut uncommitted_lines_map: StdHashMap<String, Vec<u32>> = StdHashMap::new();
-
-            // Get the committed hunks for this file (if any) - these are in commit coordinates.
-            // If the file was renamed, committed_hunks is keyed by the new path.
-            let file_committed_hunks = committed_hunks.get(&nfc_file_path).or_else(|| {
-                rename_map
-                    .get(&nfc_file_path)
-                    .and_then(|np| committed_hunks.get(np))
-            });
 
             for line_attr in line_attrs {
                 // Check each line individually
@@ -2347,114 +2937,7 @@ impl VirtualAttributions {
                             .or_default()
                             .push(workdir_line_num);
                         referenced_prompts.insert(line_attr.author_id.clone());
-                    } else {
-                        // Convert working directory line number to commit line number
-                        // by subtracting the count of unstaged lines before this line
-                        let adjustment = unstaged_lines
-                            .iter()
-                            .filter(|&&l| l < workdir_line_num)
-                            .count() as u32;
-                        let commit_line_num = workdir_line_num - adjustment;
-
-                        // Check if this commit line number is in any committed hunk
-                        let is_committed = if let Some(hunks) = file_committed_hunks {
-                            hunks.iter().any(|hunk| hunk.contains(commit_line_num))
-                        } else {
-                            false
-                        };
-
-                        let is_renamed_file = rename_map.contains_key(&nfc_file_path);
-
-                        if is_committed {
-                            // Line was committed in this commit (use commit coordinates)
-                            committed_lines_map
-                                .entry(line_attr.author_id.clone())
-                                .or_default()
-                                .push(commit_line_num);
-                        } else if is_renamed_file
-                            && line_attr.author_id != CheckpointKind::Human.to_str()
-                            && !line_attr.author_id.starts_with("h_")
-                        {
-                            // For renamed files, git blame attributes ALL lines to
-                            // this commit. Include AI lines in the note even if they're
-                            // not in committed_hunks — without this, they'd have no
-                            // attestation and blame would fall back to the git committer.
-                            committed_lines_map
-                                .entry(line_attr.author_id.clone())
-                                .or_default()
-                                .push(commit_line_num);
-                        }
                     }
-                }
-            }
-
-            // Do not infer provenance from neighboring authors or equal text.
-            // Such gaps may be AI-written, but attaching them to an existing
-            // trace invents checkpoint evidence and bypasses recovery metrics.
-            // Leave them for attribution_recovery, which records recovered lines
-            // under their own trace and matching checkpoint metric.
-
-            // Add committed attributions to authorship log
-            if !committed_lines_map.is_empty() {
-                // Create attestation entries from committed lines
-                for (author_id, mut lines) in committed_lines_map {
-                    // Skip the legacy "human" sentinel (CheckpointKind::Human checkpoints that were
-                    // never attested). KnownHuman lines use h_-prefixed author IDs and pass through.
-                    if author_id == CheckpointKind::Human.to_str() {
-                        continue;
-                    }
-
-                    lines.sort();
-                    lines.dedup();
-
-                    if lines.is_empty() {
-                        continue;
-                    }
-
-                    // Create line ranges
-                    let mut ranges = Vec::new();
-                    let mut range_start = lines[0];
-                    let mut range_end = lines[0];
-
-                    for &line in &lines[1..] {
-                        if line == range_end + 1 {
-                            range_end = line;
-                        } else {
-                            if range_start == range_end {
-                                ranges.push(crate::authorship::authorship_log::LineRange::Single(
-                                    range_start,
-                                ));
-                            } else {
-                                ranges.push(crate::authorship::authorship_log::LineRange::Range(
-                                    range_start,
-                                    range_end,
-                                ));
-                            }
-                            range_start = line;
-                            range_end = line;
-                        }
-                    }
-
-                    // Add the last range
-                    if range_start == range_end {
-                        ranges.push(crate::authorship::authorship_log::LineRange::Single(
-                            range_start,
-                        ));
-                    } else {
-                        ranges.push(crate::authorship::authorship_log::LineRange::Range(
-                            range_start,
-                            range_end,
-                        ));
-                    }
-
-                    let entry =
-                        crate::authorship::authorship_log_serialization::AttestationEntry::new(
-                            author_id, ranges,
-                        );
-
-                    let attestation_path = rename_map.get(&nfc_file_path).unwrap_or(&nfc_file_path);
-                    let file_attestation = authorship_log.get_or_create_file(attestation_path);
-                    file_attestation.add_entry(entry);
                 }
             }
 
@@ -2606,6 +3089,15 @@ impl VirtualAttributions {
             }
         }
 
+        authorship_log.retain_referenced_trace_models();
+        SessionRecord::retain_referenced_trace_models(
+            &mut initial_sessions,
+            initial_files
+                .values()
+                .flatten()
+                .map(|line| line.author_id.as_str()),
+        );
+
         let initial_attributions = InitialAttributions {
             files: initial_files,
             prompts: initial_prompts,
@@ -2614,7 +3106,12 @@ impl VirtualAttributions {
             sessions: initial_sessions,
         };
 
-        Ok((authorship_log, initial_attributions, initial_file_contents))
+        Ok((
+            authorship_log,
+            initial_attributions,
+            initial_file_contents,
+            protected_lines,
+        ))
     }
 
     /// Convert VirtualAttributions to AuthorshipLog only (index-only mode)
@@ -2636,7 +3133,6 @@ impl VirtualAttributions {
         pathspecs: Option<&HashSet<String>>,
     ) -> Result<crate::authorship::authorship_log_serialization::AuthorshipLog, GitAiError> {
         use crate::authorship::authorship_log_serialization::AuthorshipLog;
-        use std::collections::HashMap as StdHashMap;
 
         let mut authorship_log = AuthorshipLog::new();
         authorship_log.metadata.base_commit_sha = self.base_commit.clone();
@@ -2657,6 +3153,12 @@ impl VirtualAttributions {
 
         // Get committed hunks only (no need to check working copy)
         let committed_hunks = collect_committed_hunks(repo, parent_sha, commit_sha, pathspecs)?;
+        let committed_contents = committed_projection_contents(
+            repo,
+            commit_sha,
+            self.file_contents.keys().cloned(),
+            &HashMap::new(),
+        )?;
 
         // Process each file
         for (file_path, (_, line_attrs)) in &self.attributions {
@@ -2672,25 +3174,16 @@ impl VirtualAttributions {
                 None => continue, // No committed hunks for this file, skip
             };
 
-            // Map author_id -> line numbers (in commit coordinates)
-            let mut committed_lines_map: StdHashMap<String, Vec<u32>> = StdHashMap::new();
-
-            for line_attr in line_attrs {
-                // Since we're not dealing with unstaged hunks, the line numbers in VirtualAttributions
-                // are already in the right coordinates (working log coordinates = commit coordinates)
-                for line_num in line_attr.start_line..=line_attr.end_line {
-                    // Check if this line is in any committed hunk
-                    let is_committed = file_committed_hunks
-                        .iter()
-                        .any(|hunk| hunk.contains(line_num));
-
-                    if is_committed {
-                        committed_lines_map
-                            .entry(line_attr.author_id.clone())
-                            .or_default()
-                            .push(line_num);
-                    }
-                }
+            let (Some(observed), Some(committed)) = (
+                self.file_contents.get(file_path),
+                committed_contents.get(&nfc_file_path),
+            ) else {
+                continue;
+            };
+            let mut committed_lines_map =
+                project_committed_lines(observed, committed, line_attrs)?.authors;
+            for lines in committed_lines_map.values_mut() {
+                lines.retain(|line| file_committed_hunks.iter().any(|hunk| hunk.contains(*line)));
             }
 
             // Project only observed line attributions. Recovery of unobserved
@@ -2776,6 +3269,7 @@ impl VirtualAttributions {
             });
         }
 
+        authorship_log.retain_referenced_trace_models();
         Ok(authorship_log)
     }
 
@@ -2832,6 +3326,14 @@ impl VirtualAttributions {
                 }
             }
         }
+
+        SessionRecord::retain_referenced_trace_models(
+            &mut initial_sessions,
+            initial_files
+                .values()
+                .flatten()
+                .map(|line| line.author_id.as_str()),
+        );
 
         crate::git::repo_storage::InitialAttributions {
             files: initial_files,
@@ -2990,7 +3492,11 @@ pub fn merge_attributions_favoring_first(
     // Merge sessions from both VAs (primary wins on conflict)
     let mut merged_sessions = secondary.sessions.clone();
     for (id, record) in &primary.sessions {
-        merged_sessions.insert(id.clone(), record.clone());
+        let mut record = record.clone();
+        if let Some(secondary_record) = merged_sessions.get(id) {
+            record.merge_from(secondary_record);
+        }
+        merged_sessions.insert(id.clone(), record);
     }
 
     let mut merged = VirtualAttributions {
@@ -3004,6 +3510,11 @@ pub fn merge_attributions_favoring_first(
         humans: merged_humans,
         initial_only_prompt_ids: HashSet::new(),
         sessions: merged_sessions,
+        failed_tool_snapshots: {
+            let mut snapshots = secondary.failed_tool_snapshots.clone();
+            snapshots.extend(primary.failed_tool_snapshots.clone());
+            snapshots
+        },
     };
 
     // Get union of all files
@@ -3310,7 +3821,16 @@ fn compute_attributions_for_file(
     file_path: &str,
     ts: u128,
     blame_start_commit: Option<String>,
-) -> Result<Option<(String, String, Vec<Attribution>, Vec<LineAttribution>)>, GitAiError> {
+) -> Result<
+    Option<(
+        String,
+        String,
+        Vec<Attribution>,
+        Vec<LineAttribution>,
+        HashMap<String, SessionRecord>,
+    )>,
+    GitAiError,
+> {
     // Set up blame options
     let mut ai_blame_opts = GitAiBlameOptions::default();
     #[allow(clippy::field_reassign_with_default)]
@@ -3324,13 +3844,13 @@ fn compute_attributions_for_file(
     }
 
     // Run blame at the base commit
-    let ai_blame = repo.blame(file_path, &ai_blame_opts);
+    let ai_blame = repo.blame_analysis(file_path, &ai_blame_opts);
 
     match ai_blame {
-        Ok((blames, _)) => {
+        Ok(analysis) => {
             // Convert blame results to line attributions
             let mut line_attributions = Vec::new();
-            for (line, author) in blames {
+            for (line, author) in analysis.line_authors {
                 // Skip human-only lines as they don't need tracking
                 if author == CheckpointKind::Human.to_str() {
                     continue;
@@ -3356,6 +3876,7 @@ fn compute_attributions_for_file(
                 file_content,
                 char_attributions,
                 line_attributions,
+                analysis.session_records,
             )))
         }
         Err(_) => {
@@ -3467,6 +3988,74 @@ pub fn restore_virtual_attribution_carryover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_tool_snapshots_use_persisted_human_evidence_without_inventing_authorship() {
+        use crate::authorship::working_log::{AgentId, Checkpoint, WorkingLogEntry};
+        let temp = tempfile::tempdir().unwrap();
+        let log = crate::git::repo_storage::PersistedWorkingLog::new(
+            temp.path().join("log"),
+            "base",
+            temp.path().into(),
+            temp.path().into(),
+            None,
+        );
+        let blob = log.persist_file_version("partial\n").unwrap();
+        let mut failed = Checkpoint::new(
+            CheckpointKind::Human,
+            String::new(),
+            "User".into(),
+            vec![WorkingLogEntry::new(
+                "file.txt".into(),
+                blob.clone(),
+                vec![],
+                vec![],
+            )],
+        );
+        failed.agent_id = Some(AgentId {
+            tool: "zcode".into(),
+            id: "session".into(),
+            model: "unknown".into(),
+        });
+        failed.agent_metadata = Some(HashMap::from([("tool_outcome".into(), "failed".into())]));
+        assert_eq!(
+            collect_failed_tool_snapshots(&[failed.clone()], &log).unwrap()["file.txt"],
+            "partial\n"
+        );
+        failed.agent_metadata = None;
+        assert!(
+            collect_failed_tool_snapshots(&[failed.clone()], &log)
+                .unwrap()
+                .is_empty()
+        );
+        failed.agent_metadata = Some(HashMap::from([("tool_outcome".into(), "failed".into())]));
+        failed.agent_id.as_mut().unwrap().tool = "codex".into();
+        assert!(
+            collect_failed_tool_snapshots(&[failed.clone()], &log)
+                .unwrap()
+                .is_empty()
+        );
+        failed.agent_id.as_mut().unwrap().tool = "zcode".into();
+        std::fs::remove_file(log.dir.join("blobs").join(blob)).unwrap();
+        assert!(collect_failed_tool_snapshots(&[failed], &log).is_err());
+    }
+
+    #[test]
+    fn failed_tool_projection_protects_only_surviving_observed_lines() {
+        assert_eq!(
+            project_failed_tool_lines("old\npartial\n", "insert\nold\npartial\nnew\n"),
+            vec![2, 3]
+        );
+        assert_eq!(
+            project_failed_tool_lines("old\npartial\n", "old\nreplacement\n"),
+            vec![1]
+        );
+        assert_eq!(
+            project_failed_tool_lines("old\r\npartial\r\n", "old\npartial\n"),
+            vec![1, 2]
+        );
+        assert!(project_failed_tool_lines("removed\n", "").is_empty());
+    }
 
     #[test]
     fn checkout_merge_rebased_content_preserves_clean_local_hunk_on_target_edit() {

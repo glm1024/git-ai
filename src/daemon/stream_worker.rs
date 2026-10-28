@@ -5,6 +5,7 @@
 //! 2. **Periodic sweeps** (Low priority, every 30min) - agent-specific discovery of all sessions
 
 use crate::authorship::authorship_log_serialization::{generate_session_id, generate_trace_id};
+use crate::commands::checkpoint_agent::presets::{PresetContext, StreamSource};
 use crate::config;
 use crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle;
 use crate::metrics::session_compaction::compact_session_event;
@@ -22,7 +23,23 @@ use std::time::Instant;
 use tokio::sync::Notify;
 use tokio::time::{Duration, interval};
 
+type StreamTaskKey = (PathBuf, String, String);
+
 const TRIGGERED_SWEEP_COOLDOWN: Duration = Duration::from_secs(30);
+
+fn canonicalize_stream_path(path: &Path) -> PathBuf {
+    // Enrollment can precede source DB creation. Resolve the existing ancestor
+    // now so macOS /var aliases and symlinked home directories retain the same
+    // durable stream key once SQLite creates the file.
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor)
+            && let Ok(suffix) = path.strip_prefix(ancestor)
+        {
+            return canonical.join(suffix);
+        }
+    }
+    path.to_path_buf()
+}
 
 /// Extract a Unix-epoch u32 timestamp from a raw JSON event's "timestamp" field.
 /// Handles both ISO 8601 strings (e.g. "2026-05-11T23:13:12.819Z") and numeric
@@ -77,6 +94,16 @@ pub(super) struct ProcessingTask {
     pub(super) retry_count: u32,
     #[cfg_attr(test, serde(skip))]
     pub(super) next_retry_at: Option<std::time::Instant>,
+}
+
+impl ProcessingTask {
+    fn dedup_key(&self) -> StreamTaskKey {
+        (
+            self.canonical_path.clone(),
+            self.stream_kind.clone(),
+            self.session_id.clone(),
+        )
+    }
 }
 
 impl PartialOrd for ProcessingTask {
@@ -197,6 +224,7 @@ impl SweepTriggerGate {
 /// Handle for sending checkpoint notifications and sweep requests to the worker.
 #[derive(Clone)]
 pub struct StreamWorkerHandle {
+    streams_db: Arc<StreamsDatabase>,
     checkpoint_tx: tokio::sync::mpsc::UnboundedSender<CheckpointNotification>,
     sweep_tx: tokio::sync::mpsc::UnboundedSender<SweepRequest>,
     drain_tx: tokio::sync::mpsc::UnboundedSender<DrainRequest>,
@@ -228,6 +256,80 @@ impl StreamWorkerHandle {
             external_parent_session_id,
         };
         let _ = self.checkpoint_tx.send(notification);
+    }
+
+    /// Persist session enrollment before acknowledging a pre-model hook. This
+    /// does not wait for transcript processing, which may include slow I/O.
+    pub async fn notify_session_activity(
+        &self,
+        source: StreamSource,
+        context: PresetContext,
+        observed_at_millis: i64,
+        repo_work_dir: Option<PathBuf>,
+    ) -> Result<(), String> {
+        if context.agent_id.tool != "zcode"
+            || context.agent_id.id != context.external_session_id
+            || source.external_session_id.trim().is_empty()
+            || !source.path.is_absolute()
+            || source.format
+                != crate::commands::checkpoint_agent::presets::StreamFormat::ZCodeSqlite
+            || source.external_session_id != context.external_session_id
+            || source.session_id != generate_session_id(&source.external_session_id, "zcode")
+        {
+            return Err("invalid ZCode session activity identity".to_string());
+        }
+        let db = self.streams_db.clone();
+        let notification = tokio::task::spawn_blocking(move || {
+            let path = canonicalize_stream_path(&source.path);
+            let watermark = crate::streams::watermark::ZCodeWatermark::at(observed_at_millis);
+            db.insert_stream_if_absent(&StreamRecord {
+                session_id: source.session_id.clone(),
+                stream_kind: "transcript".to_string(),
+                tool: "zcode".to_string(),
+                stream_path: path.display().to_string(),
+                stream_format: "ZCodeSqlite".to_string(),
+                watermark_type: "ZCodeUsage".to_string(),
+                watermark_value: watermark.serialize(),
+                external_session_id: source.external_session_id.clone(),
+                external_parent_session_id: source.external_parent_session_id.clone(),
+                first_seen_at: observed_at_millis / 1000,
+                last_processed_at: 0,
+                last_known_size: 0,
+                last_modified: None,
+                processing_errors: 0,
+                last_error: None,
+                repo_work_dir: repo_work_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            })
+            .map_err(|error| error.to_string())?;
+            db.fill_stream_context(
+                &source.session_id,
+                "transcript",
+                &path.display().to_string(),
+                source.external_parent_session_id.as_deref(),
+                repo_work_dir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy())
+                    .as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok::<_, String>(CheckpointNotification {
+                session_id: source.session_id,
+                tool: "zcode".to_string(),
+                trace_id: context.trace_id,
+                tool_use_id: None,
+                stream_path: path,
+                repo_work_dir,
+                external_session_id: source.external_session_id,
+                external_parent_session_id: source.external_parent_session_id,
+            })
+        })
+        .await
+        .map_err(|error| format!("session enrollment task failed: {error}"))??;
+        self.checkpoint_tx
+            .send(notification)
+            .map_err(|_| "stream worker has stopped".to_string())
     }
 
     /// Request a full sweep unless another sweep was triggered recently.
@@ -291,6 +393,7 @@ impl StreamWorkerHandle {
         let (checkpoint_tx, _checkpoint_rx) = tokio::sync::mpsc::unbounded_channel();
         let (drain_tx, _drain_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            streams_db: Arc::new(StreamsDatabase::open(":memory:").expect("test streams database")),
             checkpoint_tx,
             sweep_tx,
             drain_tx,
@@ -317,7 +420,7 @@ struct StreamWorker {
     sweep_coordinator: crate::daemon::sweep_coordinator::SweepCoordinator, // NEW
     priority_queue: BinaryHeap<ProcessingTask>,
     delayed_tasks: Vec<ProcessingTask>,
-    in_flight: HashSet<(PathBuf, String)>,
+    in_flight: HashSet<StreamTaskKey>,
     telemetry_handle: DaemonTelemetryWorkerHandle,
     shutdown_notify: Arc<Notify>,
     shutdown_flag: Arc<AtomicBool>,
@@ -546,7 +649,7 @@ impl StreamWorker {
             tracing::info!(remaining = items.len() - 10, "... and more sweep items");
         }
 
-        let mut enqueued_this_sweep: HashSet<(PathBuf, String)> = HashSet::new();
+        let mut enqueued_this_sweep: HashSet<StreamTaskKey> = HashSet::new();
 
         for item in items {
             match item {
@@ -583,7 +686,11 @@ impl StreamWorker {
                     stream_kind,
                     canonical_path,
                 } => {
-                    let dedup_key = (canonical_path.clone(), stream_kind.clone());
+                    let dedup_key = (
+                        canonical_path.clone(),
+                        stream_kind.clone(),
+                        SHARED_STREAM_SESSION_ID.to_string(),
+                    );
                     if self.in_flight.contains(&dedup_key)
                         || enqueued_this_sweep.contains(&dedup_key)
                     {
@@ -644,7 +751,7 @@ impl StreamWorker {
         let canonical_path = std::fs::canonicalize(&notification.stream_path)
             .unwrap_or_else(|_| notification.stream_path.clone());
 
-        let mut enqueued: HashSet<(PathBuf, String)> = HashSet::new();
+        let mut enqueued: HashSet<StreamTaskKey> = HashSet::new();
         let tasks = self.enqueue_streams_for_session(
             &notification.tool,
             &canonical_path,
@@ -717,7 +824,11 @@ impl StreamWorker {
             let session_id = generate_session_id(&external_session_id, "claude");
 
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            let dedup_key = (canonical.clone(), "transcript".to_string());
+            let dedup_key = (
+                canonical.clone(),
+                "transcript".to_string(),
+                session_id.clone(),
+            );
             if self.in_flight.contains(&dedup_key) {
                 continue;
             }
@@ -786,7 +897,7 @@ impl StreamWorker {
         external_parent_session_id: Option<&str>,
         repo_work_dir: Option<&Path>,
         non_shared_session_id: &str,
-        enqueued: &mut HashSet<(PathBuf, String)>,
+        enqueued: &mut HashSet<StreamTaskKey>,
     ) -> Vec<ProcessingTask> {
         let agent = crate::streams::agent::get_agent(tool);
         let streams = agent.as_ref().map(|a| a.streams()).unwrap_or_default();
@@ -833,7 +944,11 @@ impl StreamWorker {
                 continue;
             }
 
-            let dedup_key = (stream_path.clone(), stream.stream_kind.to_string());
+            let dedup_key = (
+                stream_path.clone(),
+                stream.stream_kind.to_string(),
+                effective_session_id.clone(),
+            );
             if self.in_flight.contains(&dedup_key) || enqueued.contains(&dedup_key) {
                 continue;
             }
@@ -981,8 +1096,7 @@ impl StreamWorker {
         }
 
         // Mark as in-flight
-        self.in_flight
-            .insert((task.canonical_path.clone(), task.stream_kind.clone()));
+        self.in_flight.insert(task.dedup_key());
 
         // Process the session (spawn blocking to avoid blocking the worker loop)
         let db = self.streams_db.clone();
@@ -996,8 +1110,7 @@ impl StreamWorker {
         .await;
 
         // Remove from in-flight
-        self.in_flight
-            .remove(&(task.canonical_path.clone(), task.stream_kind.clone()));
+        self.in_flight.remove(&task.dedup_key());
 
         // Handle result
         match result {
@@ -1360,8 +1473,7 @@ impl StreamWorker {
 
         // Process immediate tasks
         for task in immediate_tasks {
-            self.in_flight
-                .insert((task.canonical_path.clone(), task.stream_kind.clone()));
+            self.in_flight.insert(task.dedup_key());
             let db = self.streams_db.clone();
             let telemetry = self.telemetry_handle.clone();
             let shutdown_flag = self.shutdown_flag.clone();
@@ -1372,8 +1484,7 @@ impl StreamWorker {
             })
             .await;
 
-            self.in_flight
-                .remove(&(task.canonical_path.clone(), task.stream_kind.clone()));
+            self.in_flight.remove(&task.dedup_key());
 
             match result {
                 Err(e) => {
@@ -1395,6 +1506,7 @@ impl StreamWorker {
     /// drains token usage right after transcripts, always sees the ping.
     fn notify_token_usage(&self, task: &ProcessingTask) {
         if task.stream_kind == "transcript"
+            && task.tool != "zcode" // ZCode already projects authoritative request facts into daily metrics.
             && let Some(token_usage) = &self.token_usage_worker
         {
             token_usage.notify_stream_processed(&task.session_id, &task.tool, &task.canonical_path);
@@ -1442,7 +1554,7 @@ pub fn spawn_stream_worker(
     let sweep_trigger_gate = SweepTriggerGate::new();
 
     let worker = StreamWorker::new(
-        streams_db,
+        streams_db.clone(),
         telemetry_handle,
         shutdown_notify,
         shutdown_flag,
@@ -1458,6 +1570,7 @@ pub fn spawn_stream_worker(
     });
 
     StreamWorkerHandle {
+        streams_db,
         checkpoint_tx,
         sweep_tx,
         drain_tx,
@@ -2066,9 +2179,11 @@ mod subagent_sweep_tests {
 
         // Mark the subagent's canonical path as in-flight
         let canonical = std::fs::canonicalize(&sub).unwrap();
-        worker
-            .in_flight
-            .insert((canonical, "transcript".to_string()));
+        worker.in_flight.insert((
+            canonical,
+            "transcript".to_string(),
+            generate_session_id("agent-inflight", "claude"),
+        ));
 
         let notification = CheckpointNotification {
             session_id: "internal-sess-dup".to_string(),
@@ -2085,5 +2200,141 @@ mod subagent_sweep_tests {
 
         // Should not enqueue the in-flight subagent
         assert_eq!(worker.priority_queue.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod zcode_activity_tests {
+    use super::*;
+    use crate::authorship::working_log::AgentId;
+    use crate::commands::checkpoint_agent::presets::{PresetContext, StreamFormat, StreamSource};
+    use crate::streams::watermark::ZCodeWatermark;
+    use std::collections::HashMap;
+
+    fn activity(path: PathBuf, external: &str) -> (StreamSource, PresetContext) {
+        let source = StreamSource {
+            path,
+            format: StreamFormat::ZCodeSqlite,
+            session_id: generate_session_id(external, "zcode"),
+            external_session_id: external.to_string(),
+            external_parent_session_id: Some("parent".to_string()),
+        };
+        let context = PresetContext {
+            agent_id: AgentId {
+                tool: "zcode".to_string(),
+                id: external.to_string(),
+                model: "unknown".to_string(),
+            },
+            external_session_id: external.to_string(),
+            trace_id: "trace".to_string(),
+            cwd: PathBuf::from("/repo"),
+            metadata: HashMap::new(),
+        };
+        (source, context)
+    }
+
+    #[tokio::test]
+    async fn zcode_activity_ack_persists_boundary_before_source_exists_and_never_resets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(StreamsDatabase::open(dir.path().join("tracked.sqlite")).unwrap());
+        let (checkpoint_tx, mut checkpoint_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sweep_tx, _sweep_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (drain_tx, _drain_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = StreamWorkerHandle {
+            checkpoint_tx,
+            sweep_tx,
+            drain_tx,
+            sweep_trigger_gate: SweepTriggerGate::new(),
+            streams_db: db.clone(),
+        };
+        let (source, context) = activity(dir.path().join("not-created.sqlite"), "session");
+        handle
+            .notify_session_activity(
+                source.clone(),
+                context.clone(),
+                100,
+                Some(context.cwd.clone()),
+            )
+            .await
+            .unwrap();
+        let notification = checkpoint_rx.try_recv().unwrap();
+        let record = db
+            .get_stream(
+                &source.session_id,
+                "transcript",
+                &notification.stream_path.display().to_string(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.tool, "zcode");
+        assert_eq!(record.repo_work_dir.as_deref(), Some("/repo"));
+        assert_eq!(record.external_parent_session_id.as_deref(), Some("parent"));
+        let wm = WatermarkType::ZCodeUsage
+            .deserialize(&record.watermark_value)
+            .unwrap();
+        assert_eq!(
+            wm.as_any()
+                .downcast_ref::<ZCodeWatermark>()
+                .unwrap()
+                .activated_at_millis,
+            100
+        );
+        handle
+            .notify_session_activity(source.clone(), context, 999, None)
+            .await
+            .unwrap();
+        let record_after = db
+            .get_stream(
+                &source.session_id,
+                "transcript",
+                &notification.stream_path.display().to_string(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(record_after.watermark_value, record.watermark_value);
+        assert!(
+            !source.path.exists(),
+            "enrollment must not create or modify ZCode's database"
+        );
+    }
+
+    #[test]
+    fn zcode_same_database_sessions_have_independent_processing_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_db = dir.path().join("zcode.sqlite");
+        drop(crate::sqlite::open_with_memory_limits(&source_db).unwrap());
+        let db = Arc::new(StreamsDatabase::open(dir.path().join("tracked.sqlite")).unwrap());
+        let (_checkpoint_tx, checkpoint_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_sweep_tx, sweep_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_drain_tx, drain_rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = StreamWorker::new(
+            db,
+            DaemonTelemetryWorkerHandle::new_noop(),
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+            checkpoint_rx,
+            sweep_rx,
+            drain_rx,
+            SweepTriggerGate::new(),
+            None,
+        );
+        let mut enqueued = HashSet::new();
+        let mut tasks = Vec::new();
+        for session in ["first", "second"] {
+            tasks.extend(worker.enqueue_streams_for_session(
+                "zcode",
+                &source_db,
+                Priority::Low,
+                None,
+                None,
+                Some(session),
+                None,
+                Some(dir.path()),
+                session,
+                &mut enqueued,
+            ));
+        }
+        assert_eq!(tasks.len(), 2);
+        assert_ne!(tasks[0].dedup_key(), tasks[1].dedup_key());
     }
 }

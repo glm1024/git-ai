@@ -264,13 +264,33 @@ impl StreamsDatabase {
 
     /// Insert a new stream record.
     pub fn insert_stream(&self, record: &StreamRecord) -> Result<(), StreamError> {
+        self.insert_stream_inner(record, false)
+    }
+
+    /// Atomically preserve the first onboarding boundary when duplicate hooks
+    /// race. The existing cursor is never replaced by a later enrollment.
+    pub fn insert_stream_if_absent(&self, record: &StreamRecord) -> Result<(), StreamError> {
+        self.insert_stream_inner(record, true)
+    }
+
+    fn insert_stream_inner(
+        &self,
+        record: &StreamRecord,
+        ignore_existing: bool,
+    ) -> Result<(), StreamError> {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        let conflict = if ignore_existing {
+            " ON CONFLICT(session_id, stream_kind, stream_path) DO NOTHING"
+        } else {
+            ""
+        };
         conn.execute(
-            r#"
+            &format!(
+                r#"
             INSERT INTO tracked_streams (
                 session_id, stream_kind, tool, stream_path, stream_format,
                 watermark_type, watermark_value, external_session_id,
@@ -278,7 +298,8 @@ impl StreamsDatabase {
                 first_seen_at, last_processed_at, last_known_size, last_modified,
                 processing_errors, last_error, repo_work_dir
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-            "#,
+            {conflict}"#
+            ),
             params![
                 record.session_id,
                 record.stream_kind,
@@ -302,6 +323,39 @@ impl StreamsDatabase {
             message: format!("Failed to insert stream: {}", e),
         })?;
 
+        Ok(())
+    }
+
+    /// Fill context that was unavailable at enrollment without replacing its
+    /// first-observed boundary, stable identity or a running reader's cursor.
+    pub fn fill_stream_context(
+        &self,
+        session_id: &str,
+        stream_kind: &str,
+        stream_path: &str,
+        external_parent_session_id: Option<&str>,
+        repo_work_dir: Option<&str>,
+    ) -> Result<(), StreamError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE tracked_streams SET
+            external_parent_session_id=COALESCE(external_parent_session_id, ?4),
+            repo_work_dir=COALESCE(repo_work_dir, ?5)
+            WHERE session_id=?1 AND stream_kind=?2 AND stream_path=?3",
+            params![
+                session_id,
+                stream_kind,
+                stream_path,
+                external_parent_session_id,
+                repo_work_dir
+            ],
+        )
+        .map_err(|error| StreamError::Fatal {
+            message: format!("Failed to fill stream context: {error}"),
+        })?;
         Ok(())
     }
 

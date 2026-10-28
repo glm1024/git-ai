@@ -52,8 +52,12 @@ pub fn find_prompt_in_commit(
     } else {
         prompt_id
     };
-    if let Some(session) = authorship_log.metadata.sessions.get(session_key) {
-        return Ok((commit_sha, session.to_prompt_record()));
+    if let Some(session) = authorship_log.metadata.sessions.get(session_key)
+        && prompt_id
+            .split_once("::")
+            .is_none_or(|(_, trace_id)| session.trace_models.contains_key(trace_id))
+    {
+        return Ok((commit_sha, session.to_prompt_record_for_author(prompt_id)));
     }
 
     Err(GitAiError::Generic(format!(
@@ -100,8 +104,15 @@ pub fn find_prompt_in_history(
                 found_count += 1;
             // Then check sessions map
             } else if let Some(session) = authorship_log.metadata.sessions.get(session_key) {
+                // A full checkpoint ID must resolve through a note containing
+                // that trace, rather than a newer note for the same conversation.
+                if let Some((_, trace_id)) = prompt_id.split_once("::")
+                    && !session.trace_models.contains_key(trace_id)
+                {
+                    continue;
+                }
                 if found_count == offset {
-                    return Ok((sha.clone(), session.to_prompt_record()));
+                    return Ok((sha.clone(), session.to_prompt_record_for_author(prompt_id)));
                 }
                 found_count += 1;
             }

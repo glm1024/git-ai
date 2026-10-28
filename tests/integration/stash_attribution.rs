@@ -1583,6 +1583,7 @@ fn test_partial_stash_trims_unstashed_initial_metadata() {
     sessions.insert(
         "s_b".to_string(),
         SessionRecord {
+            trace_models: Default::default(),
             agent_id: test_agent("session-b"),
             human_author: None,
             custom_attributes: None,

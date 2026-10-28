@@ -17,6 +17,8 @@ const AI_AUTHOR_NAMES: &[&str] = &[
     "amp",
     "windsurf",
     "kilo",
+    "zcode",
+    "deepseek-harness",
     "devin",
     "cloud-agent",
     "codex-cloud",

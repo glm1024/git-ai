@@ -11,6 +11,7 @@ mod gemini;
 pub mod opencode;
 mod pi;
 mod windsurf;
+pub mod zcode;
 
 pub use amp::AmpAgent;
 pub use claude::ClaudeAgent;
@@ -24,3 +25,4 @@ pub use gemini::GeminiAgent;
 pub use opencode::OpenCodeAgent;
 pub use pi::PiAgent;
 pub use windsurf::WindsurfAgent;
+pub use zcode::ZCodeAgent;

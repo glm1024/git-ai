@@ -912,6 +912,7 @@ fn merge_authorship_logs(target: &mut AuthorshipLog, source: &AuthorshipLog) {
             .metadata
             .sessions
             .entry(key.clone())
+            .and_modify(|existing| existing.merge_from(record))
             .or_insert_with(|| record.clone());
     }
     for (key, record) in &source.metadata.humans {
@@ -2344,6 +2345,7 @@ diff --git a/c.txt b/c.txt
         log.metadata.sessions.insert(
             format!("s_{index}"),
             SessionRecord {
+                trace_models: Default::default(),
                 agent_id,
                 human_author: None,
                 custom_attributes: None,

@@ -65,6 +65,37 @@ impl SweepCoordinator {
                 continue;
             }
 
+            if agent.polls_tracked_sessions() {
+                // Enrollment is persisted by the hook, not inferred from old
+                // source rows. Always poll these sources: SQLite WAL updates
+                // and late request finalization need not change main DB mtime.
+                let owned_kinds: HashSet<_> = agent
+                    .streams()
+                    .into_iter()
+                    .filter(|stream| !stream.shared)
+                    .map(|stream| stream.stream_kind)
+                    .collect();
+                let mut seen = HashSet::new();
+                for record in self.streams_db.all_streams()? {
+                    if record.tool != *agent_type
+                        || !owned_kinds.contains(record.stream_kind.as_str())
+                    {
+                        continue;
+                    }
+                    let path = Self::canonicalize_path(&PathBuf::from(&record.stream_path));
+                    if path.exists() && seen.insert((record.session_id.clone(), path.clone())) {
+                        items.push(SweepItem::Session {
+                            session_id: record.session_id,
+                            tool: record.tool,
+                            canonical_path: path,
+                            external_session_id: record.external_session_id,
+                            external_parent_session_id: record.external_parent_session_id,
+                        });
+                    }
+                }
+                continue;
+            }
+
             let discovered = match agent.discover_sessions() {
                 Ok(sessions) => sessions,
                 Err(e) => {
@@ -216,5 +247,100 @@ impl SweepCoordinator {
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streams::watermark::{WatermarkStrategy, ZCodeWatermark};
+
+    #[test]
+    fn zcode_sweep_only_polls_enrolled_sessions_including_wal_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("zcode.sqlite");
+        let source_conn = crate::sqlite::open_with_memory_limits(&source).unwrap();
+        source_conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE session(id TEXT);
+            INSERT INTO session VALUES('historical-unenrolled');",
+            )
+            .unwrap();
+        let tracking_path = dir.path().join("tracked.sqlite");
+        let db = Arc::new(StreamsDatabase::open(&tracking_path).unwrap());
+        let coordinator = SweepCoordinator {
+            streams_db: db.clone(),
+            agent_registry: vec![(
+                "zcode".to_string(),
+                Box::new(crate::streams::agents::ZCodeAgent::new()),
+            )],
+            lookback_days: Some(0),
+        };
+        assert!(
+            coordinator.run_sweep().unwrap().is_empty(),
+            "must not enroll source history"
+        );
+        let metadata = source.metadata().unwrap();
+        for session in ["child-a", "child-b"] {
+            db.insert_stream(&StreamRecord {
+                session_id: session.to_string(),
+                stream_kind: "transcript".to_string(),
+                tool: "zcode".to_string(),
+                stream_path: source.display().to_string(),
+                stream_format: "ZCodeSqlite".to_string(),
+                watermark_type: "ZCodeUsage".to_string(),
+                watermark_value: ZCodeWatermark::at(100).serialize(),
+                external_session_id: format!("external-{session}"),
+                external_parent_session_id: Some("parent".to_string()),
+                first_seen_at: 0,
+                last_processed_at: 100,
+                last_known_size: metadata.len() as i64,
+                last_modified: SweepCoordinator::get_modified_timestamp(&metadata),
+                processing_errors: 0,
+                last_error: None,
+                repo_work_dir: Some("/repo".to_string()),
+            })
+            .unwrap();
+        }
+        let first = coordinator.run_sweep().unwrap();
+        assert_eq!(
+            first.len(),
+            2,
+            "one shared DB still requires each enrolled session"
+        );
+        source_conn
+            .execute("INSERT INTO session VALUES('late-write')", [])
+            .unwrap();
+        let reopened = Arc::new(StreamsDatabase::open(&tracking_path).unwrap());
+        let recovered = SweepCoordinator {
+            streams_db: reopened,
+            agent_registry: vec![(
+                "zcode".to_string(),
+                Box::new(crate::streams::agents::ZCodeAgent::new()),
+            )],
+            lookback_days: Some(0),
+        }
+        .run_sweep()
+        .unwrap();
+        assert_eq!(
+            recovered.len(),
+            2,
+            "poll registered sessions even if main DB mtime/size is unchanged"
+        );
+        for item in recovered {
+            match item {
+                SweepItem::Session {
+                    tool,
+                    external_session_id,
+                    external_parent_session_id,
+                    ..
+                } => {
+                    assert_eq!(tool, "zcode");
+                    assert!(external_session_id.starts_with("external-child-"));
+                    assert_eq!(external_parent_session_id.as_deref(), Some("parent"));
+                }
+                _ => panic!("ZCode uses per-session onboarding boundaries"),
+            }
+        }
     }
 }

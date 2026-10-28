@@ -300,7 +300,11 @@ impl RepoStorage {
             merged_initial.humans.entry(k).or_insert(v);
         }
         for (k, v) in new_initial.sessions {
-            merged_initial.sessions.entry(k).or_insert(v);
+            merged_initial
+                .sessions
+                .entry(k)
+                .and_modify(|existing| existing.merge_from(&v))
+                .or_insert(v);
         }
         new_log.write_initial(merged_initial)?;
 
@@ -1241,7 +1245,7 @@ impl PersistedWorkingLog {
                 )));
             }
         };
-        let initial: InitialAttributions = serde_json::from_str(&content).map_err(|error| {
+        let mut initial: InitialAttributions = serde_json::from_str(&content).map_err(|error| {
             GitAiError::EvidenceError(format!(
                 "preserved INITIAL {} is not valid JSON: {}",
                 self.initial_file.display(),
@@ -1249,6 +1253,16 @@ impl PersistedWorkingLog {
             ))
         })?;
         self.validate_initial_blob_references(&initial)?;
+        // Legacy INITIAL records used one model for all referenced traces.
+        // Keep that explicit model when later checkpoints share the session.
+        for line in initial.files.values().flatten() {
+            if let Some((session_id, trace_id)) = line.author_id.split_once("::")
+                && let Some(session) = initial.sessions.get_mut(session_id)
+            {
+                let model = session.agent_id.model.clone();
+                session.record_trace_model(trace_id, &model);
+            }
+        }
         Ok(initial)
     }
 

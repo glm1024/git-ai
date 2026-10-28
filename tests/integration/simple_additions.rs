@@ -905,11 +905,11 @@ Another AI line
         .unwrap();
     repo.stage_all_and_commit("Fourth commit").unwrap();
     file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(), // 'untracked'
-        "Human line".human(),                  // known human
-        "AI line".ai(),                        // AI line
-        "Another untracked line".ai(),         // recovered edge line
-        "Another AI line".ai(),                // AI line
+        "Untracked line".unattributed_human(),         // 'untracked'
+        "Human line".human(),                          // known human
+        "AI line".ai(),                                // AI line
+        "Another untracked line".unattributed_human(), // the pre-edit checkpoint excluded this line
+        "Another AI line".ai(),                        // AI line
     ]);
 }
 

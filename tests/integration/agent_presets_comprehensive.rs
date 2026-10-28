@@ -536,7 +536,8 @@ fn test_codex_preset_invalid_transcript_path() {
         "tool_use_id": "patch-1",
         "session_id": "test-session-12345",
         "transcript_path": "/nonexistent/path/transcript.jsonl",
-        "cwd": "/path"
+        "cwd": "/path",
+        "tool_input": { "file_path": "/path/example.rs" }
     })
     .to_string();
 

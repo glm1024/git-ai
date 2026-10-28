@@ -1063,7 +1063,10 @@ fn build_line_attribution_from_notes(
             prompts.entry(id.clone()).or_insert_with(|| record.clone());
         }
         for (id, record) in &parent_note.metadata.sessions {
-            sessions.entry(id.clone()).or_insert_with(|| record.clone());
+            sessions
+                .entry(id.clone())
+                .and_modify(|existing| existing.merge_from(record))
+                .or_insert_with(|| record.clone());
         }
         for (id, record) in &parent_note.metadata.humans {
             humans.entry(id.clone()).or_insert_with(|| record.clone());
@@ -1290,16 +1293,22 @@ fn apply_blame_for_side(
             if let Some(session_record) = analysis.session_records.get(session_key) {
                 sessions
                     .entry(session_key.to_string())
+                    .and_modify(|existing| existing.merge_from(session_record))
                     .or_insert_with(|| session_record.clone());
             } else {
                 // Fallback: convert PromptRecord back to SessionRecord
-                sessions
-                    .entry(session_key.to_string())
-                    .or_insert_with(|| SessionRecord {
-                        agent_id: prompt_record.agent_id.clone(),
-                        human_author: prompt_record.human_author.clone(),
-                        custom_attributes: prompt_record.custom_attributes.clone(),
-                    });
+                let session =
+                    sessions
+                        .entry(session_key.to_string())
+                        .or_insert_with(|| SessionRecord {
+                            trace_models: Default::default(),
+                            agent_id: prompt_record.agent_id.clone(),
+                            human_author: prompt_record.human_author.clone(),
+                            custom_attributes: prompt_record.custom_attributes.clone(),
+                        });
+                if let Some((_, trace_id)) = prompt_id.split_once("::") {
+                    session.record_trace_model(trace_id, &prompt_record.agent_id.model);
+                }
             }
         } else {
             prompts
@@ -1784,6 +1793,7 @@ fn merge_missing_prompts_and_sessions_from_authorship_note(
                     {
                         sessions
                             .entry(session_key.to_string())
+                            .and_modify(|existing| existing.merge_from(session_record))
                             .or_insert_with(|| session_record.clone());
                     }
                 }
@@ -1824,8 +1834,12 @@ fn calculate_diff_commit_stats(
             let session_key = extract_session_id(prompt_id);
             let key = prompts
                 .get(prompt_id)
-                .map(|r| &r.agent_id)
-                .or_else(|| sessions.get(session_key).map(|r| &r.agent_id))
+                .map(|r| r.agent_id.clone())
+                .or_else(|| {
+                    sessions
+                        .get(session_key)
+                        .map(|r| r.agent_id_for_author(prompt_id))
+                })
                 .map(|agent_id| format!("{}::{}", agent_id.tool, agent_id.model));
             if let Some(key) = key {
                 let tool_stats = stats.tool_model_breakdown.entry(key).or_default();
@@ -2858,6 +2872,7 @@ index 7f4f5e8..1c84817 100644
         parent_note.metadata.sessions.insert(
             session_id.to_string(),
             SessionRecord {
+                trace_models: Default::default(),
                 agent_id: AgentId {
                     tool: "codex".to_string(),
                     id: "parent-session".to_string(),

@@ -1,6 +1,6 @@
 use crate::authorship::working_log::AgentId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,16 +216,69 @@ pub struct PromptRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub agent_id: AgentId,
+    /// Model observed for each checkpoint trace. The conversation identity stays stable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trace_models: BTreeMap<String, String>,
     pub human_author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
 }
 
 impl SessionRecord {
-    /// Convert to a PromptRecord (with zeroed stats) for backwards-compatible lookup
+    /// Resolve the checkpoint identity without changing the external conversation ID.
+    /// Old notes without trace metadata retain their original session model.
+    pub fn agent_id_for_author(&self, author_id: &str) -> AgentId {
+        let mut agent_id = self.agent_id.clone();
+        if let Some((_, trace_id)) = author_id.split_once("::")
+            && let Some(model) = self.trace_models.get(trace_id)
+        {
+            agent_id.model = model.clone();
+        }
+        agent_id
+    }
+
+    pub fn record_trace_model(&mut self, trace_id: &str, model: &str) {
+        self.trace_models
+            .entry(trace_id.to_string())
+            .or_insert_with(|| model.to_string());
+    }
+
+    /// Preserve every observed trace while keeping the receiver's legacy defaults.
+    pub fn merge_from(&mut self, other: &Self) {
+        for (trace_id, model) in &other.trace_models {
+            self.record_trace_model(trace_id, model);
+        }
+    }
+
+    /// Finalize newly generated metadata against its actual line references.
+    /// Keep the legacy session default even when no trace mapping is referenced.
+    pub fn retain_referenced_trace_models<'a>(
+        sessions: &mut BTreeMap<String, Self>,
+        author_ids: impl IntoIterator<Item = &'a str>,
+    ) {
+        let mut referenced: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for author_id in author_ids {
+            if let Some((session_id, trace_id)) = author_id.split_once("::") {
+                referenced.entry(session_id).or_default().insert(trace_id);
+            }
+        }
+        for (session_id, session) in sessions {
+            session.trace_models.retain(|trace_id, _| {
+                referenced
+                    .get(session_id.as_str())
+                    .is_some_and(|traces| traces.contains(trace_id.as_str()))
+            });
+        }
+    }
+
+    /// Convert to a PromptRecord (with zeroed stats) for backwards-compatible lookup.
     pub fn to_prompt_record(&self) -> PromptRecord {
+        self.to_prompt_record_for_author("")
+    }
+
+    pub fn to_prompt_record_for_author(&self, author_id: &str) -> PromptRecord {
         PromptRecord {
-            agent_id: self.agent_id.clone(),
+            agent_id: self.agent_id_for_author(author_id),
             human_author: self.human_author.clone(),
             messages_url: None,
             total_additions: 0,
@@ -240,6 +293,68 @@ impl SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_trace_models_retain_only_referenced_session_traces() {
+        let record: SessionRecord = serde_json::from_value(serde_json::json!({
+            "agent_id": {"tool": "fixture", "id": "conversation", "model": "default-model"},
+            "trace_models": {"t_keep": "model-A", "t_drop": "model-B"},
+            "human_author": "author",
+        }))
+        .unwrap();
+        let mut sessions = BTreeMap::from([
+            ("s_one".to_string(), record.clone()),
+            ("s_two".to_string(), record.clone()),
+        ]);
+        SessionRecord::retain_referenced_trace_models(&mut sessions, ["s_one::t_keep", "s_two"]);
+        assert_eq!(
+            sessions["s_one"].trace_models,
+            BTreeMap::from([("t_keep".to_string(), "model-A".to_string())])
+        );
+        assert!(
+            sessions["s_two"].trace_models.is_empty(),
+            "a bare session is not a reference to every trace"
+        );
+        for session in sessions.values() {
+            assert_eq!(session.agent_id, record.agent_id);
+            assert_eq!(session.human_author, record.human_author);
+        }
+        assert_eq!(
+            record.trace_models.len(),
+            2,
+            "source metadata remains unchanged"
+        );
+    }
+
+    #[test]
+    fn session_trace_models_keep_conversation_identity_and_merge() {
+        let legacy = serde_json::json!({
+            "agent_id": {"tool": "fixture", "id": "real-conversation", "model": "model-A"},
+            "human_author": null,
+        });
+        let mut first: SessionRecord = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(first.trace_models.is_empty());
+        assert_eq!(
+            first.agent_id_for_author("s_fixture::t_legacy").model,
+            "model-A"
+        );
+        first.record_trace_model("t_first", "model-A");
+        let mut second: SessionRecord = serde_json::from_value(legacy).unwrap();
+        second.agent_id.model = "model-B".into();
+        second.record_trace_model("t_second", "model-B");
+        first.merge_from(&second);
+        assert_eq!(first.agent_id.model, "model-A");
+        for (trace, model) in [("t_first", "model-A"), ("t_second", "model-B")] {
+            let author = format!("s_fixture::{trace}");
+            let prompt = first.to_prompt_record_for_author(&author);
+            assert_eq!(prompt.agent_id.id, "real-conversation");
+            assert_eq!(prompt.agent_id.tool, "fixture");
+            assert_eq!(prompt.agent_id.model, model);
+        }
+        let encoded = serde_json::to_string(&first).unwrap();
+        let decoded: SessionRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, first);
+    }
 
     // --- LineRange::shift regression tests ---
 

@@ -160,6 +160,7 @@ pub fn fill_unattributed_lines(
     authorship_log.metadata.sessions.insert(
         session_key,
         SessionRecord {
+            trace_models: std::collections::BTreeMap::from([(trace_id, agent_id.model.clone())]),
             agent_id,
             human_author: Some(human_author.to_string()),
             custom_attributes: None,

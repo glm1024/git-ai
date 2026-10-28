@@ -1,5 +1,8 @@
 pub mod parse;
 
+#[cfg(test)]
+mod zcode_tests;
+
 mod agent_v1;
 mod ai_tab;
 mod amp;
@@ -20,6 +23,7 @@ mod mock_known_human;
 mod opencode;
 mod pi;
 mod windsurf;
+mod zcode;
 
 use crate::authorship::working_log::AgentId;
 use crate::error::GitAiError;
@@ -44,6 +48,26 @@ pub enum ParsedHookEvent {
     PostBashCall(PostBashCall),
     KnownHumanEdit(KnownHumanEdit),
     UntrackedEdit(UntrackedEdit),
+    SessionActivity(SessionActivity),
+    FailedToolCall(FailedToolCall),
+}
+
+/// Register usage independently of code edits, including prompt-only sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionActivity {
+    pub context: PresetContext,
+    pub stream_source: StreamSource,
+    pub observed_at_millis: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedToolCall {
+    pub context: PresetContext,
+    pub tool_use_id: String,
+    pub file_paths: Vec<PathBuf>,
+    pub bash: bool,
+    pub command: Option<String>,
+    pub stream_source: Option<StreamSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +148,7 @@ pub enum StreamFormat {
     CopilotEventStreamJsonl,
     AmpThreadJson,
     OpenCodeSqlite,
+    ZCodeSqlite,
     PiJsonl,
 }
 
@@ -143,6 +168,7 @@ impl StreamFormat {
                 WatermarkType::RecordIndex
             }
             Self::OpenCodeSqlite => WatermarkType::Timestamp,
+            Self::ZCodeSqlite => WatermarkType::ZCodeUsage,
         }
     }
 }
@@ -168,6 +194,7 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, GitAiError> {
         "agent-v1" => Ok(Box::new(agent_v1::AgentV1Preset)),
         "droid" => Ok(Box::new(droid::DroidPreset)),
         "opencode" => Ok(Box::new(opencode::OpenCodePreset)),
+        "zcode" => Ok(Box::new(zcode::ZCodePreset)),
         "kilo" => Ok(Box::new(kilo::KiloPreset)),
         "pi" => Ok(Box::new(pi::PiPreset)),
         "human" => Ok(Box::new(human::HumanPreset)),

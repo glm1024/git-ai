@@ -234,6 +234,7 @@ fn extract_attributions_from_log_shifted(
     for (key, record) in &log.metadata.sessions {
         sessions
             .entry(key.clone())
+            .and_modify(|existing| existing.merge_from(record))
             .or_insert_with(|| record.clone());
     }
     for (key, record) in &log.metadata.humans {

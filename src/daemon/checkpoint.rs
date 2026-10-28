@@ -356,7 +356,8 @@ fn checkpoint_metric_custom_attributes(
     checkpoint_metadata: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut merged = configured.clone();
-    if checkpoint_metadata.get("integration").map(String::as_str) != Some("kilo-v7") {
+    let integration = checkpoint_metadata.get("integration").map(String::as_str);
+    if !matches!(integration, Some("kilo-v7" | "zcode")) {
         return merged;
     }
 
@@ -370,10 +371,12 @@ fn checkpoint_metric_custom_attributes(
         }
     };
     copy("platform", "ide");
-    copy("platform", "kilo_platform");
-    copy("client", "kilo_client");
+    if integration == Some("kilo-v7") {
+        copy("platform", "kilo_platform");
+        copy("client", "kilo_client");
+        copy("kilo_version", "kilo_version");
+    }
     copy("editor_name", "editor_name");
-    copy("kilo_version", "kilo_version");
     copy("integration", "integration");
     copy("model_provider", "model_provider");
     merged
@@ -593,7 +596,16 @@ fn prepare_resolved_checkpoint(
         checkpoint.line_stats = compute_line_stats(&file_stats)?;
         checkpoint.trace_id = Some(trace_id.clone());
 
-        if kind.is_ai() {
+        if kind.is_ai()
+            || (kind == CheckpointKind::Human
+                && matches!(
+                    checkpoint_request
+                        .metadata
+                        .get("tool_outcome")
+                        .map(String::as_str),
+                    Some("failed" | "backgrounded")
+                ))
+        {
             checkpoint.agent_id = checkpoint_request.agent_id.clone();
             checkpoint.agent_metadata = if checkpoint_request.metadata.is_empty() {
                 None
@@ -1389,6 +1401,29 @@ mod kilo_runtime_metadata_tests {
     use super::*;
     use crate::authorship::working_log::WorkingLogEntry;
     use crate::metrics::PosEncoded;
+
+    #[test]
+    fn zcode_checkpoint_metrics_preserve_identity_without_leaking_source_paths() {
+        let configured = HashMap::from([("organization_id".into(), "org".into())]);
+        let metadata = HashMap::from([
+            ("integration".into(), "zcode".into()),
+            ("platform".into(), "zcode".into()),
+            ("editor_name".into(), "ZCode".into()),
+            ("model_provider".into(), "zai".into()),
+            ("database_path".into(), "/private/db.sqlite".into()),
+            ("tool_use_id".into(), "private-call".into()),
+        ]);
+        let attrs = checkpoint_metric_custom_attributes(&configured, &metadata);
+        assert_eq!(attrs.get("ide").map(String::as_str), Some("zcode"));
+        assert_eq!(attrs.get("model_provider").map(String::as_str), Some("zai"));
+        assert_eq!(
+            attrs.get("organization_id").map(String::as_str),
+            Some("org")
+        );
+        assert!(!attrs.contains_key("database_path"));
+        assert!(!attrs.contains_key("tool_use_id"));
+        assert!(!attrs.contains_key("kilo_platform"));
+    }
 
     #[test]
     fn root_checkpoint_metric_uses_null_base_commit() {

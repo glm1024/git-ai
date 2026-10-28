@@ -63,6 +63,28 @@ pub(crate) fn compact_session_event(
         );
     }
 
+    if tool == "zcode" && raw.get("zcode_usage").is_some() {
+        let mut custom = sparse_get_string(&attrs, attr_pos::CUSTOM_ATTRIBUTES)
+            .flatten()
+            .and_then(|value| serde_json::from_str::<serde_json::Map<String, Value>>(&value).ok())
+            .unwrap_or_default();
+        custom.insert("ide".to_string(), Value::String("zcode".to_string()));
+        custom.insert(
+            "integration".to_string(),
+            Value::String("zcode".to_string()),
+        );
+        if let Some(provider) = token.as_ref().and_then(|usage| usage.provider.as_ref()) {
+            custom.insert(
+                "model_provider".to_string(),
+                Value::String(provider.clone()),
+            );
+        }
+        attrs.insert(
+            attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+            Value::String(Value::Object(custom).to_string()),
+        );
+    }
+
     SessionObservation {
         timestamp,
         attrs,
@@ -80,6 +102,49 @@ fn extract_token_snapshot(
     external_event_id: Option<&str>,
     baseline_only: bool,
 ) -> Option<TokenSnapshot> {
+    // ZCode's canonical model_usage rows are request-attempt facts. Input
+    // already includes cache reads/writes, and output already includes reasoning.
+    // The enterprise wire contract carries ordinary input plus separate cache
+    // categories, so subtract cache once instead of inflating total usage.
+    if tool == "zcode" {
+        let usage = raw.get("zcode_usage")?;
+        if !matches!(
+            usage.get("status").and_then(Value::as_str),
+            Some("completed" | "error" | "cancelled")
+        ) {
+            return None;
+        }
+        let id = usage
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())?;
+        let input_total = non_negative(usage, "input_tokens");
+        let output = non_negative(usage, "output_tokens");
+        let cache_read = non_negative(usage, "cache_read_input_tokens");
+        let cache_write = non_negative(usage, "cache_creation_input_tokens");
+        // Impossible cache detail must not create token volume beyond the
+        // provider-normalized total. Preserve valid detail, cap malformed rows.
+        let cache_read = cache_read.min(input_total);
+        let cache_write = cache_write.min(input_total - cache_read);
+        return Some(TokenSnapshot {
+            source_key: hashed_source_key(tool, session_id, "model-request-attempt", id),
+            input: input_total - cache_read - cache_write,
+            output,
+            cache_read,
+            cache_write,
+            model: usage
+                .get("model_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            provider: usage
+                .get("provider_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            cumulative: false,
+            baseline_only,
+        });
+    }
+
     // Codex reports an absolute session total. Prefer it over last_token_usage
     // when both are present so replay and repeated token_count events cannot
     // inflate usage.
@@ -328,6 +393,63 @@ mod tests {
         assert_eq!(final_token.model.as_deref(), Some("claude-sonnet-4"));
         assert_eq!(final_token.provider.as_deref(), Some("anthropic"));
         assert!(!final_token.source_key.contains("msg-1"));
+    }
+
+    #[test]
+    fn zcode_request_projection_subtracts_cached_input_and_uses_stable_attempt_id() {
+        let raw = json!({"zcode_usage": {
+            "id": "usage-attempt-0", "logical_request_id": "logical-1", "session_id": "s",
+            "provider_id": "zai-plan", "model_id": "glm-4.7", "status": "error",
+            "input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 10, "reasoning_tokens": 9
+        }});
+        let first = compact_session_event(&raw, 200, attrs("zcode", "s"), None, None, None);
+        let repeated = compact_session_event(&raw, 201, attrs("zcode", "s"), None, None, None);
+        let token = first.token.unwrap();
+        assert_eq!(
+            (
+                token.input,
+                token.output,
+                token.cache_read,
+                token.cache_write
+            ),
+            (60, 20, 30, 10)
+        );
+        assert_eq!(
+            token.input + token.output + token.cache_read + token.cache_write,
+            120
+        );
+        assert_eq!(token.source_key, repeated.token.unwrap().source_key);
+        let mut second = raw.clone();
+        second["zcode_usage"]["id"] = json!("usage-attempt-1");
+        assert_ne!(
+            token.source_key,
+            compact_session_event(&second, 202, attrs("zcode", "s"), None, None, None)
+                .token
+                .unwrap()
+                .source_key
+        );
+        assert_eq!(token.provider.as_deref(), Some("zai-plan"));
+        let custom: Value = serde_json::from_str(
+            &sparse_get_string(&first.attrs, attr_pos::CUSTOM_ATTRIBUTES)
+                .flatten()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(custom["ide"], "zcode");
+        assert_eq!(custom["model_provider"], "zai-plan");
+        assert_eq!(
+            sparse_get_string(&first.attrs, attr_pos::MODEL)
+                .flatten()
+                .as_deref(),
+            Some("glm-4.7")
+        );
+        second["zcode_usage"]["status"] = json!("running");
+        assert!(
+            compact_session_event(&second, 203, attrs("zcode", "s"), None, None, None)
+                .token
+                .is_none()
+        );
     }
 
     #[test]

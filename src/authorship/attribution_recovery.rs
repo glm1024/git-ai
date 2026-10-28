@@ -22,7 +22,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const BASH_RECOVERY_WINDOW_NS: u128 = 3_000_000_000;
 const BASH_RECOVERY_COARSE_TIMESTAMP_NS: u128 = 1_000_000_000;
 pub(crate) const SESSION_EVENT_RECOVERY_WINDOW_NS: u128 = 3_000_000_000;
-const EDGE_EXTENSION_MAX_LINES: usize = 3;
 const NS_PER_SECOND: u128 = 1_000_000_000;
 
 const CODEX_TOOLS: &[&str] = &["codex", "codex-cloud"];
@@ -161,6 +160,25 @@ const KNOWN_COMMIT_AGENT_KINDS: &[CommitAgentKind] = &[
 pub(crate) type FileTimestampsByPath = HashMap<String, Vec<u128>>;
 pub(crate) type UnknownLinesByFile = BTreeMap<String, Vec<u32>>;
 
+#[derive(Default)]
+pub(crate) struct RecoveryProtection {
+    pub(crate) overwritten: UnknownLinesByFile,
+    pub(crate) preexisting: UnknownLinesByFile,
+}
+
+impl RecoveryProtection {
+    pub(crate) fn extend(&mut self, other: Self) {
+        for (target, source) in [
+            (&mut self.overwritten, other.overwritten),
+            (&mut self.preexisting, other.preexisting),
+        ] {
+            for (path, lines) in source {
+                target.entry(path).or_default().extend(lines);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CommitAgentKind {
     key: &'static str,
@@ -199,6 +217,11 @@ struct CommitMetadataSessionSelection {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct AttributionRecoveryContext<'a> {
     pub(crate) file_timestamps: Option<&'a FileTimestampsByPath>,
+    pub(crate) protected_lines: Option<&'a UnknownLinesByFile>,
+    /// Untracked text already observed before a direct edit cannot be claimed
+    /// by broad session/commit markers. A recorded Bash operation may still
+    /// supply independent evidence (for example a nested file edit inside Bash).
+    pub(crate) preexisting_lines: Option<&'a UnknownLinesByFile>,
     pub(crate) precomputed_parent_diff: Option<&'a DiffTreeResult>,
     pub(crate) before_external_recovery: Option<&'a dyn Fn(&UnknownLinesByFile)>,
 }
@@ -237,6 +260,7 @@ pub(crate) fn recover_attribution(
             return Ok(());
         }
     };
+    let filtered_hunks = exclude_protected_lines(filtered_hunks, context.protected_lines);
     let committed_hunks = &filtered_hunks;
     if committed_hunks.is_empty() {
         return Ok(());
@@ -252,20 +276,16 @@ pub(crate) fn recover_attribution(
         context.file_timestamps,
     )?;
 
-    recover_adjacent_edges(
-        repo,
-        parent_sha,
-        commit_sha,
-        authorship_log,
-        committed_hunks,
-    )?;
-    let unknown_after_edges = unknown_lines_by_file(authorship_log, committed_hunks);
-    if unknown_after_edges.is_empty() {
+    let filtered_hunks = exclude_protected_lines(filtered_hunks, context.preexisting_lines);
+    let committed_hunks = &filtered_hunks;
+
+    let unknown_before_external = unknown_lines_by_file(authorship_log, committed_hunks);
+    if unknown_before_external.is_empty() {
         return Ok(());
     }
 
     if let Some(before_external_recovery) = context.before_external_recovery {
-        before_external_recovery(&unknown_after_edges);
+        before_external_recovery(&unknown_before_external);
     }
 
     let mut metrics_db_unavailable = false;
@@ -572,6 +592,7 @@ fn recover_bash_mtime(
             timestamps,
             &existing_commit_sessions,
             &repo_work_dir,
+            Some(&file_path),
         ) else {
             continue;
         };
@@ -589,7 +610,13 @@ fn recover_bash_mtime(
         let trace_id = generate_trace_id();
         let session_id = generate_session_id(&agent_id.id, &agent_id.tool);
         let author_id = format!("{}::{}", session_id, trace_id);
-        insert_session_record(authorship_log, &session_id, &agent_id, human_author);
+        insert_session_record(
+            authorship_log,
+            &session_id,
+            &agent_id,
+            human_author,
+            &trace_id,
+        );
         add_attestation(authorship_log, &file_path, &author_id, &unknown_lines);
 
         let metadata = json!({
@@ -721,7 +748,7 @@ fn recover_session_event_mtime(
         let candidate = selection.candidate;
         let trace_id = generate_trace_id();
         let author_id = format!("{}::{}", candidate.session_id, trace_id);
-        insert_session_event_record(authorship_log, candidate, human_author);
+        insert_session_event_record(authorship_log, candidate, human_author, &trace_id);
         add_attestation(authorship_log, &file_path, &author_id, &unknown_lines);
 
         let selected_model = session_event_model(candidate);
@@ -809,6 +836,7 @@ fn recover_commit_metadata(
         .entry(selection.session_id.clone())
         .or_insert_with(|| SessionRecord {
             agent_id: selection.agent_id.clone(),
+            trace_models: Default::default(),
             human_author: Some(human_author.to_string()),
             custom_attributes: None,
         });
@@ -827,6 +855,13 @@ fn recover_commit_metadata(
     for (file_path, unknown_lines) in unknown_by_file {
         let trace_id = generate_trace_id();
         let author_id = format!("{}::{}", selection.session_id, trace_id);
+        if let Some(session) = authorship_log
+            .metadata
+            .sessions
+            .get_mut(&selection.session_id)
+        {
+            session.record_trace_model(&trace_id, &selection.agent_id.model);
+        }
         add_attestation(authorship_log, file_path, &author_id, unknown_lines);
 
         let file_timestamps = timestamps_by_file
@@ -1414,82 +1449,6 @@ fn agent_kind_matches_tool(kind: &CommitAgentKind, tool: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(tool))
 }
 
-fn recover_adjacent_edges(
-    repo: &Repository,
-    parent_sha: &str,
-    commit_sha: &str,
-    authorship_log: &mut AuthorshipLog,
-    committed_hunks: &HashMap<String, Vec<LineRange>>,
-) -> Result<(), GitAiError> {
-    let unknown = unknown_lines_by_file(authorship_log, committed_hunks);
-    for (file_path, unknown_lines) in unknown {
-        let line_to_author = line_author_map(authorship_log, &file_path);
-        let runs = contiguous_runs(&unknown_lines);
-        for run in runs {
-            let Some(recovery) = edge_recovery_for_run(&line_to_author, &run) else {
-                continue;
-            };
-            let trace_id = generate_trace_id();
-            let source_session = recovery
-                .source_author
-                .split("::")
-                .next()
-                .unwrap_or(&recovery.source_author)
-                .to_string();
-            let (tool, model, external_session_id) = authorship_log
-                .metadata
-                .sessions
-                .get(&source_session)
-                .map(|session| {
-                    (
-                        session.agent_id.tool.clone(),
-                        session.agent_id.model.clone(),
-                        session.agent_id.id.clone(),
-                    )
-                })
-                .unwrap_or_default();
-            let recovered_author = if source_session.starts_with("s_") {
-                format!("{}::{}", source_session, trace_id)
-            } else {
-                recovery.source_author.clone()
-            };
-            let recovered_line_count = recovery.lines.len() as u32;
-            add_attestation(
-                authorship_log,
-                &file_path,
-                &recovered_author,
-                &recovery.lines,
-            );
-
-            let metadata = json!({
-                "solver": "edge_extension",
-                "file_path": file_path,
-                "source_author": &recovery.source_author,
-                "recovered_lines": &recovery.lines,
-            });
-            record_recovery_metric(RecoveryMetricInput {
-                repo,
-                parent_sha,
-                commit_sha,
-                file_path: &file_path,
-                author_id: &recovered_author,
-                session_id: &source_session,
-                trace_id: &trace_id,
-                tool: &tool,
-                model: &model,
-                external_session_id: &external_session_id,
-                external_tool_use_id: None,
-                edit_kind: "attribution_recovery_edge",
-                checkpoint_type: "recovered_edge_extension",
-                recovered_line_count,
-                metadata,
-                event_ts: None,
-            })?;
-        }
-    }
-    Ok(())
-}
-
 fn repo_worktree_key(repo: &Repository) -> Result<String, GitAiError> {
     let workdir = repo.workdir()?;
     let normalized = worktree_root_for_path(&workdir).unwrap_or(workdir);
@@ -1532,10 +1491,17 @@ fn select_best_bash_candidate<'a>(
     timestamps: &[u128],
     existing_commit_sessions: &HashSet<String>,
     target_repo_work_dir: &str,
+    committed_file_path: Option<&str>,
 ) -> Option<BashCandidateSelection<'a>> {
     candidates
         .iter()
         .filter_map(|candidate| {
+            if candidate.agent_id.tool == "zcode"
+                && !committed_file_path
+                    .is_some_and(|path| zcode_bash_scope_contains(candidate, path))
+            {
+                return None;
+            }
             // A nearby timestamp is only a correlation signal.  Do not let a
             // Bash call from an unrelated worktree (or merely an ancestor
             // cwd) claim unknown lines in this commit.  Cross-repository Bash
@@ -1606,11 +1572,38 @@ impl BashCandidateTier {
     }
 }
 
+fn zcode_bash_scope_contains(candidate: &BashCheckpointCall, file_path: &str) -> bool {
+    use crate::commands::checkpoint_agent::bash_tool::canonical_bash_scope_path;
+    let Some(file_path) = canonical_bash_scope_path(file_path) else {
+        return false;
+    };
+    let Some(scope) = candidate.metadata.get("bash_changed_paths") else {
+        return false;
+    };
+    let Ok(paths) = serde_json::from_str::<Vec<String>>(scope) else {
+        return false;
+    };
+    !paths.is_empty()
+        && paths
+            .iter()
+            .all(|path| canonical_bash_scope_path(path).as_ref() == Some(path))
+        && paths.contains(&file_path)
+}
+
 fn bash_candidate_tier(
     candidate: &BashCheckpointCall,
     existing_commit_sessions: &HashSet<String>,
     target_repo_work_dir: &str,
 ) -> Option<BashCandidateTier> {
+    // ZCode is a new integration: only a completed, positively successful call
+    // supplies recovery evidence. Legacy tools retain their existing contract.
+    if candidate.agent_id.tool == "zcode"
+        && (candidate.end_time_ns.is_none()
+            || candidate.metadata.get("tool_outcome").map(String::as_str) != Some("succeeded"))
+    {
+        return None;
+    }
+
     if candidate.repo_work_dir.as_deref() != Some(target_repo_work_dir) {
         return None;
     }
@@ -1760,6 +1753,7 @@ fn insert_session_record(
     session_id: &str,
     agent_id: &AgentId,
     human_author: &str,
+    trace_id: &str,
 ) {
     authorship_log
         .metadata
@@ -1767,15 +1761,18 @@ fn insert_session_record(
         .entry(session_id.to_string())
         .or_insert_with(|| SessionRecord {
             agent_id: agent_id.clone(),
+            trace_models: Default::default(),
             human_author: Some(human_author.to_string()),
             custom_attributes: None,
-        });
+        })
+        .record_trace_model(trace_id, &agent_id.model);
 }
 
 fn insert_session_event_record(
     authorship_log: &mut AuthorshipLog,
     candidate: &SessionEventRecoveryCandidate,
     human_author: &str,
+    trace_id: &str,
 ) {
     authorship_log
         .metadata
@@ -1787,9 +1784,11 @@ fn insert_session_event_record(
                 id: candidate.external_session_id.clone(),
                 model: session_event_model(candidate),
             },
+            trace_models: Default::default(),
             human_author: Some(human_author.to_string()),
             custom_attributes: None,
-        });
+        })
+        .record_trace_model(trace_id, &session_event_model(candidate));
 }
 
 fn session_event_model(candidate: &SessionEventRecoveryCandidate) -> String {
@@ -1798,6 +1797,31 @@ fn session_event_model(candidate: &SessionEventRecoveryCandidate) -> String {
         .clone()
         .filter(|model| !model.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Exclude checkpoint provenance that the heuristic solvers must not override.
+/// Apply this after logical diff validation even when every candidate is protected.
+pub(crate) fn exclude_protected_lines(
+    mut committed_hunks: HashMap<String, Vec<LineRange>>,
+    protected_lines: Option<&UnknownLinesByFile>,
+) -> HashMap<String, Vec<LineRange>> {
+    let Some(protected_lines) = protected_lines else {
+        return committed_hunks;
+    };
+    committed_hunks.retain(|file_path, ranges| {
+        let Some(protected) = protected_lines.get(file_path) else {
+            return true;
+        };
+        let protected: HashSet<u32> = protected.iter().copied().collect();
+        let remaining: Vec<u32> = ranges
+            .iter()
+            .flat_map(LineRange::expand)
+            .filter(|line| !protected.contains(line))
+            .collect();
+        *ranges = LineRange::compress_lines(&remaining);
+        !ranges.is_empty()
+    });
+    committed_hunks
 }
 
 fn unknown_lines_by_file(
@@ -1836,109 +1860,6 @@ fn covered_lines_by_file(authorship_log: &AuthorshipLog) -> HashMap<String, Hash
         }
     }
     covered
-}
-
-fn line_author_map(authorship_log: &AuthorshipLog, file_path: &str) -> BTreeMap<u32, String> {
-    let mut map = BTreeMap::new();
-    let Some(file_attestation) = authorship_log
-        .attestations
-        .iter()
-        .find(|att| att.file_path == file_path)
-    else {
-        return map;
-    };
-    for entry in &file_attestation.entries {
-        for line in entry.line_ranges.iter().flat_map(LineRange::expand) {
-            map.insert(line, entry.hash.clone());
-        }
-    }
-    map
-}
-
-fn contiguous_runs(lines: &[u32]) -> Vec<Vec<u32>> {
-    if lines.is_empty() {
-        return Vec::new();
-    }
-    let mut sorted = lines.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-
-    let mut runs: Vec<Vec<u32>> = Vec::new();
-    let mut current = vec![sorted[0]];
-    for line in sorted.into_iter().skip(1) {
-        if line == current.last().copied().unwrap_or(line) + 1 {
-            current.push(line);
-        } else {
-            runs.push(current);
-            current = vec![line];
-        }
-    }
-    runs.push(current);
-    runs
-}
-
-struct EdgeRecovery {
-    source_author: String,
-    lines: Vec<u32>,
-}
-
-fn edge_recovery_for_run(
-    line_to_author: &BTreeMap<u32, String>,
-    run: &[u32],
-) -> Option<EdgeRecovery> {
-    let first = *run.first()?;
-    let last = *run.last()?;
-    let prev = first
-        .checked_sub(1)
-        .and_then(|line| line_to_author.get(&line));
-    let next = line_to_author.get(&(last + 1));
-
-    match (prev, next) {
-        (Some(left), Some(right))
-            if is_ai_attestation(left)
-                && is_ai_attestation(right)
-                && ai_session_key(left) == ai_session_key(right) =>
-        {
-            let mut lines = run
-                .iter()
-                .take(EDGE_EXTENSION_MAX_LINES)
-                .copied()
-                .collect::<Vec<_>>();
-            lines.extend(run.iter().rev().take(EDGE_EXTENSION_MAX_LINES).copied());
-            lines.sort_unstable();
-            lines.dedup();
-            Some(EdgeRecovery {
-                source_author: left.clone(),
-                lines,
-            })
-        }
-        (Some(left), None) if is_ai_attestation(left) => Some(EdgeRecovery {
-            source_author: left.clone(),
-            lines: run.iter().take(EDGE_EXTENSION_MAX_LINES).copied().collect(),
-        }),
-        (None, Some(right)) if is_ai_attestation(right) => Some(EdgeRecovery {
-            source_author: right.clone(),
-            lines: run
-                .iter()
-                .rev()
-                .take(EDGE_EXTENSION_MAX_LINES)
-                .copied()
-                .collect(),
-        }),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-fn edge_recovered_lines(line_to_author: &BTreeMap<u32, String>, run: &[u32]) -> Option<Vec<u32>> {
-    edge_recovery_for_run(line_to_author, run).map(|mut recovery| {
-        recovery.lines.sort_unstable();
-        recovery.lines
-    })
-}
-
-fn is_ai_attestation(author: &str) -> bool {
-    author != CheckpointKind::Human.to_str() && !author.starts_with("h_")
 }
 
 fn ai_session_key(author: &str) -> &str {
@@ -2458,6 +2379,100 @@ mod tests {
     }
 
     #[test]
+    fn zcode_bash_recovery_requires_the_actual_committed_file_in_observed_scope() {
+        let mut candidate = bash_call(1, "session", "call", "/repo", 1_000, Some(2_000));
+        candidate.agent_id.tool = "zcode".into();
+        candidate
+            .metadata
+            .insert("tool_outcome".into(), "succeeded".into());
+        for (scope, allowed) in [
+            (None, false),
+            (Some("[]"), false),
+            (Some("not-json"), false),
+            (Some(r#"["src/other.rs"]"#), false),
+            (Some(r#"["src/file.rs"]"#), true),
+            (Some(r#"["src/file.rs", "../outside.rs"]"#), false),
+            (Some(r#"["/src/file.rs"]"#), false),
+        ] {
+            candidate.metadata.remove("bash_changed_paths");
+            if let Some(scope) = scope {
+                candidate
+                    .metadata
+                    .insert("bash_changed_paths".into(), scope.into());
+            }
+            // Both files have identical mtimes inside the successful call window.
+            let actual = select_best_bash_candidate(
+                &[candidate.clone()],
+                &[1_500],
+                &HashSet::new(),
+                "/repo",
+                Some("src/file.rs"),
+            )
+            .is_some();
+            assert_eq!(actual, allowed, "scope={scope:?}");
+            assert!(
+                select_best_bash_candidate(
+                    &[candidate.clone()],
+                    &[1_500],
+                    &HashSet::new(),
+                    "/repo",
+                    Some("manual.rs")
+                )
+                .is_none()
+            );
+        }
+        candidate.agent_id.tool = "codex".into();
+        candidate.metadata.remove("bash_changed_paths");
+        assert!(
+            select_best_bash_candidate(
+                &[candidate],
+                &[1_500],
+                &HashSet::new(),
+                "/repo",
+                Some("manual.rs")
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn zcode_bash_recovery_requires_proven_terminal_success() {
+        for (end, outcome, expected) in [
+            (None, None, false),
+            (Some(2_000), None, false),
+            (Some(2_000), Some("pending"), false),
+            (Some(2_000), Some("failed"), false),
+            (Some(2_000), Some("backgrounded"), false),
+            (None, Some("succeeded"), false),
+            (Some(2_000), Some("succeeded"), true),
+        ] {
+            let mut candidate = bash_call(1, "session", "call", "/repo", 1_000, end);
+            candidate.agent_id.tool = "zcode".into();
+            candidate
+                .metadata
+                .insert("bash_changed_paths".into(), r#"["file.txt"]"#.into());
+            if let Some(outcome) = outcome {
+                candidate
+                    .metadata
+                    .insert("tool_outcome".into(), outcome.into());
+            }
+            let selected = select_best_bash_candidate(
+                &[candidate],
+                &[1_500],
+                &HashSet::new(),
+                "/repo",
+                Some("file.txt"),
+            )
+            .is_some();
+            assert_eq!(selected, expected, "outcome={outcome:?} end={end:?}");
+        }
+        let legacy = bash_call(2, "legacy", "call", "/repo", 1_000, None);
+        assert!(
+            select_best_bash_candidate(&[legacy], &[1_500], &HashSet::new(), "/repo", None).is_some()
+        );
+    }
+
+    #[test]
     fn bash_candidate_ranking_prefers_session_already_in_commit() {
         let existing_session = generate_session_id("existing-session", "codex");
         let existing_sessions = HashSet::from([existing_session]);
@@ -2467,7 +2482,7 @@ mod tests {
         ];
 
         let selection =
-            select_best_bash_candidate(&candidates, &[1_050], &existing_sessions, "/repo")
+            select_best_bash_candidate(&candidates, &[1_050], &existing_sessions, "/repo", None)
                 .expect("expected candidate");
 
         assert_eq!(selection.candidate.tool_use_id, "tool-existing");
@@ -2486,7 +2501,7 @@ mod tests {
         ];
 
         let selection =
-            select_best_bash_candidate(&candidates, &[1_050], &existing_sessions, "/repo")
+            select_best_bash_candidate(&candidates, &[1_050], &existing_sessions, "/repo", None)
                 .expect("expected candidate");
 
         assert_eq!(selection.candidate.tool_use_id, "tool-near");
@@ -2507,7 +2522,7 @@ mod tests {
         )];
 
         assert!(
-            select_best_bash_candidate(&candidates, &[1_050], &existing_sessions, "/repo")
+            select_best_bash_candidate(&candidates, &[1_050], &existing_sessions, "/repo", None)
                 .is_none(),
             "the same session in a commit does not prove that a Bash call wrote across repositories"
         );
@@ -2527,9 +2542,14 @@ mod tests {
             bash_call(2, "closer-session", "tool-closer", "/other", 1_040, None),
         ];
 
-        let selection =
-            select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/tmp/work/repo")
-                .expect("expected candidate");
+        let selection = select_best_bash_candidate(
+            &candidates,
+            &[1_050],
+            &HashSet::new(),
+            "/tmp/work/repo",
+            None,
+        )
+        .expect("expected candidate");
 
         assert_eq!(selection.candidate.tool_use_id, "tool-same-worktree");
         assert_eq!(selection.tier, BashCandidateTier::SameWorktree);
@@ -2556,9 +2576,14 @@ mod tests {
             ),
         ];
 
-        let selection =
-            select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/tmp/work/repo")
-                .expect("expected candidate");
+        let selection = select_best_bash_candidate(
+            &candidates,
+            &[1_050],
+            &HashSet::new(),
+            "/tmp/work/repo",
+            None,
+        )
+        .expect("expected candidate");
 
         assert_eq!(selection.candidate.tool_use_id, "tool-same-worktree");
         assert_eq!(selection.tier, BashCandidateTier::SameWorktree);
@@ -2579,8 +2604,14 @@ mod tests {
         ];
 
         assert!(
-            select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/tmp/work/repo")
-                .is_none(),
+            select_best_bash_candidate(
+                &candidates,
+                &[1_050],
+                &HashSet::new(),
+                "/tmp/work/repo",
+                None
+            )
+            .is_none(),
             "an ancestor cwd does not prove that the Bash call wrote the target repository"
         );
     }
@@ -2593,7 +2624,7 @@ mod tests {
         ];
 
         assert!(
-            select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/repo").is_none(),
+            select_best_bash_candidate(&candidates, &[1_050], &HashSet::new(), "/repo", None).is_none(),
             "time proximity alone must not turn an unrelated repository write into AI code"
         );
     }
@@ -2614,7 +2645,8 @@ mod tests {
                 &candidates,
                 &[1_050],
                 &HashSet::new(),
-                "/tmp/work/nested-repo"
+                "/tmp/work/nested-repo",
+                None
             )
             .is_none(),
             "path ancestry does not prove that nested repositories were inside the observed worktree scope"
@@ -2714,7 +2746,7 @@ mod tests {
         ];
 
         let selection =
-            select_best_bash_candidate(&candidates, &[1_500], &existing_sessions, "/repo");
+            select_best_bash_candidate(&candidates, &[1_500], &existing_sessions, "/repo", None);
 
         assert!(
             selection.is_none(),
@@ -2733,62 +2765,71 @@ mod tests {
             Some(3_000_000_000),
         )];
 
-        let selection =
-            select_best_bash_candidate(&candidates, &[2_000_000_000], &HashSet::new(), "/repo")
-                .expect("expected coarse timestamp to match");
+        let selection = select_best_bash_candidate(
+            &candidates,
+            &[2_000_000_000],
+            &HashSet::new(),
+            "/repo",
+            None,
+        )
+        .expect("expected coarse timestamp to match");
 
         assert_eq!(selection.candidate.tool_use_id, "tool-coarse");
         assert_eq!(selection.distance_ns, 500_000_000);
     }
 
     #[test]
-    fn edge_recovery_extends_one_sided_runs_and_bridges_matching_ai_neighbors() {
-        let map = BTreeMap::from([
-            (1, "s_a::t_1".to_string()),
-            (3, "s_a::t_2".to_string()),
-            (10, "s_a::t_3".to_string()),
-            (20, "s_b::t_1".to_string()),
+    fn protected_recovery_lines_are_excluded_in_commit_coordinates() {
+        let candidates = HashMap::from([
+            ("renamed.txt".to_string(), vec![LineRange::Range(2, 6)]),
+            ("bash.txt".to_string(), vec![LineRange::Single(3)]),
+            (
+                "fully-protected.txt".to_string(),
+                vec![LineRange::Single(1)],
+            ),
         ]);
-
+        let protected = BTreeMap::from([
+            ("renamed.txt".to_string(), vec![5, 2, 5, 99]),
+            ("fully-protected.txt".to_string(), vec![1]),
+        ]);
+        let remaining = exclude_protected_lines(candidates, Some(&protected));
         assert_eq!(
-            edge_recovered_lines(&map, &[2]).as_deref(),
-            Some(&[2][..]),
-            "different trace ids for the same session should extend by session"
+            remaining["renamed.txt"],
+            vec![LineRange::Range(3, 4), LineRange::Single(6)]
         );
-        assert_eq!(
-            edge_recovered_lines(&map, &[4, 5, 6, 7, 8, 9]).as_deref(),
-            Some(&[4, 5, 6, 7, 8, 9][..]),
-            "matching AI neighbors should recover up to three lines from each side"
-        );
-        assert_eq!(
-            edge_recovered_lines(&map, &[11, 12, 13, 14]).as_deref(),
-            Some(&[11, 12, 13][..]),
-            "trailing edge extension should recover at most three lines"
-        );
-        assert_eq!(
-            edge_recovered_lines(&map, &[16, 17, 18, 19]).as_deref(),
-            Some(&[17, 18, 19][..]),
-            "leading edge extension should recover the three lines nearest the AI block"
-        );
+        assert_eq!(remaining["bash.txt"], vec![LineRange::Single(3)]);
+        assert!(!remaining.contains_key("fully-protected.txt"));
     }
 
     #[test]
-    fn edge_recovery_keeps_human_and_different_session_guardrails() {
-        let map = BTreeMap::from([
-            (1, "s_a::t_1".to_string()),
-            (3, "s_b::t_1".to_string()),
-            (5, "h_human::t_1".to_string()),
-        ]);
-
+    fn absent_or_empty_protection_preserves_recovery_candidates() {
+        let candidates = HashMap::from([("bash.txt".to_string(), vec![LineRange::Range(1, 3)])]);
         assert_eq!(
-            edge_recovered_lines(&map, &[2]).as_deref(),
-            None,
-            "different sessions must not be bridged"
+            exclude_protected_lines(candidates.clone(), None),
+            candidates
         );
         assert_eq!(
-            edge_recovered_lines(&map, &[4]).as_deref(),
-            None,
-            "known-human neighbors must not be used for edge extension"
+            exclude_protected_lines(candidates.clone(), Some(&BTreeMap::new())),
+            candidates
         );
+    }
+    #[test]
+    fn recovered_traces_keep_models_within_one_session() {
+        let mut log = AuthorshipLog::new();
+        let mut agent = test_agent("same-conversation");
+        agent.model = "model-A".to_string();
+        insert_session_record(&mut log, "s_same", &agent, "human", "t_first");
+        agent.model = "model-B".to_string();
+        insert_session_record(&mut log, "s_same", &agent, "human", "t_second");
+        let session = &log.metadata.sessions["s_same"];
+        assert_eq!(
+            session.agent_id_for_author("s_same::t_first").model,
+            "model-A"
+        );
+        assert_eq!(
+            session.agent_id_for_author("s_same::t_second").model,
+            "model-B"
+        );
+        assert_eq!(session.agent_id.id, "same-conversation");
     }
 }

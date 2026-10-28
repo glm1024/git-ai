@@ -26,7 +26,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Current schema version (must match MIGRATIONS.len())
-const SCHEMA_VERSION: usize = 15;
+const SCHEMA_VERSION: usize = 16;
 
 // This value is part of the metrics retry index schema. Changing it requires a
 // migration that rebuilds `metrics_retryable` with the same literal used by
@@ -242,6 +242,10 @@ const MIGRATIONS: &[&str] = &[
     // Migration 14 -> 15: distinguish an explicit, evidence-backed operator
     // abandonment from normal completion. Columns are added idempotently before
     // this empty transactional migration.
+    "",
+    // Migration 15 -> 16: ZCode request corrections keep a frozen contribution
+    // bucket and an independent monotonically increasing daily snapshot sequence.
+    // No historical token source is replayed or recomputed.
     "",
 ];
 
@@ -681,6 +685,12 @@ impl MetricsDatabase {
         }
         if from_version == 14 {
             self.add_deferred_checkpoint_terminal_columns()?;
+        }
+        if from_version == 15 {
+            self.add_column_if_missing("session_token_sources", "daily_bucket_key",
+                "ALTER TABLE session_token_sources ADD COLUMN daily_bucket_key TEXT NOT NULL DEFAULT ''")?;
+            self.add_column_if_missing("session_token_daily", "snapshot_sequence",
+                "ALTER TABLE session_token_daily ADD COLUMN snapshot_sequence INTEGER NOT NULL DEFAULT 0")?;
         }
         // Version 6 is the first schema containing session_activity. Add the
         // columns before compacting legacy content so those rows can establish
@@ -1130,6 +1140,18 @@ impl MetricsDatabase {
             let Some(token) = observation.token.as_ref() else {
                 continue;
             };
+            if tool == "zcode" && !token.cumulative {
+                if let Some(id) = apply_zcode_request_snapshot(
+                    &tx,
+                    observation,
+                    token,
+                    &machine_id,
+                    reporting_identity_allows_recovery,
+                )? {
+                    metric_ids.push(id);
+                }
+                continue;
+            }
             let previous = tx
                 .query_row(
                     r#"
@@ -2865,6 +2887,16 @@ fn migrate_daily_token_bucket(
         ],
     )?;
     tx.execute(
+        "UPDATE session_token_sources SET daily_bucket_key = ?1 WHERE daily_bucket_key = ?2 AND tool = 'zcode'",
+        params![target_bucket_key, source_bucket_key],
+    )?;
+    if target_bucket_key.starts_with("td5:") {
+        tx.execute(
+            "UPDATE session_token_daily SET snapshot_sequence = snapshot_sequence + 1 WHERE bucket_key = ?1",
+            params![target_bucket_key],
+        )?;
+    }
+    tx.execute(
         "UPDATE session_token_daily \
          SET supersedes_source_keys_json = ?1, \
              supersedes_snapshot_instance_ids_json = ?2 \
@@ -2894,6 +2926,161 @@ fn parse_token_snapshot_aliases(raw: Option<&str>) -> Result<BTreeSet<String>, G
         .collect())
 }
 
+/// ZCode model_usage rows are replaceable absolute request-attempt facts.
+/// Apply a signed correction to the originally credited bucket, never MAX each
+/// category independently. Other agents keep their historical monotonic path.
+fn apply_zcode_request_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    observation: &SessionObservation,
+    token: &crate::metrics::session_compaction::TokenSnapshot,
+    machine_id: &str,
+    may_recover_identity: bool,
+) -> Result<Option<i64>, GitAiError> {
+    let session_id = compact_sparse_string(&observation.attrs, attr_pos::SESSION_ID)
+        .ok_or_else(|| GitAiError::Generic("ZCode token snapshot has no session".into()))?;
+    let previous = tx.query_row(
+        "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, daily_bucket_key
+         FROM session_token_sources WHERE source_key = ?1",
+        params![token.source_key],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
+                  row.get::<_, i64>(3)?, row.get::<_, String>(4)?)),
+    ).optional()?;
+    // Earlier local projections have no recoverable bucket identity. Preserve
+    // them instead of replaying history or blocking new independent requests.
+    if previous.as_ref().is_some_and(|row| row.4.is_empty()) {
+        tracing::warn!(
+            "ZCode token correction skipped: historical source has no frozen daily bucket"
+        );
+        return Ok(None);
+    }
+    let (desired_bucket, anonymous_bucket, date_key, timezone, attrs) = daily_token_bucket(
+        observation.timestamp,
+        &observation.attrs,
+        token.provider.as_deref(),
+        machine_id,
+        &token.source_key,
+        &session_id,
+    )?;
+    let attrs_json = serde_json::to_string(&attrs)?;
+    let mut bucket = previous
+        .as_ref()
+        .map(|row| row.4.clone())
+        .unwrap_or_else(|| desired_bucket.clone());
+    let mut migrated = false;
+    // A later *new* request can be the first trusted identity observation.
+    // Recover this session's matching anonymous day even when the current
+    // request itself has never contributed to it. A frozen dimension-drift
+    // correction must not migrate an unrelated model/day bucket as a side effect.
+    if may_recover_identity
+        && anonymous_bucket != desired_bucket
+        && (bucket == anonymous_bucket || bucket == desired_bucket)
+    {
+        migrated = migrate_unknown_daily_token_bucket(
+            tx,
+            &anonymous_bucket,
+            &desired_bucket,
+            &attrs_json,
+            &timezone,
+            token.provider.as_deref(),
+        )?;
+        if migrated && bucket == anonymous_bucket {
+            bucket = desired_bucket.clone();
+        }
+    }
+    if bucket != desired_bucket {
+        tracing::warn!(
+            "ZCode token correction retained its original daily bucket after dimension drift"
+        );
+    }
+    let old = previous
+        .as_ref()
+        .map(|row| [row.0, row.1, row.2, row.3])
+        .unwrap_or([0; 4]);
+    let new = [
+        u64_to_sqlite(token.input),
+        u64_to_sqlite(token.output),
+        u64_to_sqlite(token.cache_read),
+        u64_to_sqlite(token.cache_write),
+    ];
+    let added_request = i64::from(previous.is_none());
+    let changed = new != old || added_request != 0;
+    if !changed && !migrated {
+        return Ok(None);
+    }
+    let existing = tx
+        .query_row(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                request_count, snapshot_sequence FROM session_token_daily WHERE bucket_key = ?1",
+            params![bucket],
+            |row| {
+                Ok((
+                    [
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ],
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if previous.is_some() && existing.is_none() {
+        tracing::warn!("ZCode token correction skipped: original daily bucket is unavailable");
+        return Ok(None);
+    }
+    let (totals, requests, sequence) = existing.unwrap_or(([0; 4], 0, 0));
+    let mut corrected = [0; 4];
+    for index in 0..4 {
+        corrected[index] = totals[index]
+            .checked_sub(old[index])
+            .and_then(|remaining| remaining.checked_add(new[index]))
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| {
+                GitAiError::Generic(
+                    "ZCode token correction conflicts with frozen daily contribution".into(),
+                )
+            })?;
+    }
+    let sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| GitAiError::Generic("ZCode snapshot sequence exhausted".into()))?;
+    let requests = requests
+        .checked_add(added_request)
+        .ok_or_else(|| GitAiError::Generic("ZCode request count exhausted".into()))?;
+    tx.execute(
+        "INSERT INTO session_token_daily (bucket_key, date_key, timezone, machine_id, first_ts, last_ts,
+            attrs_json, provider, request_count, input_tokens, output_tokens, cache_read_tokens,
+            cache_write_tokens, snapshot_instance_id, snapshot_sequence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(bucket_key) DO UPDATE SET request_count=excluded.request_count,
+            attrs_json=CASE WHEN ?15 AND excluded.last_ts >= session_token_daily.last_ts
+                THEN excluded.attrs_json ELSE session_token_daily.attrs_json END,
+            timezone=CASE WHEN ?15 AND excluded.last_ts >= session_token_daily.last_ts
+                THEN excluded.timezone ELSE session_token_daily.timezone END,
+            last_ts=MAX(session_token_daily.last_ts, excluded.last_ts),
+            input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
+            cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens,
+            snapshot_sequence=excluded.snapshot_sequence",
+        params![bucket, date_key, timezone, machine_id, i64::from(observation.timestamp), attrs_json,
+            token.provider, requests, corrected[0], corrected[1], corrected[2], corrected[3],
+            crate::uuid::generate_v4(), sequence, previous.is_none()],
+    )?;
+    tx.execute(
+        "INSERT INTO session_token_sources (source_key, session_id, first_ts, last_ts, tool, model,
+            provider, repo_url, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+            cumulative_source, daily_bucket_key)
+         VALUES (?1, ?2, ?3, ?3, 'zcode', ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)
+         ON CONFLICT(source_key) DO UPDATE SET input_tokens=excluded.input_tokens,
+            output_tokens=excluded.output_tokens, cache_read_tokens=excluded.cache_read_tokens,
+            cache_write_tokens=excluded.cache_write_tokens, daily_bucket_key=excluded.daily_bucket_key",
+        params![token.source_key, session_id, i64::from(observation.timestamp), token.model, token.provider,
+            compact_sparse_string(&observation.attrs, attr_pos::REPO_URL), new[0], new[1], new[2], new[3], bucket],
+    )?;
+    Ok(Some(refresh_daily_token_outbox(tx, &bucket)?))
+}
+
 fn refresh_daily_token_outbox(
     tx: &rusqlite::Transaction<'_>,
     bucket_key: &str,
@@ -2903,7 +3090,7 @@ fn refresh_daily_token_outbox(
         SELECT date_key, timezone, machine_id, last_ts, attrs_json, provider, request_count,
                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                outbox_metric_id, snapshot_instance_id, supersedes_source_keys_json,
-               supersedes_snapshot_instance_ids_json
+               supersedes_snapshot_instance_ids_json, snapshot_sequence
         FROM session_token_daily WHERE bucket_key = ?1
         "#,
         params![bucket_key],
@@ -2924,6 +3111,7 @@ fn refresh_daily_token_outbox(
                 row.get::<_, String>(12)?,
                 row.get::<_, String>(13)?,
                 row.get::<_, String>(14)?,
+                row.get::<_, i64>(15)?,
             ))
         },
     )?;
@@ -2943,6 +3131,7 @@ fn refresh_daily_token_outbox(
         snapshot_instance_id,
         supersedes_source_keys_json,
         supersedes_snapshot_instance_ids_json,
+        snapshot_sequence,
     ) = snapshot;
     let snapshot_attrs: SparseArray = serde_json::from_str(&snapshot_attrs_json)?;
     let supersedes_source_keys = parse_token_snapshot_aliases(Some(&supersedes_source_keys_json))?
@@ -2952,7 +3141,7 @@ fn refresh_daily_token_outbox(
         parse_token_snapshot_aliases(Some(&supersedes_snapshot_instance_ids_json))?
             .into_iter()
             .collect();
-    let values = SessionTokenUsageValues::new(
+    let mut values = SessionTokenUsageValues::new(
         bucket_key,
         input.max(0) as u64,
         output.max(0) as u64,
@@ -2967,6 +3156,9 @@ fn refresh_daily_token_outbox(
         snapshot_instance_id,
         supersedes_snapshot_instance_ids,
     );
+    if bucket_key.starts_with("td5:") {
+        values.snapshot_sequence = Some(Some(snapshot_sequence.max(0) as u64));
+    }
     let event = MetricEvent::from_values_with_timestamp(
         values,
         snapshot_attrs,
@@ -3156,7 +3348,9 @@ fn daily_token_bucket(
     // attributes here would split one server row into multiple client snapshots;
     // the server's freshness upsert would then keep only the largest split and
     // silently under-count the day.
-    let revision = if source_key.starts_with("ts2:") {
+    let revision = if compact_sparse_string(attrs, attr_pos::TOOL).as_deref() == Some("zcode") {
+        "td5"
+    } else if source_key.starts_with("ts2:") {
         "td4"
     } else {
         "td3"
@@ -3246,6 +3440,7 @@ fn daily_token_bucket_key(
 fn latest_daily_token_bucket_revision(bucket_key: &str) -> &str {
     match bucket_key.split_once(':').map(|(revision, _)| revision) {
         Some("td2" | "td4") => "td4",
+        Some("td5") => "td5",
         _ => "td3",
     }
 }
@@ -4032,6 +4227,450 @@ mod tests {
             ),
         );
         observation
+    }
+
+    #[test]
+    fn test_zcode_usage_replay_model_switch_and_daily_outbox_are_content_free() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ts = seconds_ago(60);
+        let observe = |id: &str, model: &str, output: u64| {
+            let raw = json!({"zcode_usage": {
+                "id": id, "logical_request_id": "logical", "session_id": "zcode-session",
+                "status": "completed", "model_id": model, "provider_id": "zai-plan",
+                "input_tokens": 100, "output_tokens": output,
+                "cache_read_input_tokens": 30, "cache_creation_input_tokens": 10,
+                "raw_usage_json": "private usage payload must not persist",
+                "error_message": "private error must not persist"
+            }});
+            let attrs = EventAttributes::with_version("test")
+                .tool("zcode")
+                .session_id("zcode-session")
+                .external_session_id("external-zcode-session")
+                .repo_url("github.com/acme/repo")
+                .author("alice@example.com")
+                .custom_attributes(r#"{"project_key":"repo"}"#)
+                .to_sparse();
+            compact_session_event(&raw, ts, attrs, Some(id.to_string()), None, None)
+        };
+        db.insert_session_observations(&[observe("req-a", "glm-a", 20)])
+            .unwrap();
+        assert!(
+            db.insert_session_observations(&[observe("req-a", "glm-a", 20)])
+                .unwrap()
+                .is_empty()
+        );
+        db.insert_session_observations(&[
+            observe("req-a", "glm-a", 25),
+            observe("req-b", "glm-b", 10),
+        ])
+        .unwrap();
+        let source_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM session_token_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_count, 2);
+        let mut totals: Vec<(String, u64, u64, u64, u64, u64)> = pending_event_jsons(&db)
+            .iter()
+            .map(|raw| {
+                assert!(!raw.contains("private"));
+                let event: MetricEvent = serde_json::from_str(raw).unwrap();
+                assert_eq!(event.event_id, MetricEventId::SessionTokenUsage as u16);
+                let custom: Value = serde_json::from_str(
+                    &sparse_get_string(&event.attrs, attr_pos::CUSTOM_ATTRIBUTES)
+                        .flatten()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(custom["ide"], "zcode");
+                (
+                    sparse_get_string(&event.attrs, attr_pos::MODEL)
+                        .flatten()
+                        .unwrap(),
+                    event.values["1"].as_u64().unwrap(),
+                    event.values["2"].as_u64().unwrap(),
+                    event.values["3"].as_u64().unwrap(),
+                    event.values["4"].as_u64().unwrap(),
+                    event.values["5"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        totals.sort();
+        assert_eq!(
+            totals,
+            vec![
+                ("glm-a".to_string(), 60, 25, 30, 10, 1),
+                ("glm-b".to_string(), 60, 10, 30, 10, 1)
+            ]
+        );
+    }
+
+    fn zcode_request_observation(
+        timestamp: u32,
+        input: u64,
+        output: u64,
+        cache: u64,
+    ) -> SessionObservation {
+        zcode_request_observation_for_id(timestamp, "request-to-revise", input, output, cache)
+    }
+
+    fn zcode_request_observation_for_id(
+        timestamp: u32,
+        request_id: &str,
+        input: u64,
+        output: u64,
+        cache: u64,
+    ) -> SessionObservation {
+        let raw = json!({"zcode_usage": {
+            "id": request_id, "status": "completed", "model_id": "glm-test",
+            "provider_id": "zai-plan", "input_tokens": input, "output_tokens": output,
+            "cache_read_input_tokens": cache, "cache_creation_input_tokens": 0
+        }});
+        let attrs = EventAttributes::with_version("test")
+            .tool("zcode")
+            .session_id("zcode-revision-session")
+            .external_session_id("external-zcode-revision-session")
+            .repo_url("github.com/acme/repo")
+            .custom_attributes(r#"{"project_key":"repo"}"#)
+            .to_sparse();
+        compact_session_event(
+            &raw,
+            timestamp,
+            attrs,
+            Some(request_id.to_string()),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_zcode_request_revision_reclassifies_cache_and_accepts_downward_correction() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ts = seconds_ago(60);
+        db.insert_session_observations(&[zcode_request_observation(ts, 100, 20, 0)])
+            .unwrap();
+        db.insert_session_observations(&[zcode_request_observation(ts, 100, 20, 30)])
+            .unwrap();
+        let read_totals = |db: &MetricsDatabase| -> (i64, i64, i64, i64) {
+            db.conn.query_row("SELECT input_tokens, output_tokens, cache_read_tokens, request_count FROM session_token_daily", [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap()
+        };
+        assert_eq!(read_totals(&db), (70, 20, 30, 1));
+        db.insert_session_observations(&[zcode_request_observation(ts, 60, 10, 20)])
+            .unwrap();
+        assert_eq!(read_totals(&db), (40, 10, 20, 1));
+        assert!(
+            db.insert_session_observations(&[zcode_request_observation(ts, 60, 10, 20)])
+                .unwrap()
+                .is_empty()
+        );
+        let event: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
+        assert_eq!(event.values["1"], 40);
+        assert_eq!(event.values["2"], 10);
+        assert_eq!(event.values["3"], 20);
+        assert_eq!(event.values["5"], 1);
+        assert!(event.values["0"].as_str().unwrap().starts_with("td5:"));
+        assert_eq!(event.values["14"], 3);
+        db.insert_session_observations(&[zcode_request_observation(ts, 0, 0, 0)])
+            .unwrap();
+        assert_eq!(read_totals(&db), (0, 0, 0, 1));
+        db.insert_session_observations(&[zcode_request_observation(ts, 60, 10, 20)])
+            .unwrap();
+        assert_eq!(read_totals(&db), (40, 10, 20, 1));
+    }
+
+    #[test]
+    fn test_zcode_request_revision_preserves_inflight_snapshot_and_survives_restart() {
+        let (mut db, temp_dir) = create_test_db();
+        let ts = seconds_ago(60);
+        let first_id = db
+            .insert_session_observations(&[zcode_request_observation(ts, 100, 20, 0)])
+            .unwrap()[0];
+        let first = db.dequeue_pending_batch(1).unwrap().remove(0);
+        assert_eq!(first.id, first_id);
+        drop(db);
+        let conn = crate::sqlite::open_with_memory_limits(temp_dir.path().join("test-metrics.db"))
+            .unwrap();
+        let mut db = MetricsDatabase { conn };
+        db.initialize_schema().unwrap();
+        let successor_id = db
+            .insert_session_observations(&[zcode_request_observation(ts, 60, 10, 20)])
+            .unwrap()[0];
+        assert_ne!(first_id, successor_id);
+        let unchanged: String = db
+            .conn
+            .query_row(
+                "SELECT event_json FROM metrics WHERE id=?1",
+                [first_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, first.event_json);
+        let successor: String = db
+            .conn
+            .query_row(
+                "SELECT event_json FROM metrics WHERE id=?1",
+                [successor_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: MetricEvent = serde_json::from_str(&successor).unwrap();
+        let first_event: MetricEvent = serde_json::from_str(&first.event_json).unwrap();
+        assert_eq!(event.values["0"], first_event.values["0"]);
+        assert_eq!(event.values["12"], first_event.values["12"]);
+        assert_eq!(first_event.values["14"], 1);
+        assert_eq!(event.values["14"], 2);
+        assert_eq!(event.values["1"], 40);
+        assert_eq!(event.values["2"], 10);
+        assert_eq!(event.values["3"], 20);
+        assert_eq!(event.values["5"], 1);
+        db.mark_records_delivered(&[first_id], unix_now()).unwrap();
+        assert_eq!(pending_event_jsons(&db).len(), 1);
+        assert!(
+            db.insert_session_observations(&[zcode_request_observation(ts, 60, 10, 20)])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_zcode_zero_initial_request_is_counted_once_and_correction_keeps_frozen_dimensions() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ts = seconds_ago(60);
+        db.insert_session_observations(&[zcode_request_observation(ts, 0, 0, 0)])
+            .unwrap();
+        let first: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
+        let mut correction = zcode_request_observation(ts, 60, 10, 20);
+        correction.token.as_mut().unwrap().model = Some("changed-model".to_string());
+        correction
+            .attrs
+            .insert(attr_pos::MODEL.to_string(), json!("changed-model"));
+        db.insert_session_observations(&[correction]).unwrap();
+        let next: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
+        assert_eq!(next.values["0"], first.values["0"]);
+        assert_eq!(next.values["1"], 40);
+        assert_eq!(next.values["5"], 1);
+        assert_eq!(next.values["14"], 2);
+        assert_eq!(
+            sparse_get_string(&next.attrs, attr_pos::MODEL),
+            sparse_get_string(&first.attrs, attr_pos::MODEL)
+        );
+    }
+
+    #[test]
+    fn test_zcode_signed_source_binding_migration_preserves_existing_non_zcode_facts() {
+        let (mut db, _temp_dir) = create_test_db();
+        db.insert_session_observations(&[codex_cumulative_observation(
+            seconds_ago(60),
+            100,
+            20,
+            30,
+            false,
+        )])
+        .unwrap();
+        let original = pending_event_jsons(&db);
+        db.conn
+            .execute_batch(
+                "ALTER TABLE session_token_sources DROP COLUMN daily_bucket_key;
+            ALTER TABLE session_token_daily DROP COLUMN snapshot_sequence;
+            UPDATE schema_metadata SET value='15' WHERE key='version';",
+            )
+            .unwrap();
+        db.initialize_schema().unwrap();
+        db.initialize_schema().unwrap();
+        assert_eq!(pending_event_jsons(&db), original);
+        let legacy: (String, i64) = db
+            .conn
+            .query_row(
+                "SELECT daily_bucket_key, input_tokens FROM session_token_sources",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (String::new(), 100));
+        let sequence: i64 = db
+            .conn
+            .query_row(
+                "SELECT snapshot_sequence FROM session_token_daily",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence, 0);
+    }
+
+    fn with_zcode_reporting_email(
+        observation: SessionObservation,
+        email: &str,
+    ) -> SessionObservation {
+        let mut observation = with_reporting_email(observation, email);
+        let raw = sparse_get_string(&observation.attrs, attr_pos::CUSTOM_ATTRIBUTES)
+            .flatten()
+            .unwrap();
+        let mut custom: Value = serde_json::from_str(&raw).unwrap();
+        custom["ide"] = json!("zcode");
+        observation.attrs.insert(
+            attr_pos::CUSTOM_ATTRIBUTES.to_string(),
+            Value::String(custom.to_string()),
+        );
+        observation
+    }
+
+    #[test]
+    fn test_zcode_new_identified_request_recovers_earlier_anonymous_request_and_binding() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ts = seconds_ago(60);
+        db.insert_session_observations(&[zcode_request_observation_for_id(
+            ts,
+            "anonymous-a",
+            100,
+            20,
+            0,
+        )])
+        .unwrap();
+        let anonymous: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
+        let known = with_zcode_reporting_email(
+            zcode_request_observation_for_id(ts + 1, "known-b", 50, 10, 10),
+            "alice@example.com",
+        );
+        db.insert_session_observations(&[known]).unwrap();
+        let totals: (i64, i64, i64, i64, i64) = db.conn.query_row(
+            "SELECT count(*), sum(input_tokens), sum(output_tokens), sum(cache_read_tokens), sum(request_count) FROM session_token_daily", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!(totals, (1, 140, 30, 10, 2));
+        let bound_buckets: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(distinct daily_bucket_key) FROM session_token_sources",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound_buckets, 1);
+        let pending = pending_event_jsons(&db);
+        assert_eq!(pending.len(), 1);
+        let known: MetricEvent = serde_json::from_str(&pending[0]).unwrap();
+        assert!(
+            known.values["11"]
+                .as_array()
+                .unwrap()
+                .contains(&anonymous.values["0"])
+        );
+        assert!(
+            known.values["13"]
+                .as_array()
+                .unwrap()
+                .contains(&anonymous.values["12"])
+        );
+        let correction = with_zcode_reporting_email(
+            zcode_request_observation_for_id(ts, "anonymous-a", 100, 20, 30),
+            "alice@example.com",
+        );
+        db.insert_session_observations(&[correction]).unwrap();
+        let known: MetricEvent = serde_json::from_str(&pending_event_jsons(&db)[0]).unwrap();
+        assert_eq!(known.values["1"], 110);
+        assert_eq!(known.values["3"], 40);
+        assert_eq!(known.values["5"], 2);
+    }
+
+    #[test]
+    fn test_zcode_anonymous_merge_keeps_both_inflight_acks_from_deleting_successor() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ts = seconds_ago(60);
+        let mut earlier_known = with_zcode_reporting_email(
+            zcode_request_observation_for_id(ts, "known-c", 200, 20, 0),
+            "alice@example.com",
+        );
+        earlier_known.attrs.insert(
+            attr_pos::SESSION_ID.to_string(),
+            json!("another-zcode-session"),
+        );
+        db.insert_session_observations(&[earlier_known]).unwrap();
+        db.insert_session_observations(&[zcode_request_observation_for_id(
+            ts,
+            "anonymous-a",
+            100,
+            20,
+            0,
+        )])
+        .unwrap();
+        let inflight = db.dequeue_pending_batch(2).unwrap();
+        assert_eq!(inflight.len(), 2);
+        let known = with_zcode_reporting_email(
+            zcode_request_observation_for_id(ts + 1, "known-b", 50, 10, 10),
+            "alice@example.com",
+        );
+        let successor_id = db.insert_session_observations(&[known]).unwrap()[0];
+        assert!(inflight.iter().all(|old| old.id != successor_id));
+        for old in &inflight {
+            let frozen: String = db
+                .conn
+                .query_row(
+                    "SELECT event_json FROM metrics WHERE id=?1",
+                    [old.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(frozen, old.event_json);
+        }
+        db.mark_records_delivered(
+            &inflight.iter().map(|old| old.id).collect::<Vec<_>>(),
+            unix_now(),
+        )
+        .unwrap();
+        let pending = pending_event_jsons(&db);
+        assert_eq!(pending.len(), 1);
+        let merged: MetricEvent = serde_json::from_str(&pending[0]).unwrap();
+        assert_eq!(merged.values["1"], 340);
+        assert_eq!(merged.values["2"], 50);
+        assert_eq!(merged.values["3"], 10);
+        assert_eq!(merged.values["5"], 3);
+        assert_eq!(merged.values["14"], 3);
+        assert_eq!(merged.values["13"].as_array().unwrap().len(), 1);
+        let bindings: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(distinct daily_bucket_key) FROM session_token_sources",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bindings, 1);
+    }
+
+    #[test]
+    fn test_zcode_identity_conflict_does_not_claim_the_intermediate_anonymous_request() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ts = seconds_ago(60);
+        let first = with_zcode_reporting_email(
+            zcode_request_observation_for_id(ts, "known-a", 100, 20, 0),
+            "alice@example.com",
+        );
+        db.insert_session_observations(&[first]).unwrap();
+        db.insert_session_observations(&[zcode_request_observation_for_id(
+            ts,
+            "anonymous-b",
+            100,
+            20,
+            0,
+        )])
+        .unwrap();
+        let changed_user = with_zcode_reporting_email(
+            zcode_request_observation_for_id(ts, "known-c", 100, 20, 0),
+            "bob@example.com",
+        );
+        db.insert_session_observations(&[changed_user]).unwrap();
+        let state: String = db.conn.query_row("SELECT reporting_identity_state FROM session_activity WHERE session_id='zcode-revision-session'", [], |row| row.get(0)).unwrap();
+        assert_eq!(state, "conflicted");
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM session_token_daily", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(pending_event_jsons(&db).len(), 3);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! In-memory aggregation of persisted metric events for `git-ai usage`.
 
-/// How long after a session's last message a subsequent commit is attributed
-/// to that session for yield and ai_lines_committed calculations.
+/// Window after the last observed session activity used by the local yield
+/// proxy. This is activity correlation, not proof that the session made a commit.
 const YIELD_WINDOW_SECS: u32 = 4 * 3600;
 
 use crate::error::GitAiError;
@@ -184,6 +184,7 @@ pub enum BucketGranularity {
 /// Event types useful for local usage stats.
 const USAGE_EVENT_IDS: &[u16] = &[
     1, // Committed
+    2, // AgentUsage (hook-only agents need no transcript stream)
     4, // Checkpoint
     5, // SessionEvent
 ];
@@ -348,6 +349,24 @@ fn compute_activity_from_sources(
     for record in records {
         let event = &record.event;
 
+        if record.event_id == 5 || hook_event_has_session_identity(event) {
+            aggregate_session(event, &mut session_ids, &mut session_tool_counts);
+            // First/last observed activity is a duration/yield proxy, independent
+            // from whether this session has any transcript or token evidence.
+            if let Some(sid) = sparse_get_string(&event.attrs, attr_pos::SESSION_ID).flatten()
+                && !sid.is_empty()
+            {
+                session_last_ts
+                    .entry(sid.clone())
+                    .and_modify(|last| *last = (*last).max(record.ts))
+                    .or_insert(record.ts);
+                session_first_ts
+                    .entry(sid)
+                    .and_modify(|first| *first = (*first).min(record.ts))
+                    .or_insert(record.ts);
+            }
+        }
+
         match record.event_id {
             1 => {
                 commit_timestamps.push(record.ts);
@@ -393,16 +412,6 @@ fn compute_activity_from_sources(
                 &mut checkpoint_ai_by_tool,
             ),
             5 => {
-                aggregate_session(event, &mut session_ids, &mut session_tool_counts);
-
-                // Track first/last-seen timestamp per session for yield
-                // classification and longest-session duration.
-                if let Some(sid) = sparse_get_string(&event.attrs, attr_pos::SESSION_ID).flatten() {
-                    let last = session_last_ts.entry(sid.clone()).or_insert(0);
-                    *last = (*last).max(record.ts);
-                    let first = session_first_ts.entry(sid).or_insert(record.ts);
-                    *first = (*first).min(record.ts);
-                }
                 let session_id = sparse_get_string(&event.attrs, attr_pos::SESSION_ID)
                     .flatten()
                     .unwrap_or_default();
@@ -1126,6 +1135,49 @@ fn aggregate_checkpoint(
     }
 }
 
+/// Hooks carry session evidence even when no native transcript exists. Require
+/// the original tool/conversation pair to derive the persisted session ID so
+/// empty, unknown, and synthesized recovery identities do not invent sessions.
+fn hook_event_has_session_identity(event: &MetricEvent) -> bool {
+    if event.event_id != 2
+        && (event.event_id != 4
+            || !matches!(
+                sparse_get_string(&event.values, checkpoint_pos::KIND)
+                    .flatten()
+                    .as_deref(),
+                Some("ai_agent" | "ai_tab")
+            ))
+    {
+        return false;
+    }
+    let Some(tool) = sparse_get_string(&event.attrs, attr_pos::TOOL).flatten() else {
+        return false;
+    };
+    if tool.trim().is_empty()
+        || matches!(
+            tool.as_str(),
+            "human" | "known_human" | "unknown" | "mock_ai"
+        )
+    {
+        return false;
+    }
+    let Some(external) = sparse_get_string(&event.attrs, attr_pos::EXTERNAL_SESSION_ID).flatten()
+    else {
+        return false;
+    };
+    if external.trim().is_empty() {
+        return false;
+    }
+    sparse_get_string(&event.attrs, attr_pos::SESSION_ID)
+        .flatten()
+        .is_some_and(|session| {
+            session
+                == crate::authorship::authorship_log_serialization::generate_session_id(
+                    &external, &tool,
+                )
+        })
+}
+
 fn aggregate_session(
     event: &MetricEvent,
     session_ids: &mut HashSet<String>,
@@ -1137,6 +1189,7 @@ fn aggregate_session(
         .unwrap_or_else(|| "unknown".to_string());
 
     if let Some(sid) = session_id
+        && !sid.is_empty()
         && session_ids.insert(sid)
     {
         *session_tool_counts.entry(tool).or_insert(0) += 1;
@@ -1496,6 +1549,179 @@ mod tests {
             &values,
             attrs(repo_url, "claude", Some(session_id)),
         ))
+    }
+
+    #[test]
+    fn hook_only_activity_counts_real_sessions_without_transcript_or_tokens() {
+        use crate::authorship::authorship_log_serialization::generate_session_id;
+        use crate::metrics::events::AgentUsageValues;
+        let now = now_ts();
+        let session = generate_session_id("dsh-session", "deepseek-harness");
+        let second = generate_session_id("checkpoint-only", "deepseek-harness");
+        let identity = |sid: &str, external: &str| {
+            EventAttributes::with_version("test")
+                .tool("deepseek-harness")
+                .model("deepseek-v3.2")
+                .session_id(sid)
+                .external_session_id(external)
+                .to_sparse()
+        };
+        let records = [
+            record(MetricEvent::with_timestamp(
+                now - 7200,
+                &CheckpointValues::new().kind("human"),
+                identity(&session, "dsh-session"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 7100,
+                &CheckpointValues::new().kind("known_human"),
+                identity(&session, "dsh-session"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 100,
+                &AgentUsageValues::new(),
+                identity(&session, "dsh-session"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 90,
+                &AgentUsageValues::new(),
+                identity(&session, "dsh-session"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 80,
+                &CheckpointValues::new().kind("ai_agent").lines_added(2),
+                identity(&session, "dsh-session"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 70,
+                &CheckpointValues::new().kind("ai_agent").lines_added(1),
+                identity(&second, "checkpoint-only"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 60,
+                &CheckpointValues::new().kind("human"),
+                identity("s_human", "human"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 50,
+                &CheckpointValues::new()
+                    .kind("ai_agent")
+                    .checkpoint_type("recovered_commit_metadata"),
+                identity("s_0123456789abcd", "s_0123456789abcd"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 40,
+                &AgentUsageValues::new(),
+                identity("", ""),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 30,
+                &AgentUsageValues::new(),
+                identity("legacy-unknown-session", "unknown"),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 20,
+                &AgentUsageValues::new(),
+                EventAttributes::with_version("test")
+                    .tool("unknown")
+                    .session_id(generate_session_id("unknown", "unknown"))
+                    .external_session_id("unknown")
+                    .to_sparse(),
+            )),
+        ];
+        let rejected = [
+            record(MetricEvent::with_timestamp(
+                now - 15,
+                &AgentUsageValues::new(),
+                EventAttributes::with_version("test")
+                    .tool("mock_ai")
+                    .session_id(generate_session_id("mock-session", "mock_ai"))
+                    .external_session_id("mock-session")
+                    .to_sparse(),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 10,
+                &AgentUsageValues::new(),
+                EventAttributes::with_version("test")
+                    .tool("deepseek-harness")
+                    .session_id(generate_session_id("no-external", "deepseek-harness"))
+                    .to_sparse(),
+            )),
+        ];
+        let refs: Vec<_> = records.iter().chain(&rejected).collect();
+        let stats = compute_activity_from_records(
+            &refs,
+            now - 3600,
+            "last hour".into(),
+            BucketGranularity::Daily,
+        )
+        .unwrap();
+        assert_eq!(stats.sessions.total, 2);
+        assert_eq!(
+            stats.summary.longest_session_secs, 20,
+            "human pre does not extend an AI session"
+        );
+        assert_eq!(stats.sessions.by_tool, vec![("deepseek-harness".into(), 2)]);
+        assert_eq!(stats.tokens.input, 0);
+        assert_eq!(stats.tokens.output, 0);
+        assert_eq!(stats.tokens.cache_read, 0);
+        assert_eq!(stats.tokens.cache_creation, 0);
+        assert_eq!(stats.tokens.estimated_cost_usd, 0.0);
+        assert!(stats.tokens.by_model.is_empty());
+        assert!(stats.summary.favorite_model.is_none());
+    }
+
+    #[test]
+    fn hook_session_activity_deduplicates_streams_and_keeps_token_totals() {
+        use crate::authorship::authorship_log_serialization::generate_session_id;
+        use crate::metrics::events::AgentUsageValues;
+        let now = now_ts();
+        let session = generate_session_id("real-session", "claude");
+        let identity = EventAttributes::with_version("test")
+            .tool("claude")
+            .model("model-A")
+            .session_id(&session)
+            .external_session_id("real-session")
+            .to_sparse();
+        let mut checkpoint_identity = identity.clone();
+        checkpoint_identity.insert(attr_pos::MODEL.to_string(), json!("model-B"));
+        let records = [
+            record(MetricEvent::with_timestamp(
+                now - 20,
+                &AgentUsageValues::new(),
+                identity.clone(),
+            )),
+            record(MetricEvent::with_timestamp(
+                now - 10,
+                &CheckpointValues::new().kind("ai_agent").lines_added(1),
+                checkpoint_identity,
+            )),
+            claude_session(now - 5, None, &session),
+        ];
+        let refs: Vec<_> = records.iter().collect();
+        let sessions = [CompactSessionRecord {
+            session_id: session,
+            first_ts: now - 30,
+            last_ts: now - 25,
+            tool: "claude".into(),
+            model: None,
+            repo_url: None,
+        }];
+        let stats = compute_activity_from_sources(
+            &refs,
+            &sessions,
+            &[],
+            now - 3600,
+            "last hour".into(),
+            BucketGranularity::Daily,
+        )
+        .unwrap();
+        assert_eq!(stats.sessions.total, 1);
+        assert_eq!(stats.sessions.by_tool, vec![("claude".into(), 1)]);
+        assert_eq!(stats.tokens.input, 100);
+        assert_eq!(stats.tokens.output, 50);
+        assert_eq!(stats.tokens.cache_read, 20);
+        assert_eq!(stats.tokens.cache_creation, 10);
     }
 
     #[test]

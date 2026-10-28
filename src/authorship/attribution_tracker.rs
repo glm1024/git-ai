@@ -2020,7 +2020,7 @@ fn ceil_char_boundary(content: &str, idx: usize) -> usize {
 /// # Returns
 /// A vector of character-based attributions covering the same ranges
 pub fn line_attributions_to_attributions(
-    line_attributions: &Vec<LineAttribution>,
+    line_attributions: &[LineAttribution],
     content: &str,
     ts: u128,
 ) -> Vec<Attribution> {

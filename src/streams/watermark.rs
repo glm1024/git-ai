@@ -26,6 +26,7 @@ pub enum WatermarkType {
     Timestamp,
     Hybrid,
     TimestampCursor,
+    ZCodeUsage,
 }
 
 impl fmt::Display for WatermarkType {
@@ -37,6 +38,7 @@ impl fmt::Display for WatermarkType {
             WatermarkType::Timestamp => write!(f, "Timestamp"),
             WatermarkType::Hybrid => write!(f, "Hybrid"),
             WatermarkType::TimestampCursor => write!(f, "TimestampCursor"),
+            WatermarkType::ZCodeUsage => write!(f, "ZCodeUsage"),
         }
     }
 }
@@ -52,6 +54,7 @@ impl FromStr for WatermarkType {
             "Timestamp" => Ok(WatermarkType::Timestamp),
             "Hybrid" => Ok(WatermarkType::Hybrid),
             "TimestampCursor" => Ok(WatermarkType::TimestampCursor),
+            "ZCodeUsage" => Ok(WatermarkType::ZCodeUsage),
             _ => Err(StreamError::Parse {
                 line: 0,
                 message: format!("Invalid watermark type: {}", s),
@@ -70,6 +73,7 @@ impl WatermarkType {
             WatermarkType::Timestamp => Ok(Box::new(TimestampWatermark::from_str(s)?)),
             WatermarkType::Hybrid => Ok(Box::new(HybridWatermark::from_str(s)?)),
             WatermarkType::TimestampCursor => Ok(Box::new(TimestampCursorWatermark::from_str(s)?)),
+            WatermarkType::ZCodeUsage => Ok(Box::new(ZCodeWatermark::from_str(s)?)),
         }
     }
 
@@ -83,6 +87,9 @@ impl WatermarkType {
             )),
             WatermarkType::Hybrid => Box::new(HybridWatermark::new(0, 0, None)),
             WatermarkType::TimestampCursor => Box::new(TimestampCursorWatermark::initial()),
+            WatermarkType::ZCodeUsage => {
+                Box::new(ZCodeWatermark::at(Utc::now().timestamp_millis()))
+            }
         }
     }
 }
@@ -700,6 +707,7 @@ mod tests {
             WatermarkType::Timestamp,
             WatermarkType::Hybrid,
             WatermarkType::TimestampCursor,
+            WatermarkType::ZCodeUsage,
         ];
 
         for wm_type in &types {
@@ -777,5 +785,59 @@ mod tests {
             .deserialize("5000|span_42")
             .unwrap();
         assert_eq!(wm.serialize(), "5000|span_42");
+    }
+}
+
+/// ZCode has no update sequence: requests can be inserted late and upserted.
+/// Persist projection hashes instead of assuming timestamp or SQLite rowid order
+/// is an update log. The scan cursor bounds each read; `cycle_complete` lets the
+/// worker terminate its drain before the next scheduled rescan.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ZCodeWatermark {
+    pub activated_at_millis: i64,
+    pub scan_started_at: i64,
+    pub scan_id: String,
+    pub cycle_complete: bool,
+    pub generation: u64,
+    pub seen: std::collections::BTreeMap<String, ZCodeSeenUsage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ZCodeSeenUsage {
+    pub generation: u64,
+    pub digest: String,
+}
+
+impl ZCodeWatermark {
+    pub fn at(activated_at_millis: i64) -> Self {
+        Self {
+            activated_at_millis,
+            scan_started_at: activated_at_millis,
+            scan_id: String::new(),
+            cycle_complete: false,
+            generation: 0,
+            seen: Default::default(),
+        }
+    }
+}
+
+impl WatermarkStrategy for ZCodeWatermark {
+    fn serialize(&self) -> String {
+        // All fields have infallible JSON representations (integers and strings).
+        serde_json::to_string(self).expect("serialize ZCode watermark")
+    }
+    fn advance(&mut self, _bytes_read: usize, _records_read: usize) {}
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl FromStr for ZCodeWatermark {
+    type Err = StreamError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_str(s).map_err(|e| StreamError::Parse {
+            line: 0,
+            message: format!("Invalid ZCode usage watermark: {}", e),
+        })
     }
 }

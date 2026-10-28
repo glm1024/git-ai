@@ -1023,6 +1023,7 @@ fn is_known_checkpoint_preset(arg: &str) -> bool {
             | "windsurf"
             | "opencode"
             | "kilo"
+            | "zcode"
             | "pi"
             | "ai_tab"
             | "firebender"
@@ -3799,6 +3800,10 @@ mod tests {
 
     #[test]
     fn test_normalize_test_git_ai_checkpoint_args_preserves_known_presets_and_separator() {
+        assert_eq!(
+            normalize_test_git_ai_checkpoint_args(&["checkpoint", "zcode", "--strict-errors"]),
+            vec!["checkpoint", "zcode", "--strict-errors"]
+        );
         assert_eq!(
             normalize_test_git_ai_checkpoint_args(&["checkpoint", "mock_ai", "src/lib.rs"]),
             vec!["checkpoint", "mock_ai", "src/lib.rs"]

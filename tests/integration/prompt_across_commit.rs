@@ -65,8 +65,8 @@ fn test_change_across_commits() {
 }
 
 /// Variant of test_change_across_commits using unattributed (legacy) human checkpoints.
-/// The inserted legacy/untracked line is adjacent to the new AI edit, so edge
-/// recovery attributes it to AI with a separate recovery trace.
+/// The inserted legacy/untracked line stays unknown even when it is adjacent
+/// to the new AI edit.
 #[test]
 fn test_change_across_commits_standard_human() {
     let repo = TestRepo::new();
@@ -101,7 +101,7 @@ fn test_change_across_commits_standard_human() {
     let commit = repo.stage_all_and_commit("add more AI").unwrap();
 
     let file_attestation = commit.authorship_log.attestations.first().unwrap();
-    assert_eq!(file_attestation.entries.len(), 2);
+    assert_eq!(file_attestation.entries.len(), 1);
 
     let mut attested_lines = file_attestation
         .entries
@@ -109,7 +109,7 @@ fn test_change_across_commits_standard_human() {
         .flat_map(|entry| entry.line_ranges.iter().flat_map(LineRange::expand))
         .collect::<Vec<_>>();
     attested_lines.sort_unstable();
-    assert_eq!(attested_lines, vec![5, 6]);
+    assert_eq!(attested_lines, vec![6]);
     assert!(
         file_attestation
             .entries

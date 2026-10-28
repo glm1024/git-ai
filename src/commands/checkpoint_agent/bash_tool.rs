@@ -1124,6 +1124,103 @@ pub struct BashToolHookContext<'a> {
     pub command: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum BashToolOutcome {
+    Succeeded,
+    Failed,
+    Backgrounded,
+}
+
+impl BashToolOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Backgrounded => "backgrounded",
+        }
+    }
+}
+
+/// Canonical repository-relative evidence key. Reject traversal and absolute
+/// paths rather than interpreting them relative to a later process cwd.
+pub(crate) fn canonical_bash_scope_path(path: &str) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
+    #[cfg(not(windows))]
+    if path.contains('\\') {
+        return None;
+    }
+    let path = path.replace('\\', "/");
+    if path.starts_with('/') || path.as_bytes().get(1) == Some(&b':') || path.contains('\0') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/").nfc().collect())
+}
+
+fn zcode_bash_changed_scope(diff: &StatDiffResult) -> Vec<String> {
+    let mut paths: Vec<String> = diff
+        .created
+        .iter()
+        .chain(&diff.modified)
+        .filter_map(|path| path.to_str().and_then(canonical_bash_scope_path))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn bash_outcome_metadata(
+    agent_id: &AgentId,
+    metadata: Option<&HashMap<String, String>>,
+    outcome: &str,
+) -> HashMap<String, String> {
+    let mut metadata = metadata.cloned().unwrap_or_default();
+    if agent_id.tool == "zcode"
+        && !matches!(
+            metadata.get("tool_outcome").map(String::as_str),
+            Some("failed" | "backgrounded")
+        )
+    {
+        metadata.insert("tool_outcome".into(), outcome.into());
+    }
+    metadata
+}
+
+/// End an invocation without reading its files or claiming successful edits.
+/// The daemon acknowledgement must confirm both active-state cleanup and history
+/// persistence; transport errors and negative acknowledgements remain errors.
+pub fn finish_bash_tool_call_without_snapshot(
+    repo_root: &Path,
+    original_cwd: &Path,
+    context: BashToolHookContext<'_>,
+    outcome: BashToolOutcome,
+) -> Result<(), GitAiError> {
+    let mut metadata =
+        bash_outcome_metadata(context.agent_id, context.agent_metadata, outcome.as_str());
+    metadata
+        .entry("tool_outcome".into())
+        .or_insert_with(|| outcome.as_str().into());
+    metadata.insert("snapshot_without_checkpoint".into(), "true".into());
+    signal_daemon_bash_session_end(BashSessionEndSignal {
+        repo_work_dir: &repo_root.to_string_lossy(),
+        original_cwd,
+        session_id: context.session_id,
+        tool_use_id: context.tool_use_id,
+        agent_id: context.agent_id,
+        metadata: &metadata,
+        trace_id: context.trace_id,
+        ended_at_ns: crate::daemon::bash_history_db::unix_time_ns(),
+        command: context.command,
+    })
+}
+
 pub fn signal_daemon_bash_hook_attempt(
     phase: BashHookAttemptPhase,
     signal: BashHookAttemptSignal<'_>,
@@ -1147,7 +1244,14 @@ pub fn signal_daemon_bash_hook_attempt(
     let session_id = signal.session_id.to_string();
     let tool_use_id = signal.tool_use_id.to_string();
     let agent_id = signal.agent_id.clone();
-    let metadata = signal.metadata.clone();
+    let metadata = bash_outcome_metadata(
+        signal.agent_id,
+        Some(signal.metadata),
+        match phase {
+            BashHookAttemptPhase::Start => "pending",
+            BashHookAttemptPhase::End => "succeeded",
+        },
+    );
     let trace_id = signal.trace_id.to_string();
     let command = signal.command.map(ToString::to_string);
 
@@ -1201,13 +1305,10 @@ struct BashSessionEndSignal<'a> {
 }
 
 /// Signal the daemon that a bash session has ended.
-fn signal_daemon_bash_session_end(signal: BashSessionEndSignal<'_>) {
-    let Some(socket) = effective_daemon_socket() else {
-        return;
-    };
-    if !socket.exists() {
-        return;
-    }
+fn signal_daemon_bash_session_end(signal: BashSessionEndSignal<'_>) -> Result<(), GitAiError> {
+    let socket = effective_daemon_socket().ok_or_else(|| {
+        GitAiError::Generic("no daemon socket available for BashSessionEnd".into())
+    })?;
     let request = ControlRequest::BashSessionEnd {
         repo_work_dir: signal.repo_work_dir.to_string(),
         original_cwd: Some(signal.original_cwd.to_string_lossy().to_string()),
@@ -1219,9 +1320,26 @@ fn signal_daemon_bash_session_end(signal: BashSessionEndSignal<'_>) {
         ended_at_ns: signal.ended_at_ns,
         command: signal.command.map(ToString::to_string),
     };
-    if let Err(e) = send_control_request_with_timeout(&socket, &request, Duration::from_millis(500))
-    {
-        tracing::debug!("Failed to signal bash session end: {}", e);
+    let response =
+        send_control_request_with_timeout(&socket, &request, Duration::from_millis(500))?;
+    if !response.ok {
+        return Err(GitAiError::Generic(format!(
+            "daemon rejected BashSessionEnd: {}",
+            response.error.as_deref().unwrap_or("unknown error")
+        )));
+    }
+    Ok(())
+}
+
+fn signal_daemon_bash_post_session_end(signal: BashSessionEndSignal<'_>) -> Result<(), GitAiError> {
+    let strict = signal.agent_id.tool == "zcode";
+    match signal_daemon_bash_session_end(signal) {
+        Err(error) if strict => Err(error),
+        Err(error) => {
+            tracing::debug!("Failed to signal bash session end: {}", error);
+            Ok(())
+        }
+        Ok(()) => Ok(()),
     }
 }
 
@@ -1309,7 +1427,7 @@ pub fn handle_bash_pre_tool_use_with_context_and_cwd(
         session_id: context.session_id.to_string(),
         tool_use_id: context.tool_use_id.to_string(),
         agent_id: context.agent_id.clone(),
-        metadata: context.agent_metadata.cloned().unwrap_or_default(),
+        metadata: bash_outcome_metadata(context.agent_id, context.agent_metadata, "pending"),
         stat_snapshot: Box::new(snap),
         trace_id: context.trace_id.to_string(),
         started_at_ns,
@@ -1367,7 +1485,11 @@ pub fn handle_bash_post_tool_use_with_cwd(
     let ended_at_ns = crate::daemon::bash_history_db::unix_time_ns();
     let hook_timeout = Duration::from_millis(effective_hook_timeout_ms());
     let repo_working_dir = repo_root.to_string_lossy().to_string();
-    let metadata = context.agent_metadata.cloned().unwrap_or_default();
+    let mut metadata =
+        bash_outcome_metadata(context.agent_id, context.agent_metadata, "capture_failed");
+    if context.agent_id.tool == "zcode" {
+        metadata.insert("snapshot_without_checkpoint".into(), "true".into());
+    }
 
     macro_rules! hook_timeout_fallback {
         ($label:expr) => {{
@@ -1386,7 +1508,7 @@ pub fn handle_bash_post_tool_use_with_cwd(
                     "hook_timeout_ms": hook_timeout.as_millis(),
                 })),
             );
-            signal_daemon_bash_session_end(BashSessionEndSignal {
+            signal_daemon_bash_post_session_end(BashSessionEndSignal {
                 repo_work_dir: &repo_working_dir,
                 original_cwd,
                 session_id: context.session_id,
@@ -1396,7 +1518,7 @@ pub fn handle_bash_post_tool_use_with_cwd(
                 trace_id: context.trace_id,
                 ended_at_ns,
                 command: context.command,
-            });
+            })?;
             return Ok(BashPostHookResult {
                 action: BashCheckpointAction::HookTimeout,
             });
@@ -1420,6 +1542,7 @@ pub fn handle_bash_post_tool_use_with_cwd(
                 } else {
                     None
                 };
+            let mut changed_scope = None;
             let result = match changed_paths_snapshot(
                 repo_root,
                 context.session_id,
@@ -1429,6 +1552,9 @@ pub fn handle_bash_post_tool_use_with_cwd(
             ) {
                 Ok(post) => {
                     let diff_result = diff(&pre, &post);
+                    if context.agent_id.tool == "zcode" && !diff_result.is_empty() {
+                        changed_scope = Some(zcode_bash_changed_scope(&diff_result));
+                    }
 
                     if diff_result.is_empty() {
                         tracing::debug!("Bash tool {}: no changes detected", invocation_key);
@@ -1458,7 +1584,25 @@ pub fn handle_bash_post_tool_use_with_cwd(
                 }
             };
 
-            signal_daemon_bash_session_end(BashSessionEndSignal {
+            if let Ok(result) = &result
+                && matches!(
+                    result.action,
+                    BashCheckpointAction::NoChanges | BashCheckpointAction::Checkpoint(_)
+                )
+            {
+                metadata =
+                    bash_outcome_metadata(context.agent_id, context.agent_metadata, "succeeded");
+                if let Some(paths) = changed_scope {
+                    metadata.insert("bash_changed_paths".into(), serde_json::to_string(&paths)?);
+                }
+                if context.agent_id.tool == "zcode"
+                    && matches!(result.action, BashCheckpointAction::NoChanges)
+                {
+                    metadata.insert("snapshot_without_checkpoint".into(), "true".into());
+                }
+            }
+
+            signal_daemon_bash_post_session_end(BashSessionEndSignal {
                 repo_work_dir: &repo_working_dir,
                 original_cwd,
                 session_id: context.session_id,
@@ -1468,7 +1612,7 @@ pub fn handle_bash_post_tool_use_with_cwd(
                 trace_id: context.trace_id,
                 ended_at_ns,
                 command: context.command,
-            });
+            })?;
 
             result
         }
@@ -1477,7 +1621,7 @@ pub fn handle_bash_post_tool_use_with_cwd(
                 "Pre-snapshot not found in daemon for {}; returning MissingPreSnapshot",
                 invocation_key
             );
-            signal_daemon_bash_session_end(BashSessionEndSignal {
+            signal_daemon_bash_post_session_end(BashSessionEndSignal {
                 repo_work_dir: &repo_working_dir,
                 original_cwd,
                 session_id: context.session_id,
@@ -1487,7 +1631,7 @@ pub fn handle_bash_post_tool_use_with_cwd(
                 trace_id: context.trace_id,
                 ended_at_ns,
                 command: context.command,
-            });
+            })?;
             Ok(BashPostHookResult {
                 action: BashCheckpointAction::MissingPreSnapshot,
             })
@@ -1504,6 +1648,127 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::Duration;
+
+    #[test]
+    fn zcode_bash_scope_records_only_normalized_observed_relative_paths() {
+        let diff = StatDiffResult {
+            created: vec![
+                PathBuf::from("./src/new.rs"),
+                PathBuf::from("../outside.rs"),
+            ],
+            modified: vec![
+                PathBuf::from("src/edited.rs"),
+                PathBuf::from("/absolute.rs"),
+            ],
+        };
+        assert_eq!(
+            zcode_bash_changed_scope(&diff),
+            vec!["src/edited.rs", "src/new.rs"]
+        );
+        assert_eq!(
+            canonical_bash_scope_path("./src/file.rs"),
+            Some("src/file.rs".into())
+        );
+        assert!(canonical_bash_scope_path("../outside.rs").is_none());
+        assert!(canonical_bash_scope_path("C:/outside.rs").is_none());
+        assert!(canonical_bash_scope_path("/absolute.rs").is_none());
+    }
+
+    #[test]
+    fn zcode_bash_metadata_requires_terminal_capture_and_preserves_declared_failure() {
+        let agent = AgentId {
+            tool: "zcode".into(),
+            id: "session".into(),
+            model: "unknown".into(),
+        };
+        assert_eq!(
+            bash_outcome_metadata(&agent, None, "pending")["tool_outcome"],
+            "pending"
+        );
+        assert_eq!(
+            bash_outcome_metadata(&agent, None, "succeeded")["tool_outcome"],
+            "succeeded"
+        );
+        for outcome in ["failed", "backgrounded"] {
+            let existing = HashMap::from([("tool_outcome".into(), outcome.into())]);
+            assert_eq!(
+                bash_outcome_metadata(&agent, Some(&existing), "succeeded")["tool_outcome"],
+                outcome
+            );
+        }
+        let legacy = AgentId {
+            tool: "codex".into(),
+            ..agent
+        };
+        assert!(bash_outcome_metadata(&legacy, None, "pending").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_bash_finish_sends_only_end_and_checks_rejection() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        for (outcome, expected, accepted) in [
+            (BashToolOutcome::Failed, "failed", true),
+            (BashToolOutcome::Backgrounded, "backgrounded", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("end.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            set_daemon_socket_for_test(socket);
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: ControlRequest = serde_json::from_str(&line).unwrap();
+                let response = if accepted {
+                    "{\"ok\":true}\n"
+                } else {
+                    "{\"ok\":false,\"error\":\"disk rejected\"}\n"
+                };
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+                request
+            });
+            let agent = AgentId {
+                tool: "zcode".into(),
+                id: "session".into(),
+                model: "unknown".into(),
+            };
+            // No repository or file snapshot is needed to issue a terminal signal.
+            let result = finish_bash_tool_call_without_snapshot(
+                Path::new("/not-a-repository"),
+                Path::new("/original"),
+                BashToolHookContext {
+                    session_id: "session",
+                    tool_use_id: "call",
+                    agent_id: &agent,
+                    agent_metadata: None,
+                    trace_id: "end",
+                    command: Some("false"),
+                },
+                outcome,
+            );
+            assert_eq!(result.is_ok(), accepted);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("disk rejected"));
+            }
+            match server.join().unwrap() {
+                ControlRequest::BashSessionEnd {
+                    session_id,
+                    tool_use_id,
+                    metadata,
+                    ..
+                } => {
+                    assert_eq!(session_id, "session");
+                    assert_eq!(tool_use_id, "call");
+                    assert_eq!(metadata["tool_outcome"], expected);
+                }
+                _ => panic!("finish must send only BashSessionEnd"),
+            }
+            TEST_DAEMON_SOCKET.with(|value| value.borrow_mut().take());
+        }
+    }
 
     #[test]
     fn test_git_status_fallback_disables_optional_index_locks() {

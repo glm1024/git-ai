@@ -53,5 +53,5 @@ pub use db::{StreamRecord, StreamsDatabase};
 pub use types::{StreamBatch, StreamError};
 pub use watermark::{
     ByteOffsetWatermark, HybridWatermark, RecordIndexWatermark, TimestampCursorWatermark,
-    TimestampWatermark, WatermarkStrategy, WatermarkType,
+    TimestampWatermark, WatermarkStrategy, WatermarkType, ZCodeWatermark,
 };

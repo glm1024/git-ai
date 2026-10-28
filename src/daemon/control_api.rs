@@ -12,6 +12,11 @@ pub enum ControlRequest {
     Ping,
     #[serde(rename = "checkpoint.run")]
     CheckpointRun { body_bytes: u64 },
+    /// Durably enroll usage before the next model call, without requiring edits.
+    #[serde(rename = "agent_session.activity")]
+    AgentSessionActivity {
+        activity: crate::commands::checkpoint_agent::presets::SessionActivity,
+    },
     #[serde(rename = "sync.family")]
     SyncFamily { repo_working_dir: String },
     #[serde(rename = "status.family")]

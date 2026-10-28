@@ -1,0 +1,86 @@
+{
+  "inspection_date": "2026-10-28",
+  "method": "Read-only package metadata and static source inspection; no app/CLI/model execution",
+  "application_path": "/Applications/ZCode.app",
+  "bundle": {
+    "CFBundleIdentifier": "dev.zcode.app",
+    "CFBundleShortVersionString": "3.16.3",
+    "CFBundleVersion": "3.16.3.8992"
+  },
+  "package": {
+    "name": "@zcode/desktop",
+    "version": "3.16.3",
+    "main": "out/main/index.js",
+    "homepage": "https://zcode.z.ai"
+  },
+  "agent_bundle": {
+    "path": "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+    "bytes": 15242397,
+    "sha256": "97490d0f06a7a225d54d47817acf4b4859cdb268b59f2490caaeda982bef063a"
+  },
+  "static_checks": {
+    "hook_input_serializer": {
+      "present": true,
+      "source_character_offset": 5230286
+    },
+    "hook_transcript_formatter": {
+      "present": true,
+      "source_character_offset": 5232437
+    },
+    "pre_tool_hook_constructor": {
+      "present": true,
+      "source_character_offset": 5162007
+    },
+    "post_tool_hook_constructor": {
+      "present": true,
+      "source_character_offset": 5163689
+    },
+    "failure_hook_constructor": {
+      "present": true,
+      "source_character_offset": 5164230
+    },
+    "session_start_model": {
+      "present": true,
+      "source_character_offset": 13272234
+    },
+    "write_input_schema": {
+      "present": true,
+      "source_character_offset": 1433317
+    },
+    "edit_input_schema": {
+      "present": true,
+      "source_character_offset": 1434537
+    },
+    "bash_input_schema": {
+      "present": true,
+      "source_character_offset": 1437724
+    },
+    "default_hooks_disabled": {
+      "present": true,
+      "source_character_offset": 1394027
+    },
+    "project_hook_pending_trust": {
+      "present": true,
+      "source_character_offset": 4240876
+    },
+    "default_session_db": {
+      "present": true,
+      "source_character_offset": 1393503
+    },
+    "model_usage_table": {
+      "present": true,
+      "source_character_offset": 1561066
+    },
+    "applypatch_compat_alias": {
+      "present": true,
+      "source_character_offset": 5080453
+    }
+  },
+  "default_user_data_root_present": false,
+  "public_source_reference": "https://github.com/zai-org/ZCode/tree/3c5b227649371507ddc4eb46ac5133afe6db1cab",
+  "public_source_matches_installed_build": null,
+  "runtime_hook_delivery_verified": false,
+  "runtime_model_mapping_verified": false,
+  "runtime_token_collection_verified": false,
+  "runtime_git_trace2_verified": false
+}

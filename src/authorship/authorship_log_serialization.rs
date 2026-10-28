@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use unicode_normalization::UnicodeNormalization;
 
 /// Authorship log format version identifier
 pub const AUTHORSHIP_LOG_VERSION: &str = "authorship/3.0.0";
@@ -160,6 +161,18 @@ impl AuthorshipLog {
             .unwrap()
     }
 
+    /// Bound trace metadata only when finalizing a newly generated note.
+    /// Reading or serializing historical notes does not invoke this cleanup.
+    pub fn retain_referenced_trace_models(&mut self) {
+        SessionRecord::retain_referenced_trace_models(
+            &mut self.metadata.sessions,
+            self.attestations
+                .iter()
+                .flat_map(|file| &file.entries)
+                .map(|entry| entry.hash.as_str()),
+        );
+    }
+
     /// Serialize to the new text format
     pub fn serialize_to_string(&self) -> Result<String, fmt::Error> {
         let mut output = String::new();
@@ -211,7 +224,17 @@ impl AuthorshipLog {
         // Parse JSON metadata section (after divider)
         let json_lines = &lines[divider_pos + 1..];
         let json_content = json_lines.join("\n");
-        let metadata: AuthorshipMetadata = serde_json::from_str(&json_content)?;
+        let mut metadata: AuthorshipMetadata = serde_json::from_str(&json_content)?;
+        // Legacy session records describe all traces in their own note with one
+        // model. Materialize that explicit evidence before merging other notes.
+        for entry in attestations.iter().flat_map(|file| &file.entries) {
+            if let Some((session_id, trace_id)) = entry.hash.split_once("::")
+                && let Some(session) = metadata.sessions.get_mut(session_id)
+            {
+                let model = session.agent_id.model.clone();
+                session.record_trace_model(trace_id, &model);
+            }
+        }
 
         Ok(Self {
             attestations,
@@ -227,8 +250,18 @@ impl AuthorshipLog {
         line: u32,
         foreign_prompts_cache: &mut HashMap<String, Option<PromptRecord>>,
     ) -> Option<(Author, Option<String>, Option<PromptRecord>)> {
-        // Find the file attestation
-        let file_attestation = self.attestations.iter().find(|f| f.file_path == file)?;
+        // Notes use NFC paths, while Git can retain a decomposed spelling in
+        // the tree. Preserve exact historical matches before normalizing.
+        let file_attestation = self
+            .attestations
+            .iter()
+            .find(|f| f.file_path == file)
+            .or_else(|| {
+                let normalized: String = file.nfc().collect();
+                self.attestations
+                    .iter()
+                    .find(|f| f.file_path.nfc().eq(normalized.chars()))
+            })?;
 
         // Check entries in reverse order (latest wins)
         for entry in file_attestation.entries.iter().rev() {
@@ -258,16 +291,7 @@ impl AuthorshipLog {
                     if let Some(session_record) = self.metadata.sessions.get(session_key) {
                         // Create a PromptRecord-like structure from SessionRecord for compatibility
                         // Note: sessions don't have message transcripts or detailed stats
-                        let prompt_record = PromptRecord {
-                            agent_id: session_record.agent_id.clone(),
-                            human_author: session_record.human_author.clone(),
-                            total_additions: 0, // Sessions don't track detailed stats
-                            total_deletions: 0,
-                            accepted_lines: 0,
-                            overriden_lines: 0,
-                            custom_attributes: session_record.custom_attributes.clone(),
-                            messages_url: None,
-                        };
+                        let prompt_record = session_record.to_prompt_record_for_author(&entry.hash);
                         return Some((
                             Author {
                                 username: session_record.agent_id.tool.clone(),
@@ -515,6 +539,72 @@ pub fn generate_trace_id() -> String {
 mod tests {
     use super::*;
     use insta::assert_debug_snapshot;
+
+    #[test]
+    fn note_trace_models_are_pruned_only_by_explicit_finalization() {
+        let mut log = AuthorshipLog::new();
+        log.get_or_create_file("file.txt")
+            .add_entry(AttestationEntry::new(
+                "s_fixture::t_keep".to_string(),
+                vec![LineRange::Single(1)],
+            ));
+        log.metadata.sessions.insert("s_fixture".to_string(), serde_json::from_value(serde_json::json!({
+            "agent_id": {"tool": "fixture", "id": "real-conversation", "model": "legacy-default"},
+            "trace_models": {"t_keep": "model-A", "t_unused": "model-B"},
+            "human_author": null,
+        })).unwrap());
+        let original = log.serialize_to_string().unwrap();
+        let read = AuthorshipLog::deserialize_from_string(&original).unwrap();
+        assert_eq!(read.metadata.sessions["s_fixture"].trace_models.len(), 2);
+        assert!(read.serialize_to_string().unwrap().contains("t_unused"));
+        log.retain_referenced_trace_models();
+        let session = &log.metadata.sessions["s_fixture"];
+        assert_eq!(session.trace_models.len(), 1);
+        assert_eq!(session.agent_id.model, "legacy-default");
+        assert_eq!(
+            session.agent_id_for_author("s_fixture::t_keep").model,
+            "model-A"
+        );
+        assert!(!log.serialize_to_string().unwrap().contains("t_unused"));
+    }
+
+    #[test]
+    fn legacy_session_note_trace_models_survive_merging() {
+        let legacy = r#"file.txt
+  s_fixture::t_legacy 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "legacy",
+  "base_commit_sha": "base",
+  "prompts": {},
+  "sessions": {
+    "s_fixture": {
+      "agent_id": {"tool": "fixture", "id": "real-conversation", "model": "model-A"},
+      "human_author": null
+    }
+  }
+}"#;
+        let original = AuthorshipLog::deserialize_from_string(legacy).unwrap();
+        let old = &original.metadata.sessions["s_fixture"];
+        let mut current = old.clone();
+        current.agent_id.model = "model-B".into();
+        current.trace_models.clear();
+        current.record_trace_model("t_new", "model-B");
+        current.merge_from(old);
+        assert_eq!(
+            current.agent_id_for_author("s_fixture::t_legacy").model,
+            "model-A"
+        );
+        assert_eq!(
+            current.agent_id_for_author("s_fixture::t_new").model,
+            "model-B"
+        );
+        let roundtrip =
+            AuthorshipLog::deserialize_from_string(&original.serialize_to_string().unwrap())
+                .unwrap();
+        assert_eq!(original, roundtrip);
+    }
 
     #[test]
     fn test_format_line_ranges() {

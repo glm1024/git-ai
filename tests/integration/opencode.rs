@@ -147,6 +147,8 @@ fn test_opencode_preset_pretooluse_returns_human_checkpoint() {
     let hook_input = json!({
         "hook_event_name": "PreToolUse",
         "session_id": "test-session-123",
+        "tool_name": "edit",
+        "tool_use_id": "test-edit-call",
         "cwd": "/Users/test/project",
         "tool_input": {
             "filePath": "/Users/test/project/index.ts"
@@ -190,6 +192,8 @@ fn test_opencode_preset_posttooluse_returns_ai_checkpoint() {
     let hook_input = json!({
         "hook_event_name": "PostToolUse",
         "session_id": "test-session-123",
+        "tool_name": "edit",
+        "tool_use_id": "test-edit-call",
         "cwd": "/Users/test/project",
         "tool_input": {
             "filePath": "/Users/test/project/index.ts"
@@ -240,6 +244,8 @@ fn test_opencode_preset_stores_session_id_in_metadata() {
     let hook_input = json!({
         "hook_event_name": "PostToolUse",
         "session_id": "test-session-123",
+        "tool_name": "edit",
+        "tool_use_id": "test-edit-call",
         "cwd": "/Users/test/project",
         "tool_input": {
             "filePath": "/Users/test/project/index.ts"
@@ -281,6 +287,8 @@ fn test_opencode_preset_sets_repo_working_dir() {
     let hook_input = json!({
         "hook_event_name": "PostToolUse",
         "session_id": "test-session-123",
+        "tool_name": "edit",
+        "tool_use_id": "test-edit-call",
         "cwd": "/Users/test/my-project",
         "tool_input": {
             "filePath": "/Users/test/my-project/src/main.ts"

@@ -15,6 +15,7 @@ mod pi;
 mod visual_studio;
 mod vscode;
 mod windsurf;
+mod zcode;
 
 pub use amp::AmpInstaller;
 pub use claude_code::ClaudeCodeInstaller;
@@ -33,6 +34,7 @@ pub use pi::PiInstaller;
 pub use visual_studio::VisualStudioInstaller;
 pub use vscode::VSCodeInstaller;
 pub use windsurf::WindsurfInstaller;
+pub use zcode::ZCodeInstaller;
 
 use super::hook_installer::HookInstaller;
 
@@ -48,6 +50,7 @@ pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
         Box::new(AmpInstaller),
         Box::new(OpenCodeInstaller),
         Box::new(KiloInstaller),
+        Box::new(ZCodeInstaller),
         Box::new(PiInstaller),
         Box::new(GeminiInstaller),
         Box::new(DroidInstaller),

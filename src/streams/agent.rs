@@ -91,6 +91,12 @@ pub trait Agent: Send + Sync {
     /// The coordinator will compare against the DB to decide what to process.
     fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>, StreamError>;
 
+    /// Poll only previously enrolled sessions, including multiplexed SQLite
+    /// sources whose WAL writes do not change the main file's metadata.
+    fn polls_tracked_sessions(&self) -> bool {
+        false
+    }
+
     /// Maximum number of events to return per `read_incremental` call.
     /// Bounds peak memory to batch_size × avg_event_size instead of file_size.
     /// The caller loops until an empty batch is returned.
@@ -189,6 +195,7 @@ const ALL_AGENT_TYPES: &[&str] = &[
     "amp",
     "opencode",
     "kilo",
+    "zcode",
     "pi",
 ];
 
@@ -210,6 +217,7 @@ pub fn get_agent(agent_type: &str) -> Option<Box<dyn Agent>> {
         "codex" => Some(Box::new(super::agents::CodexAgent::new())),
         "amp" => Some(Box::new(super::agents::AmpAgent::new())),
         "opencode" | "kilo" => Some(Box::new(super::agents::OpenCodeAgent::new())),
+        "zcode" => Some(Box::new(super::agents::ZCodeAgent::new())),
         "pi" => Some(Box::new(super::agents::PiAgent::new())),
         _ => None,
     }

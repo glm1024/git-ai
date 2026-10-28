@@ -2,8 +2,8 @@ use crate::authorship::authorship_log_serialization::generate_trace_id;
 use crate::authorship::working_log::{AgentId, CheckpointKind};
 use crate::checkpoint_content_budget::CheckpointContentBudget;
 use crate::commands::checkpoint_agent::presets::{
-    KnownHumanEdit, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    StreamSource, UntrackedEdit,
+    FailedToolCall, KnownHumanEdit, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall,
+    PreFileEdit, SessionActivity, StreamSource, UntrackedEdit,
 };
 use crate::config;
 use crate::daemon::checkpoint::PreparedPathRole;
@@ -417,7 +417,10 @@ fn execute_preset_checkpoint_with_mode(
 
     let trace_id = generate_trace_id();
     let preset = super::presets::resolve_preset(preset_name)?;
-    let events = preset.parse(hook_input, &trace_id)?;
+    let mut events = preset.parse(hook_input, &trace_id)?;
+    // Enroll usage before preparing files. Token-only sessions and tools outside
+    // a Git worktree must not depend on checkpoint preparation succeeding.
+    events.sort_by_key(|event| !matches!(event, ParsedHookEvent::SessionActivity(_)));
     let events_len = events.len();
 
     if perf {
@@ -535,7 +538,95 @@ fn execute_event(
         ParsedHookEvent::PostBashCall(e) => execute_post_bash_call(e, strict_errors),
         ParsedHookEvent::KnownHumanEdit(e) => execute_known_human_edit(e),
         ParsedHookEvent::UntrackedEdit(e) => execute_untracked_edit(e),
+        ParsedHookEvent::SessionActivity(e) => execute_session_activity(e),
+        ParsedHookEvent::FailedToolCall(e) => execute_failed_tool_call(e, strict_errors),
     }
+}
+
+fn execute_session_activity(e: SessionActivity) -> Result<Vec<CheckpointRequest>, GitAiError> {
+    use crate::daemon::{
+        DaemonConfig, control_api::ControlRequest, send_control_request_with_timeout,
+    };
+    let config = DaemonConfig::from_env_or_default_paths()?;
+    let response = send_control_request_with_timeout(
+        &config.control_socket_path,
+        &ControlRequest::AgentSessionActivity { activity: e },
+        std::time::Duration::from_secs(5),
+    )?;
+    if !response.ok {
+        return Err(GitAiError::PresetError(response.error.unwrap_or_else(
+            || "daemon rejected agent session registration".to_string(),
+        )));
+    }
+    Ok(vec![])
+}
+
+fn execute_failed_tool_call(
+    e: FailedToolCall,
+    strict_errors: bool,
+) -> Result<Vec<CheckpointRequest>, GitAiError> {
+    if e.bash {
+        use crate::commands::checkpoint_agent::bash_tool::{
+            self, BashToolHookContext, BashToolOutcome,
+        };
+        let outcome =
+            if e.context.metadata.get("tool_outcome").map(String::as_str) == Some("backgrounded") {
+                BashToolOutcome::Backgrounded
+            } else {
+                BashToolOutcome::Failed
+            };
+        let result = execute_post_bash_call(
+            PostBashCall {
+                context: e.context.clone(),
+                tool_use_id: e.tool_use_id.clone(),
+                command: e.command.clone(),
+                stream_source: e.stream_source,
+            },
+            strict_errors,
+        );
+        // A prepared Unknown checkpoint clears its call only after it applies.
+        // When there is no checkpoint, explicitly terminate even on snapshot failure.
+        if !result.as_ref().is_ok_and(|requests| !requests.is_empty()) {
+            let repo =
+                worktree_root_for_path(&e.context.cwd).unwrap_or_else(|| e.context.cwd.clone());
+            bash_tool::finish_bash_tool_call_without_snapshot(
+                &repo,
+                &e.context.cwd,
+                BashToolHookContext {
+                    session_id: &e.context.external_session_id,
+                    tool_use_id: &e.tool_use_id,
+                    agent_id: &e.context.agent_id,
+                    agent_metadata: Some(&e.context.metadata),
+                    trace_id: &e.context.trace_id,
+                    command: e.command.as_deref(),
+                },
+                outcome,
+            )?;
+        }
+        return result.map(|mut requests| {
+            for request in &mut requests {
+                request.checkpoint_kind = CheckpointKind::Human;
+            }
+            requests
+        });
+    }
+    let files = build_checkpoint_files(&e.file_paths, None, strict_errors)?;
+    let mut metadata = e.context.metadata;
+    metadata.insert("tool_use_id".into(), e.tool_use_id);
+    metadata.insert("edit_kind".into(), "file_edit".into());
+    let requests = split_files_into_requests(
+        files,
+        e.context.trace_id,
+        CheckpointKind::Human,
+        Some(e.context.agent_id),
+        PreparedPathRole::Edited,
+        e.stream_source,
+        metadata,
+    );
+    if strict_errors {
+        ensure_strict_file_coverage(&e.file_paths, &requests, "Failed tool")?;
+    }
+    Ok(requests)
 }
 
 fn split_files_into_requests(
@@ -749,9 +840,10 @@ fn execute_pre_bash_call(
         }
     };
 
-    if config::Config::get()
-        .get_feature_flags()
-        .bash_checkpoints_v2
+    if e.context.agent_id.tool != "zcode"
+        && config::Config::get()
+            .get_feature_flags()
+            .bash_checkpoints_v2
     {
         let signal_result = bash_tool::signal_daemon_bash_hook_attempt(
             BashHookAttemptPhase::Start,
@@ -920,9 +1012,10 @@ fn execute_post_bash_call(
         }
     };
 
-    if config::Config::get()
-        .get_feature_flags()
-        .bash_checkpoints_v2
+    if e.context.agent_id.tool != "zcode"
+        && config::Config::get()
+            .get_feature_flags()
+            .bash_checkpoints_v2
     {
         let signal_result = bash_tool::signal_daemon_bash_hook_attempt(
             BashHookAttemptPhase::End,
@@ -990,6 +1083,23 @@ fn execute_post_bash_call(
     };
 
     let checkpoint_files = build_bash_checkpoint_files(&file_paths, strict_errors)?;
+    if strict_errors && e.context.agent_id.tool == "zcode" && checkpoint_files.files.is_empty() {
+        // A proven no-op or binary-only change has no checkpoint to clear its
+        // pending scope. The helper preserves any declared failure outcome.
+        bash_tool::finish_bash_tool_call_without_snapshot(
+            &repo_work_dir,
+            &e.context.cwd,
+            bash_tool::BashToolHookContext {
+                session_id: &e.context.external_session_id,
+                tool_use_id: &e.tool_use_id,
+                agent_id: &e.context.agent_id,
+                agent_metadata: Some(&e.context.metadata),
+                trace_id: &e.context.trace_id,
+                command: e.command.as_deref(),
+            },
+            bash_tool::BashToolOutcome::Succeeded,
+        )?;
+    }
     let expected_paths: Vec<PathBuf> = file_paths
         .iter()
         .filter(|path| {

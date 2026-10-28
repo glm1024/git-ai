@@ -13,9 +13,10 @@ use crate::authorship::working_log::{Checkpoint, CheckpointKind, WorkingLogEntry
 use crate::config::Config;
 use crate::error::GitAiError;
 use crate::git::notes_api::{read_note, write_note};
-use crate::git::repository::{Repository, batch_read_paths_at_treeishes, exec_git};
+use crate::git::repository::{Repository, exec_git};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+use unicode_normalization::UnicodeNormalization;
 
 /// Skip expensive post-commit stats when this threshold is exceeded.
 /// High hunk density is the strongest predictor of slow diff_ai_accepted_stats.
@@ -328,8 +329,8 @@ where
     }
 
     let committed_diff_base = single_commit_diff_base(&parent_sha, &commit_sha);
-    let (mut authorship_log, initial_attributions, initial_file_contents) = working_va
-        .to_authorship_log_and_initial_working_log_with_precomputed_diff(
+    let (mut authorship_log, initial_attributions, initial_file_contents, protected_lines) =
+        working_va.to_authorship_log_and_initial_working_log_with_precomputed_diff(
             repo,
             &parent_sha,
             &commit_sha,
@@ -338,6 +339,9 @@ where
             AuthorshipLogDiffContext {
                 precomputed_parent_diff: context.precomputed_parent_diff,
                 fallback_committed_diff_base: Some(&committed_diff_base),
+                recovery_observed_snapshot: Some(&observed_snapshot),
+                preexisting_only_from_observed: false,
+                committed_sources: None,
             },
         )?;
 
@@ -386,6 +390,14 @@ where
                 })
         };
         if let Some(committed_hunks) = committed_hunks {
+            let committed_hunks = crate::authorship::attribution_recovery::exclude_protected_lines(
+                committed_hunks,
+                Some(&protected_lines.overwritten),
+            );
+            let committed_hunks = crate::authorship::attribution_recovery::exclude_protected_lines(
+                committed_hunks,
+                Some(&protected_lines.preexisting),
+            );
             crate::authorship::background_agent::fill_unattributed_lines(
                 &mut authorship_log,
                 &committed_hunks,
@@ -419,6 +431,8 @@ where
                 file_timestamps: context.recovery_file_timestamps,
                 precomputed_parent_diff: context.precomputed_parent_diff,
                 before_external_recovery: context.before_external_recovery,
+                protected_lines: Some(&protected_lines.overwritten),
+                preexisting_lines: Some(&protected_lines.preexisting),
             },
         )?;
         authorship_log.metadata.base_commit_sha = commit_sha.clone();
@@ -440,6 +454,7 @@ where
         }
     }
 
+    authorship_log.retain_referenced_trace_models();
     let authorship_note_str = authorship_log
         .serialize_to_string()
         .map_err(|_| GitAiError::Generic("Failed to serialize authorship log".to_string()))?;
@@ -655,19 +670,18 @@ fn commit_tree_snapshot_for_files(
     commit_sha: &str,
     file_paths: &HashSet<String>,
 ) -> Result<HashMap<String, String>, GitAiError> {
-    let requests = file_paths
-        .iter()
-        .map(|file_path| (commit_sha.to_string(), file_path.clone()))
-        .collect::<Vec<_>>();
-    let contents = batch_read_paths_at_treeishes(repo, &requests)?;
+    let contents = crate::authorship::virtual_attribution::committed_projection_contents(
+        repo,
+        commit_sha,
+        file_paths.iter().cloned(),
+        &HashMap::new(),
+    )?;
     let mut snapshot = HashMap::with_capacity(file_paths.len());
     for file_path in file_paths {
+        let normalized: String = file_path.nfc().collect();
         snapshot.insert(
             file_path.clone(),
-            contents
-                .get(&(commit_sha.to_string(), file_path.clone()))
-                .cloned()
-                .unwrap_or_default(),
+            contents.get(&normalized).cloned().unwrap_or_default(),
         );
     }
 
@@ -768,9 +782,9 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
     }
     let pathspecs_vec: Vec<String> = pathspecs.iter().cloned().collect();
     let observed_snapshot = working_log.observed_file_snapshot()?;
-    let mut final_state_snapshot =
-        commit_tree_snapshot_for_files(repo, amended_commit, &pathspecs)?;
-    final_state_snapshot.extend(observed_snapshot);
+    let committed_snapshot = commit_tree_snapshot_for_files(repo, amended_commit, &pathspecs)?;
+    let mut final_state_snapshot = committed_snapshot.clone();
+    final_state_snapshot.extend(observed_snapshot.clone());
 
     // Check if original commit has existing authorship data. Read through
     // notes_api so the HTTP notes backend is honored (the note may only exist
@@ -783,8 +797,13 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
         })
         .unwrap_or(false);
 
-    let working_va = crate::tokio_runtime::block_on(async {
-        VirtualAttributions::from_working_log_for_commit_snapshot(
+    let (
+        working_va,
+        mut amend_protected_lines,
+        committed_checkpoint_source,
+        committed_blame_source,
+    ) = crate::tokio_runtime::block_on(async {
+        VirtualAttributions::from_working_log_for_commit_snapshot_with_protection(
             repo.clone(),
             original_commit.to_string(),
             &pathspecs_vec,
@@ -795,6 +814,7 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
             },
             None,
             &final_state_snapshot,
+            &committed_snapshot,
         )
         .await
     })?;
@@ -810,14 +830,22 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
         "initial".to_string()
     };
 
-    let (mut authorship_log, initial_attributions, initial_file_contents) = working_va
-        .to_authorship_log_and_initial_working_log(
+    let (mut authorship_log, initial_attributions, initial_file_contents, protected_lines) =
+        working_va.to_authorship_log_and_initial_working_log_with_precomputed_diff(
             repo,
             &parent_sha,
             amended_commit,
             Some(&pathspecs),
             Some(&final_state_snapshot),
+            AuthorshipLogDiffContext {
+                recovery_observed_snapshot: Some(&observed_snapshot),
+                preexisting_only_from_observed: true,
+                committed_sources: Some((&committed_checkpoint_source, &committed_blame_source)),
+                ..AuthorshipLogDiffContext::default()
+            },
         )?;
+
+    amend_protected_lines.extend(protected_lines);
 
     authorship_log.metadata.base_commit_sha = amended_commit.to_string();
 
@@ -846,6 +874,14 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
                     )
                 })
                 .collect();
+            let committed_hunks = crate::authorship::attribution_recovery::exclude_protected_lines(
+                committed_hunks,
+                Some(&amend_protected_lines.overwritten),
+            );
+            let committed_hunks = crate::authorship::attribution_recovery::exclude_protected_lines(
+                committed_hunks,
+                Some(&amend_protected_lines.preexisting),
+            );
             crate::authorship::background_agent::fill_unattributed_lines(
                 &mut authorship_log,
                 &committed_hunks,
@@ -866,6 +902,8 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
             file_timestamps: recovery_file_timestamps,
             precomputed_parent_diff: None,
             before_external_recovery,
+            protected_lines: Some(&amend_protected_lines.overwritten),
+            preexisting_lines: Some(&amend_protected_lines.preexisting),
         },
     )?;
     authorship_log.metadata.base_commit_sha = amended_commit.to_string();
@@ -899,7 +937,12 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
             .collect();
         for (id, record) in original_log.metadata.sessions {
             if referenced_session_ids.contains(&id) {
-                authorship_log.metadata.sessions.entry(id).or_insert(record);
+                authorship_log
+                    .metadata
+                    .sessions
+                    .entry(id)
+                    .and_modify(|existing| existing.merge_from(&record))
+                    .or_insert(record);
             }
         }
     }
@@ -915,6 +958,7 @@ pub(crate) fn post_commit_amend_with_recovery_timestamps_detailed(
         }
     }
 
+    authorship_log.retain_referenced_trace_models();
     let authorship_note_str = authorship_log
         .serialize_to_string()
         .map_err(|_| GitAiError::Generic("Failed to serialize authorship log".to_string()))?;

@@ -26,7 +26,7 @@ fn isolated_bash_history_db_path() -> (tempfile::TempDir, String) {
 }
 
 #[test]
-fn test_bash_pre_legacy_checkpoint_recovers_dirty_edge_attribution() {
+fn test_bash_pre_legacy_checkpoint_preserves_dirty_unknown_attribution() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("example.txt");
 
@@ -50,7 +50,7 @@ fn test_bash_pre_legacy_checkpoint_recovers_dirty_edge_attribution() {
     repo.stage_all_and_commit("After bash").unwrap();
     file.assert_committed_lines(lines![
         "original line".unattributed_human(),
-        "dirty pre-bash line".ai(),
+        "dirty pre-bash line".unattributed_human(),
         "ai bash line".ai(),
     ]);
 }
@@ -109,7 +109,7 @@ fn test_bash_multiple_files_mixed_dirty_state() {
     repo.stage_all_and_commit("After bash").unwrap();
     file_a.assert_committed_lines(lines![
         "line a".unattributed_human(),
-        "dirty touched a".ai(),
+        "dirty touched a".unattributed_human(),
         "bash touched a".ai(),
     ]);
     file_b.assert_committed_lines(lines!["line b".unattributed_human(), "bash touched b".ai()]);
@@ -431,7 +431,12 @@ fn test_bash_recovery_uses_commit_time_file_timestamps_when_processing_is_delaye
     .unwrap();
 
     let mut file = repo.filename("delayed.txt");
-    file.assert_committed_lines(lines!["dirty pre-bash line".ai(), "ai bash line".ai(),]);
+    // The pre-hook observed the dirty line before this Bash call. Delayed
+    // processing must preserve its unknown source and the real AI edit.
+    file.assert_committed_lines(lines![
+        "dirty pre-bash line".unattributed_human(),
+        "ai bash line".ai(),
+    ]);
 }
 
 #[test]
@@ -868,7 +873,7 @@ fn test_bash_history_recovers_shifted_dirty_lines_present_before_bash() {
 }
 
 #[test]
-fn test_edge_extension_recovers_unknown_gap_between_ai_attributions() {
+fn test_unknown_gap_between_ai_attributions_stays_unknown() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("edge.txt");
 
@@ -894,13 +899,13 @@ fn test_edge_extension_recovers_unknown_gap_between_ai_attributions() {
     file.assert_committed_lines(lines![
         "base".unattributed_human(),
         "ai before edited".ai(),
-        "unknown gap".ai(),
+        "unknown gap".unattributed_human(),
         "ai after edited".ai(),
     ]);
 }
 
 #[test]
-fn test_edge_extension_recovers_leading_and_trailing_unknown_lines_near_ai_block() {
+fn test_unknown_lines_near_ai_block_stay_unknown() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("edge-fringes.txt");
 
@@ -948,13 +953,13 @@ trailing dirty 4
     let mut file = repo.filename("edge-fringes.txt");
     file.assert_committed_lines(lines![
         "base".unattributed_human(),
-        "leading dirty".ai(),
+        "leading dirty".unattributed_human(),
         "ai one".ai(),
         "ai two".ai(),
         "ai three".ai(),
-        "trailing dirty 1".ai(),
-        "trailing dirty 2".ai(),
-        "trailing dirty 3".ai(),
+        "trailing dirty 1".unattributed_human(),
+        "trailing dirty 2".unattributed_human(),
+        "trailing dirty 3".unattributed_human(),
         "trailing dirty 4".unattributed_human(),
     ]);
 }
@@ -1108,10 +1113,6 @@ fn claude_file_edit_checkpoint(
         .expect("claude checkpoint should succeed");
 }
 
-fn wait_for_edge_recovery_metric(db_path: &str) -> MetricEvent {
-    wait_for_recovery_metric(db_path, "recovered_edge_extension")
-}
-
 fn wait_for_recovery_metric(db_path: &str, checkpoint_type: &str) -> MetricEvent {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1135,7 +1136,7 @@ fn wait_for_recovery_metric(db_path: &str, checkpoint_type: &str) -> MetricEvent
 }
 
 #[test]
-fn test_edge_extension_recovery_metric_copies_source_session_tool_and_model() {
+fn test_unknown_gap_does_not_generate_edge_recovery_metric() {
     let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
     let repo =
         TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
@@ -1152,9 +1153,8 @@ fn test_edge_extension_recovery_metric_copies_source_session_tool_and_model() {
     fs::write(&file_path, "base\n").unwrap();
     repo.stage_all_and_commit("Initial commit").unwrap();
 
-    // Two AI checkpoints so the neighboring lines get different traces.
-    // Edge recovery bridges this same-session gap under a new trace with its
-    // own metric; commit serialization must not borrow either original trace.
+    // Even two same-session AI checkpoints cannot establish the provenance of
+    // an unobserved insertion between their lines.
     fs::write(&file_path, "base\nai before\n").unwrap();
     claude_file_edit_checkpoint(&repo, &file_path, &transcript_path, "PreToolUse");
     fs::write(&file_path, "base\nai before edited\n").unwrap();
@@ -1178,24 +1178,19 @@ fn test_edge_extension_recovery_metric_copies_source_session_tool_and_model() {
     file.assert_committed_lines(lines![
         "base".unattributed_human(),
         "ai before edited".ai(),
-        "unknown gap".ai(),
+        "unknown gap".unattributed_human(),
         "ai after edited".ai(),
     ]);
 
-    let event = wait_for_edge_recovery_metric(&metrics_db_path);
-    assert_eq!(
-        sparse_str(&event.attrs, attr_pos::TOOL),
-        Some("claude"),
-        "edge recovery metric should copy the neighboring AI session tool"
-    );
-    assert_eq!(
-        sparse_str(&event.attrs, attr_pos::MODEL),
-        Some("claude-sonnet-4"),
-        "edge recovery metric should copy the neighboring AI session model"
-    );
-    assert_eq!(
-        sparse_str(&event.attrs, attr_pos::EXTERNAL_SESSION_ID),
-        Some("edge-metric-session"),
-        "edge recovery metric should copy the neighboring AI session id"
+    let db = MetricsDatabase::open_at_path(Path::new(&metrics_db_path)).unwrap();
+    let records = db
+        .get_metric_history(0, None, &[MetricEventId::Checkpoint as u16])
+        .unwrap();
+    assert!(
+        records.iter().all(|record| {
+            sparse_str(&record.event.values, checkpoint_pos::CHECKPOINT_TYPE)
+                != Some("recovered_edge_extension")
+        }),
+        "adjacency must not create recovery checkpoint metrics"
     );
 }

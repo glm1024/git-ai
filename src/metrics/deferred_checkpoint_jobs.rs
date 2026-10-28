@@ -317,7 +317,7 @@ pub(crate) fn is_durable_checkpoint_request(request: &CheckpointRequest) -> bool
     let Some(agent) = request.agent_id.as_ref() else {
         return false;
     };
-    matches!(agent.tool.as_str(), "kilo" | "opencode")
+    matches!(agent.tool.as_str(), "kilo" | "opencode" | "zcode")
         && !agent.id.trim().is_empty()
         && request
             .metadata
@@ -333,6 +333,18 @@ pub(crate) fn job_key_from_trace_id(trace_id: &str) -> Option<&str> {
 }
 
 fn checkpoint_phase(request: &CheckpointRequest) -> &'static str {
+    if request
+        .agent_id
+        .as_ref()
+        .is_some_and(|agent| agent.tool == "zcode")
+        && request.path_role == PreparedPathRole::Edited
+        && matches!(
+            request.metadata.get("tool_outcome").map(String::as_str),
+            Some("failed" | "backgrounded")
+        )
+    {
+        return "failed";
+    }
     match (request.path_role, request.checkpoint_kind) {
         (PreparedPathRole::WillEdit, CheckpointKind::Human) => "pre",
         (PreparedPathRole::Edited, CheckpointKind::AiAgent | CheckpointKind::AiTab) => "post",
@@ -348,7 +360,25 @@ fn request_shape_digest(request: &CheckpointRequest) -> Result<String, GitAiErro
     // metric derivation (path role, stream source, model/version, metadata,
     // file order/content/base) participates. Object keys are sorted because
     // HashMap iteration order is not semantic; array order remains significant.
-    let value = serde_json::to_value(request)?;
+    let mut value = serde_json::to_value(request)?;
+    if request
+        .agent_id
+        .as_ref()
+        .is_some_and(|agent| agent.tool == "zcode")
+    {
+        // Exact model evidence may land after the original hook (streaming
+        // tools). A receipt retry must reuse the first frozen request, never
+        // rewrite its model/provider or reject identical file evidence merely
+        // because usage enrollment now has richer context. Usage is enrolled
+        // independently; paths, bytes, bases, call identity and outcome remain
+        // part of the admission digest. process_specific_job reads stored JSON.
+        value["agent_id"]["model"] = Value::Null;
+        value["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_provider");
+        value["stream_source"] = Value::Null;
+    }
     let mut hasher = Sha256::new();
     hash_canonical_json(&value, &mut hasher);
     Ok(format!("{:x}", hasher.finalize()))
@@ -955,6 +985,25 @@ pub(crate) fn enqueue_on_connection(
     now: u64,
 ) -> Result<bool, GitAiError> {
     let tx = conn.transaction()?;
+    if spec.integration == "zcode" && matches!(spec.phase.as_str(), "pre" | "post") {
+        let terminal: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deferred_checkpoint_jobs
+             WHERE repo_identity=?1 AND integration=?2 AND external_session_id=?3
+               AND external_tool_use_id=?4 AND phase='failed')",
+            params![
+                spec.repo_identity,
+                spec.integration,
+                spec.external_session_id,
+                spec.external_tool_use_id
+            ],
+            |row| row.get(0),
+        )?;
+        if terminal {
+            return Err(GitAiError::Generic(
+                "ZCode tool call already has a non-success terminal checkpoint".into(),
+            ));
+        }
+    }
     if spec.phase == "post" {
         // Admission may run ahead of family side effects. A pending or
         // processing pre is sufficient evidence to admit its post because the
@@ -2094,6 +2143,98 @@ mod tests {
             attrs: SparseArray::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn zcode_uses_durable_admission_and_requires_its_own_pre() {
+        let request = CheckpointRequest {
+            trace_id: "z-trace".into(),
+            checkpoint_kind: CheckpointKind::AiAgent,
+            agent_id: Some(AgentId {
+                tool: "zcode".into(),
+                id: "s".into(),
+                model: "glm".into(),
+            }),
+            files: vec![CheckpointFile {
+                path: PathBuf::from("/repo/a.rs"),
+                content: Some("ai".into()),
+                repo_work_dir: PathBuf::from("/repo"),
+                base_commit: BaseCommit::Initial,
+            }],
+            path_role: PreparedPathRole::Edited,
+            stream_source: None,
+            metadata: HashMap::from([
+                ("tool_use_id".into(), "call".into()),
+                ("integration".into(), "zcode".into()),
+            ]),
+        };
+        assert!(is_durable_checkpoint_request(&request));
+        let mut conn = setup();
+        complete_pre(&mut conn, "repo", "call");
+        let mut post = spec("repo", "call", "post", "post");
+        post.integration = "zcode".into();
+        post.job_key = stable_job_key("repo", "zcode", "session", "call", "post");
+        assert!(
+            enqueue_on_connection(&mut conn, &post, 10)
+                .unwrap_err()
+                .to_string()
+                .contains("no admitted pre")
+        );
+        let mut pre = post.clone();
+        pre.phase = "pre".into();
+        pre.job_key = stable_job_key("repo", "zcode", "session", "call", "pre");
+        assert!(enqueue_on_connection(&mut conn, &pre, 11).unwrap());
+        assert!(enqueue_on_connection(&mut conn, &post, 12).unwrap());
+    }
+
+    #[test]
+    fn zcode_failure_cannot_be_replayed_as_a_successful_post() {
+        let mut conn = setup();
+        let mut failed = spec("repo", "call", "failed", "failure");
+        failed.integration = "zcode".into();
+        failed.job_key = stable_job_key("repo", "zcode", "session", "call", "failed");
+        enqueue_on_connection(&mut conn, &failed, 10).unwrap();
+        for phase in ["pre", "post"] {
+            let mut replay = failed.clone();
+            replay.phase = phase.into();
+            replay.job_key = stable_job_key("repo", "zcode", "session", "call", phase);
+            assert!(
+                enqueue_on_connection(&mut conn, &replay, 11)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-success terminal")
+            );
+        }
+    }
+
+    #[test]
+    fn zcode_retry_freezes_model_enrichment_but_still_checks_file_evidence() {
+        let mut request = CheckpointRequest {
+            trace_id: "stable-trace".into(),
+            checkpoint_kind: CheckpointKind::AiAgent,
+            agent_id: Some(AgentId {
+                tool: "zcode".into(),
+                id: "s".into(),
+                model: "unknown".into(),
+            }),
+            files: vec![CheckpointFile {
+                path: PathBuf::from("/repo/a"),
+                content: Some("bytes".into()),
+                repo_work_dir: PathBuf::from("/repo"),
+                base_commit: BaseCommit::Initial,
+            }],
+            path_role: PreparedPathRole::Edited,
+            stream_source: None,
+            metadata: HashMap::from([("tool_use_id".into(), "c".into())]),
+        };
+        let original = request_shape_digest(&request).unwrap();
+        request.agent_id.as_mut().unwrap().model = "glm".into();
+        request
+            .metadata
+            .insert("model_provider".into(), "zai".into());
+        assert_eq!(original, request_shape_digest(&request).unwrap());
+        request.files[0].content = Some("different".into());
+        assert_ne!(original, request_shape_digest(&request).unwrap());
     }
 
     fn metadata_event_json(instance: &str) -> String {

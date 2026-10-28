@@ -180,126 +180,23 @@ impl FileModel {
             .unwrap_or_else(|| AttrRecord::new(LineAttribution::Untracked))
     }
 
+    /// Preserve unknown provenance: neighboring AI lines are not evidence for
+    /// added lines. Keep the operation hook for commit/rewrite flow symmetry.
     pub fn apply_edge_recovery_for_added_lines(
         &mut self,
-        registry: &mut AttrRegistry,
-        added_lines: &[u32],
+        _registry: &mut AttrRegistry,
+        _added_lines: &[u32],
     ) {
-        const EDGE_EXTENSION_MAX_LINES: usize = 3;
-
-        let mut unknown = added_lines
-            .iter()
-            .filter_map(|line| line.checked_sub(1).map(|idx| idx as usize))
-            .filter(|&idx| {
-                idx < self.resolved_attrs.len()
-                    && self.resolved_attrs[idx] == LineAttribution::Untracked
-                    && !self.pending_attestations.contains_key(&self.lines[idx])
-            })
-            .collect::<Vec<_>>();
-        unknown.sort_unstable();
-        unknown.dedup();
-
-        let mut start = 0;
-        while start < unknown.len() {
-            let mut end = start + 1;
-            while end < unknown.len() && unknown[end] == unknown[end - 1] + 1 {
-                end += 1;
-            }
-
-            let run = &unknown[start..end];
-            let first = run[0];
-            let last = *run.last().unwrap();
-            let prev = first
-                .checked_sub(1)
-                .and_then(|idx| self.pending_record_at_index(idx));
-            let next = self.pending_record_at_index(last + 1);
-
-            let recovery = match (prev, next) {
-                (Some(left), Some(right))
-                    if left.attr == LineAttribution::Ai
-                        && right.attr == LineAttribution::Ai
-                        && left.ai_session.is_some()
-                        && left.ai_session == right.ai_session =>
-                {
-                    let mut lines = run
-                        .iter()
-                        .take(EDGE_EXTENSION_MAX_LINES)
-                        .copied()
-                        .collect::<Vec<_>>();
-                    lines.extend(run.iter().rev().take(EDGE_EXTENSION_MAX_LINES).copied());
-                    lines.sort_unstable();
-                    lines.dedup();
-                    Some((left.ai_session.unwrap(), lines))
-                }
-                (Some(left), None)
-                    if left.attr == LineAttribution::Ai && left.ai_session.is_some() =>
-                {
-                    Some((
-                        left.ai_session.unwrap(),
-                        run.iter().take(EDGE_EXTENSION_MAX_LINES).copied().collect(),
-                    ))
-                }
-                (None, Some(right))
-                    if right.attr == LineAttribution::Ai && right.ai_session.is_some() =>
-                {
-                    Some((
-                        right.ai_session.unwrap(),
-                        run.iter()
-                            .rev()
-                            .take(EDGE_EXTENSION_MAX_LINES)
-                            .copied()
-                            .collect(),
-                    ))
-                }
-                _ => None,
-            };
-
-            if let Some((session, recovered_indices)) = recovery {
-                for idx in recovered_indices {
-                    self.resolved_attrs[idx] = LineAttribution::Ai;
-                    self.resolved_ai_sessions[idx] = Some(session);
-                    registry.register_record(self.lines[idx], AttrRecord::ai(session));
-                }
-            }
-
-            start = end;
-        }
     }
 
+    /// An untracked edit stays unknown after commit. The Git author and other
+    /// KnownHuman lines cannot establish positive human provenance for it.
+    /// Keep the hook for operation symmetry without reading actual blame.
     pub fn apply_terminal_human_recovery_for_added_lines(
         &mut self,
-        registry: &mut AttrRegistry,
-        added_lines: &[u32],
+        _registry: &mut AttrRegistry,
+        _added_lines: &[u32],
     ) {
-        let added_indices = added_lines
-            .iter()
-            .filter_map(|line| line.checked_sub(1).map(|idx| idx as usize))
-            .filter(|&idx| idx < self.resolved_attrs.len())
-            .collect::<Vec<_>>();
-        let has_known_human = added_indices
-            .iter()
-            .any(|&idx| self.resolved_attrs[idx] == LineAttribution::KnownHuman);
-        let has_ai = added_indices
-            .iter()
-            .any(|&idx| self.resolved_attrs[idx] == LineAttribution::Ai);
-
-        if !has_known_human && has_ai {
-            return;
-        }
-
-        for idx in added_indices {
-            if self.resolved_attrs[idx] == LineAttribution::Untracked {
-                self.resolved_attrs[idx] = LineAttribution::KnownHuman;
-                registry.register(self.lines[idx], LineAttribution::KnownHuman);
-            }
-        }
-    }
-
-    fn pending_record_at_index(&self, idx: usize) -> Option<AttrRecord> {
-        self.lines
-            .get(idx)
-            .and_then(|ch| self.pending_attestations.get(ch))
-            .copied()
     }
 
     pub fn mark_pending_attestation(&mut self, ch: char, record: AttrRecord) {

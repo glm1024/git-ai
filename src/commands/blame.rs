@@ -1102,6 +1102,7 @@ fn overlay_ai_authorship(
             for (session_id, session_record) in &authorship_log.metadata.sessions {
                 session_records
                     .entry(session_id.clone())
+                    .and_modify(|existing| existing.merge_from(session_record))
                     .or_insert_with(|| session_record.clone());
             }
 

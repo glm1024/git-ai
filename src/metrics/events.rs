@@ -2171,12 +2171,29 @@ pub mod session_token_usage_pos {
     pub const SUPERSEDES_SOURCE_KEYS: usize = 11;
     pub const SNAPSHOT_INSTANCE_ID: usize = 12;
     pub const SUPERSEDES_SNAPSHOT_INSTANCE_IDS: usize = 13;
+    pub const SNAPSHOT_SEQUENCE: usize = 14;
 }
 
 /// Values for Event ID 9: `session_token_usage`.
 ///
 /// This is deliberately a cumulative daily business fact. It contains no prompt,
 /// response, reasoning, tool input/output, file contents, or raw transcript.
+///
+/// Enterprise wire revisions td1 through td4 retain their existing monotonic
+/// counter contract. ZCode uses td5:<stable-dimension-hash> and optional position
+/// 14 (`snapshot_sequence`): a positive, persisted per-day-bucket sequence. A
+/// higher sequence replaces the entire snapshot, including decreases, cache
+/// reclassification and zero totals. Equal or older sequences cannot overwrite
+/// it. The sequence is NOT part of the source key, snapshot instance, or business
+/// uniqueness dimensions; in-flight snapshots stay immutable while successors
+/// keep the stable identity and advance the sequence. Other agents omit v14.
+///
+/// Deployment order: upgrade the enterprise backend and apply
+/// V20261028_1__zcode_token_snapshot_sequence.sql before enabling td5 clients.
+/// The new nullable column does not backfill or recompute historical facts.
+/// Unsupported servers must leave the client's outbox pending, never ACK/drop
+/// unprocessed td5 snapshots. This is independent of the upstream Event 11
+/// five-minute TokenUsage protocol documented in docs/token-usage-events-spec.md.
 #[derive(Debug, Clone, Default)]
 pub struct SessionTokenUsageValues {
     pub source_key: PosField<String>,
@@ -2193,6 +2210,7 @@ pub struct SessionTokenUsageValues {
     pub supersedes_source_keys: PosField<Vec<String>>,
     pub snapshot_instance_id: PosField<String>,
     pub supersedes_snapshot_instance_ids: PosField<Vec<String>>,
+    pub snapshot_sequence: PosField<u64>,
 }
 
 impl SessionTokenUsageValues {
@@ -2229,6 +2247,7 @@ impl SessionTokenUsageValues {
             snapshot_instance_id: Some(Some(snapshot_instance_id.into())),
             supersedes_snapshot_instance_ids: (!supersedes_snapshot_instance_ids.is_empty())
                 .then_some(Some(supersedes_snapshot_instance_ids)),
+            snapshot_sequence: None,
         }
     }
 }
@@ -2306,11 +2325,17 @@ impl PosEncoded for SessionTokenUsageValues {
             session_token_usage_pos::SUPERSEDES_SNAPSHOT_INSTANCE_IDS,
             vec_string_to_json(&self.supersedes_snapshot_instance_ids),
         );
+        sparse_set(
+            &mut map,
+            session_token_usage_pos::SNAPSHOT_SEQUENCE,
+            u64_to_json(&self.snapshot_sequence),
+        );
         map
     }
 
     fn from_sparse(arr: &SparseArray) -> Self {
         Self {
+            snapshot_sequence: sparse_get_u64(arr, session_token_usage_pos::SNAPSHOT_SEQUENCE),
             source_key: sparse_get_string(arr, session_token_usage_pos::SOURCE_KEY),
             input_tokens: sparse_get_u64(arr, session_token_usage_pos::INPUT_TOKENS),
             output_tokens: sparse_get_u64(arr, session_token_usage_pos::OUTPUT_TOKENS),
