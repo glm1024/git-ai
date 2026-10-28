@@ -1,0 +1,44 @@
+agent-support/zcode/README.md
+  s_80d119be223004::t_0e2f50edf2f8e9 3
+docs/zcode-adaptation-research-2026-10-28.md
+  s_80d119be223004::t_e59afa54d06cea 74,76,81,83-88,90,94
+src/commands/checkpoint_agent/presets/zcode_tests.rs
+  s_80d119be223004::t_226b73f5b64a41 30-39
+产品业务.md
+  s_80d119be223004::t_0e2f50edf2f8e9 50
+  s_80d119be223004::t_523344696e8409 53
+src/metrics/db.rs
+  s_80d119be223004::t_1ce194559c745c 3144-3162,3165,4251-4316,4388-4389,4454,4509,4537,4657,4710
+src/metrics/events.rs
+  s_80d119be223004::t_619b3d189fbb11 2183-2187
+src/metrics/session_compaction.rs
+  s_80d119be223004::t_27b8d6988ff4e8 107-109
+tests/fixtures/zcode-r2-token-usage.json
+  s_80d119be223004::t_45bb53571b5f94 1-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.25",
+  "base_commit_sha": "fd2a8cf5769228990cdfd7f7e758ea2ea6ba452f",
+  "prompts": {},
+  "sessions": {
+    "s_80d119be223004": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18019-c1c5-7990-95af-14ce5f318c62",
+        "model": "gpt-6-astra"
+      },
+      "trace_models": {
+        "t_0e2f50edf2f8e9": "gpt-6-astra",
+        "t_1ce194559c745c": "gpt-6.1-sol",
+        "t_226b73f5b64a41": "gpt-6-astra",
+        "t_27b8d6988ff4e8": "gpt-6.1-sol",
+        "t_45bb53571b5f94": "gpt-6.1-sol",
+        "t_523344696e8409": "gpt-6-astra",
+        "t_619b3d189fbb11": "gpt-6.1-sol",
+        "t_e59afa54d06cea": "gpt-6-astra"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
