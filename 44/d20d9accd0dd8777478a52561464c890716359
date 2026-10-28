@@ -1,0 +1,69 @@
+docs/zcode-deep-acceptance-20261028/review.md
+  s_80d119be223004::t_49fe0e67416ba3 3,7-8,16-17,19-26,34-35,38,40-43,53
+  s_80d119be223004::t_5744032560d30f 5,39,44-51
+docs/zcode-deep-acceptance-20261028/test_verify_failure_recovery.py
+  s_80d119be223004::t_814c65efbca13f 1-43,46-87,91-104
+  s_80d119be223004::t_9e25f701e7fa5c 44-45,88-90
+docs/zcode-deep-acceptance-20261028/verify_failure_recovery.py
+  s_80d119be223004::t_5744032560d30f 136-139,145
+  s_80d119be223004::t_9309b59d739f19 1-135,140-144,146-192
+docs/zcode-deep-acceptance-20261028/catalog-oracle.json
+  s_80d119be223004::t_dcf29fab58043e 1-334
+docs/zcode-deep-acceptance-20261028/evidence/commit1-oracle.json
+  s_80d119be223004::t_9b6ab293fb75d7 1-257
+docs/zcode-deep-acceptance-20261028/evidence/commit2-oracle.json
+  s_80d119be223004::t_7b29c3767c5fd5 1-293
+docs/zcode-deep-acceptance-20261028/oracle-guide.md
+  s_80d119be223004::t_1786804e2ae26a 1-68
+docs/zcode-deep-acceptance-20261028/oracle.json
+  s_80d119be223004::t_455e727ba9a4ca 1-331
+docs/zcode-deep-acceptance-20261028/oracle_stage.py
+  s_80d119be223004::t_4cccfac01b5584 1-17
+docs/zcode-deep-acceptance-20261028/test_verify_catalog.py
+  s_80d119be223004::t_f11d9609699427 1-72
+docs/zcode-deep-acceptance-20261028/test_verify_oracle.py
+  s_80d119be223004::t_a86f89154518cf 1-103
+docs/zcode-deep-acceptance-20261028/verify_catalog.py
+  s_80d119be223004::t_bf402e813dcb82 1-116
+docs/zcode-deep-acceptance-20261028/verify_oracle.py
+  s_80d119be223004::t_d6bd16e33fc471 1-253
+src/commands/checkpoint_agent/orchestrator.rs
+  s_80d119be223004::t_33e9326f12af44 541,546-549,564-574
+src/daemon/stream_worker.rs
+  s_80d119be223004::t_5f238504a56d92 29-31,102-103,244-267,456,492,650-651,717-720,780,809-812,927,1012,1165,1544,1550-1582,1781,1786-1969
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.25",
+  "base_commit_sha": "44d20d9accd0dd8777478a52561464c890716359",
+  "prompts": {},
+  "sessions": {
+    "s_80d119be223004": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18019-c1c5-7990-95af-14ce5f318c62",
+        "model": "gpt-6-astra"
+      },
+      "trace_models": {
+        "t_1786804e2ae26a": "gpt-6.1-sol",
+        "t_33e9326f12af44": "gpt-6.1-sol",
+        "t_455e727ba9a4ca": "gpt-6.1-sol",
+        "t_49fe0e67416ba3": "gpt-6.1-sol",
+        "t_4cccfac01b5584": "gpt-6.1-sol",
+        "t_5744032560d30f": "gpt-6.1-sol",
+        "t_5f238504a56d92": "gpt-6.1-sol",
+        "t_7b29c3767c5fd5": "gpt-6.1-sol",
+        "t_814c65efbca13f": "gpt-6.1-sol",
+        "t_9309b59d739f19": "gpt-6.1-sol",
+        "t_9b6ab293fb75d7": "gpt-6.1-sol",
+        "t_9e25f701e7fa5c": "gpt-6.1-sol",
+        "t_a86f89154518cf": "gpt-6.1-sol",
+        "t_bf402e813dcb82": "gpt-6.1-sol",
+        "t_d6bd16e33fc471": "gpt-6.1-sol",
+        "t_dcf29fab58043e": "gpt-6.1-sol",
+        "t_f11d9609699427": "gpt-6.1-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
