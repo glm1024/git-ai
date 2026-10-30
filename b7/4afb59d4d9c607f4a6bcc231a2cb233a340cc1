@@ -1,0 +1,34 @@
+Cargo.toml
+  s_268adb051a4549::t_64f199049ae4b2 3
+flake.nix
+  s_268adb051a4549::t_64f199049ae4b2 39
+scripts/offline-build/test-release-contract.sh
+  s_268adb051a4549::t_650acb5778f7e1 16
+构建方法.md
+  s_268adb051a4549::t_64f199049ae4b2 56-57
+  s_268adb051a4549::t_eabd2ea0a82ede 29-31,40-42
+Cargo.lock
+  s_268adb051a4549::t_bbc5d60126b508 1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.26",
+  "base_commit_sha": "b74afb59d4d9c607f4a6bcc231a2cb233a340cc1",
+  "prompts": {},
+  "sessions": {
+    "s_268adb051a4549": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18a7c-a8c4-7222-b2af-f6e89110d869",
+        "model": "gpt-6.1-sol"
+      },
+      "trace_models": {
+        "t_64f199049ae4b2": "gpt-6.1-sol",
+        "t_650acb5778f7e1": "gpt-6.1-sol",
+        "t_bbc5d60126b508": "gpt-6.1-sol",
+        "t_eabd2ea0a82ede": "gpt-6.1-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
