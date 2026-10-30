@@ -13,7 +13,7 @@ fail() {
 assert_contains() {
     file=$1
     value=$2
-    grep -Fq "${value}" "${file}" || fail "$(basename "${file}") is missing: ${value}"
+    grep -Fq -- "${value}" "${file}" || fail "$(basename "${file}") is missing: ${value}"
 }
 
 sh -n "${SCRIPT_DIR}/package-offline-dist.sh"
