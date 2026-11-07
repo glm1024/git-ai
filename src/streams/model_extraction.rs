@@ -208,15 +208,7 @@ fn extract_model_from_codex_jsonl_line(line: &str) -> Option<String> {
 
 fn extract_model_from_codex_config(path: &Path) -> Option<String> {
     let codex_home = codex_home_from_transcript_path(path)?;
-    let config_path = codex_home.join("config.toml");
-    let file = File::open(config_path).ok()?;
-    let mut content = String::new();
-    file.take(MAX_CODEX_CONFIG_BYTES + 1)
-        .read_to_string(&mut content)
-        .ok()?;
-    if content.len() as u64 > MAX_CODEX_CONFIG_BYTES {
-        return None;
-    }
+    let content = read_codex_config(&codex_home.join("config.toml"))?;
     let config: toml::Value = toml::from_str(&content).ok()?;
 
     config
@@ -227,7 +219,21 @@ fn extract_model_from_codex_config(path: &Path) -> Option<String> {
         .or_else(|| toml_string_candidate(config.get("model")))
 }
 
-fn codex_home_from_transcript_path(path: &Path) -> Option<PathBuf> {
+/// Read a codex `config.toml`, size-capped so an absurd file can't balloon
+/// memory. `None` when missing, unreadable, or over the cap.
+pub(crate) fn read_codex_config(config_path: &Path) -> Option<String> {
+    let file = File::open(config_path).ok()?;
+    let mut content = String::new();
+    file.take(MAX_CODEX_CONFIG_BYTES + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    if content.len() as u64 > MAX_CODEX_CONFIG_BYTES {
+        return None;
+    }
+    Some(content)
+}
+
+pub(crate) fn codex_home_from_transcript_path(path: &Path) -> Option<PathBuf> {
     let configured_home = crate::mdm::utils::codex_home_dir();
     if path.starts_with(&configured_home) {
         return Some(configured_home);
@@ -990,6 +996,35 @@ fn extract_model_from_opencode_sqlite(
         Err(_) => return Ok(None),
     };
 
+    // V2 publishes the assistant's model before executing its tools. Prefer it
+    // over the mutable session selection, which can change while a tool runs.
+    // V1 and V2 sessions can coexist in the same database.
+    if let Some(session_id) = session_id
+        && crate::streams::agents::opencode::is_v2_session(&conn, session_id)
+    {
+        let model = conn
+            .query_row(
+                "SELECT json_extract(data, '$.model.id') FROM session_message \
+                 WHERE session_id = ?1 AND type = 'assistant' ORDER BY seq DESC LIMIT 1",
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .or_else(|| {
+                // Before the first assistant response, only the selection exists.
+                conn.query_row(
+                    "SELECT model FROM session_v2 WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+                .and_then(|model| model.get("id").and_then(|id| id.as_str()).map(String::from))
+            });
+        return Ok(model);
+    }
+
     // OpenCode stores model info in two places depending on message role:
     //   User messages:     data.model.modelID  (nested object)
     //   Assistant messages: data.modelID        (top-level string)
@@ -1468,6 +1503,29 @@ model = "profile-only-model"
 
         let result = extract_model(&db_path, StreamFormat::OpenCodeSqlite, Some("sess-1")).unwrap();
         assert_eq!(result, Some("claude-opus-4-6".to_string()));
+    }
+
+    #[test]
+    fn test_extract_model_opencode_v2_selection_before_first_assistant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, model TEXT);
+             CREATE TABLE session_message (session_id TEXT, type TEXT, seq INTEGER, data TEXT);
+             INSERT INTO session_v2 VALUES ('sess-1', '{\"providerID\":\"openai\",\"id\":\"selected-model\"}');",
+        )
+        .unwrap();
+        assert_eq!(
+            extract_model(&db_path, StreamFormat::OpenCodeSqlite, Some("sess-1")).unwrap(),
+            Some("selected-model".into())
+        );
+        conn.execute("UPDATE session_v2 SET model = NULL", [])
+            .unwrap();
+        assert_eq!(
+            extract_model(&db_path, StreamFormat::OpenCodeSqlite, Some("sess-1")).unwrap(),
+            None
+        );
     }
 
     #[test]

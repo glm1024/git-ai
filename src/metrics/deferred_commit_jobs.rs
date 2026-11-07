@@ -65,6 +65,9 @@ CREATE INDEX IF NOT EXISTS deferred_commit_metric_jobs_due
     WHERE state != 'done';
 "#;
 
+pub(crate) const ADD_COMMIT_SOURCE_SQL: &str =
+    "ALTER TABLE deferred_commit_metric_jobs ADD COLUMN commit_source TEXT";
+
 const PROCESSING_LEASE_SECS: u64 = 10 * 60;
 const INITIAL_RETRY_BACKOFF_SECS: u64 = 5;
 const MAX_RETRY_BACKOFF_SECS: u64 = 60 * 60;
@@ -114,6 +117,7 @@ pub(crate) struct DeferredCommitMetricJobSpec {
     pub authorship_note: String,
     pub parent_authorship_note: String,
     pub first_checkpoint_ts: Option<u64>,
+    pub commit_source: Option<String>,
     pub attrs_json: String,
     pub ignore_patterns_json: String,
     pub event_ts: u32,
@@ -132,6 +136,7 @@ impl DeferredCommitMetricJobSpec {
         first_checkpoint_ts: Option<u64>,
         attrs: &crate::metrics::EventAttributes,
         ignore_patterns: &[String],
+        commit_source: Option<&str>,
     ) -> Result<Self, GitAiError> {
         let repository_workdir = repo.workdir()?;
         let git_dir = repo.path().to_path_buf();
@@ -152,6 +157,7 @@ impl DeferredCommitMetricJobSpec {
             authorship_note: authorship_note.to_string(),
             parent_authorship_note: parent_authorship_note.to_string(),
             first_checkpoint_ts,
+            commit_source: commit_source.map(str::to_owned),
             attrs_json,
             ignore_patterns_json,
             event_ts: unix_now().min(u64::from(u32::MAX)) as u32,
@@ -183,6 +189,7 @@ pub(crate) struct ClaimedDeferredCommitMetricJob {
     pub authorship_note: String,
     pub parent_authorship_note: String,
     pub first_checkpoint_ts: Option<u64>,
+    pub commit_source: Option<String>,
     pub attrs_json: String,
     pub ignore_patterns_json: String,
     pub event_ts: u32,
@@ -436,6 +443,7 @@ fn compute_complete_events(
         &stats,
         job.first_checkpoint_ts,
         "[]",
+        job.commit_source.as_deref(),
     );
     let Some(base_values) = base_values else {
         return Ok(Vec::new());
@@ -1050,10 +1058,10 @@ pub(crate) fn enqueue_on_connection(
             job_key, job_kind, repo_identity, repository_workdir, git_dir, git_common_dir,
             commit_sha, parent_sha, human_author, authorship_note, parent_authorship_note,
             first_checkpoint_ts, attrs_json, ignore_patterns_json, event_ts, state, attempts,
-            next_retry_at, created_at, updated_at
+            next_retry_at, created_at, updated_at, commit_source
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-            ?15, 'pending', 0, 0, ?16, ?16
+            ?15, 'pending', 0, 0, ?16, ?16, ?17
         )
         ON CONFLICT(job_key) DO NOTHING
         "#,
@@ -1074,6 +1082,7 @@ pub(crate) fn enqueue_on_connection(
             spec.ignore_patterns_json,
             i64::from(spec.event_ts),
             u64_to_sqlite(now),
+            spec.commit_source,
         ],
     )?;
     Ok(inserted == 1)
@@ -1146,7 +1155,7 @@ fn load_claimed_job(
         r#"
         SELECT job_kind, repo_identity, repository_workdir, git_dir, git_common_dir,
                commit_sha, parent_sha, authorship_note, parent_authorship_note,
-               first_checkpoint_ts, attrs_json, ignore_patterns_json, event_ts, attempts
+               first_checkpoint_ts, attrs_json, ignore_patterns_json, event_ts, attempts, commit_source
         FROM deferred_commit_metric_jobs
         WHERE job_key = ?1 AND state = 'processing' AND lease_token = ?2
         "#,
@@ -1171,6 +1180,7 @@ fn load_claimed_job(
                 row.get::<_, String>(11)?,
                 event_ts,
                 attempts,
+                row.get::<_, Option<String>>(14)?,
             ))
         },
     )
@@ -1191,6 +1201,7 @@ fn load_claimed_job(
             ignore_patterns_json,
             event_ts,
             attempts,
+            commit_source,
         )| {
             Ok(ClaimedDeferredCommitMetricJob {
                 job_key: job_key.to_string(),
@@ -1204,6 +1215,7 @@ fn load_claimed_job(
                 parent_sha,
                 authorship_note,
                 parent_authorship_note,
+                commit_source,
                 first_checkpoint_ts: first_checkpoint_ts.map(|value| value.max(0) as u64),
                 attrs_json,
                 ignore_patterns_json,
@@ -1304,6 +1316,7 @@ fn complete_validated_on_connection(
             authorship_note = '',
             parent_authorship_note = '',
             first_checkpoint_ts = NULL,
+            commit_source = NULL,
             attrs_json = '',
             ignore_patterns_json = '',
             event_ts = 0,
@@ -1351,6 +1364,7 @@ pub(crate) fn compact_done_payloads_on_connection(
             authorship_note = '',
             parent_authorship_note = '',
             first_checkpoint_ts = NULL,
+            commit_source = NULL,
             attrs_json = '',
             ignore_patterns_json = '',
             event_ts = 0
@@ -1367,6 +1381,7 @@ pub(crate) fn compact_done_payloads_on_connection(
                   OR authorship_note != ''
                   OR parent_authorship_note != ''
                   OR first_checkpoint_ts IS NOT NULL
+                  OR commit_source IS NOT NULL
                   OR attrs_json != ''
                   OR ignore_patterns_json != ''
                   OR event_ts != 0
@@ -1671,6 +1686,7 @@ mod tests {
         )
         .unwrap();
         conn.execute_batch(DEFERRED_COMMIT_JOBS_SCHEMA_SQL).unwrap();
+        conn.execute_batch(ADD_COMMIT_SOURCE_SQL).unwrap();
         conn
     }
 
@@ -1687,11 +1703,37 @@ mod tests {
             authorship_note: "file.rs\n---\n{}".to_string(),
             parent_authorship_note: "parent.rs\n---\n{}".to_string(),
             first_checkpoint_ts: Some(12),
+            commit_source: Some("untraced_fixup".into()),
             attrs_json: serde_json::to_string(&EventAttributes::with_version("test").to_sparse())
                 .unwrap(),
             ignore_patterns_json: "[]".to_string(),
             event_ts: 100,
         }
+    }
+
+    #[test]
+    fn v16_upgrade_preserves_pending_commit_without_inventing_its_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("metrics.db");
+        let pending = spec(DeferredCommitMetricKind::SingleParent);
+        {
+            let mut db = MetricsDatabase::open_at_path(&path).unwrap();
+            let conn = db.deferred_jobs_connection();
+            enqueue_on_connection(conn, &pending, 10).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE deferred_commit_metric_jobs DROP COLUMN commit_source;
+                 UPDATE schema_metadata SET value='16' WHERE key='version';",
+            )
+            .unwrap();
+        }
+        let mut reopened = MetricsDatabase::open_at_path(&path).unwrap();
+        let job = claim_due_on_connection(reopened.deferred_jobs_connection(), 20, 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.job_key, pending.job_key());
+        assert_eq!(job.authorship_note, pending.authorship_note);
+        assert_eq!(job.parent_authorship_note, pending.parent_authorship_note);
+        assert_eq!(job.commit_source, None);
     }
 
     #[test]
@@ -1800,6 +1842,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reclaimed.attempts, 2);
+        assert_eq!(reclaimed.commit_source.as_deref(), Some("untraced_fixup"));
         assert_ne!(reclaimed.lease_token, "");
     }
 
@@ -2087,6 +2130,7 @@ mod tests {
             authorship_note: String::new(),
             parent_authorship_note: String::new(),
             first_checkpoint_ts: None,
+            commit_source: None,
             attrs_json: String::new(),
             ignore_patterns_json: String::new(),
             event_ts: 0,

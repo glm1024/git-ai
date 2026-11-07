@@ -299,10 +299,15 @@ mod tests {
     fn test_opencode_plugin_content_is_valid_typescript() {
         let content = OPENCODE_PLUGIN_CONTENT;
 
-        assert!(content.contains("import type { Plugin }"));
-        assert!(content.contains("@opencode-ai/plugin"));
-        assert!(content.contains("export const GitAiPlugin: Plugin"));
-        assert!(content.contains("export default GitAiPlugin"));
+        assert!(content.contains("import type { Plugin } from \"@opencode/plugin\""));
+        assert!(content.contains("@opencode/plugin"));
+        assert!(content.contains("export const GitAiPlugin: Plugin.Plugin = {"));
+        assert!(content.contains("export default {"));
+        // V1 compatibility entrypoint (OpenCode 1.18.x calls `server()`)
+        assert!(content.contains("async server("));
+        // V2 registers hooks through the tool domain
+        assert!(content.contains("ctx.tool.hook(\"execute.before\""));
+        assert!(content.contains("ctx.tool.hook(\"execute.after\""));
         assert!(content.contains("child_process"));
         assert!(content.contains("\"tool.execute.before\""));
         assert!(content.contains("\"tool.execute.after\""));
@@ -372,7 +377,7 @@ mod tests {
             post_checkpoint < delete_pending,
             "same-process correlation must only be deleted after the strict CLI returns an ACK"
         );
-        assert!(post_content.contains("const postToolInput = input.args ?? callInfo?.toolInput"));
+        assert!(post_content.contains("const postToolInput = callInfo?.toolInput ?? input.args"));
         assert!(post_content.contains("const candidateFilePaths = callInfo"));
         assert!(post_content.contains("? callInfo.filePaths"));
         assert!(!post_content.contains("new Set([...callInfo.filePaths, ...extractedFilePaths])"));

@@ -235,7 +235,22 @@ fn extract_token_snapshot(
             })
             .or(external_event_id)?;
         let input = non_negative(usage, "input");
-        let output = non_negative(usage, "output");
+        // Native V2 session_message rows carry the discriminator and sequence
+        // outside data. @opencode/schema TokenUsage.total adds reasoning to
+        // visible output; enterprise output counts both. Keep V1 unchanged.
+        let native_v2 = message.is_some_and(|row| {
+            row.get("type").and_then(Value::as_str) == Some("assistant")
+                && row.get("seq").and_then(Value::as_i64).is_some()
+                && data
+                    .and_then(|value| value.pointer("/model/id"))
+                    .and_then(Value::as_str)
+                    .is_some()
+        });
+        let output = non_negative(usage, "output").saturating_add(if native_v2 {
+            non_negative(usage, "reasoning")
+        } else {
+            0
+        });
         let cache_read = usage
             .get("cache")
             .map(|cache| non_negative(cache, "read"))
@@ -248,7 +263,7 @@ fn extract_token_snapshot(
             return None;
         }
         let model = data
-            .and_then(|value| value.get("modelID"))
+            .and_then(|value| value.get("modelID").or_else(|| value.pointer("/model/id")))
             .and_then(Value::as_str)
             .map(ToString::to_string);
         return Some(TokenSnapshot {
@@ -258,7 +273,11 @@ fn extract_token_snapshot(
             cache_read,
             cache_write,
             provider: data
-                .and_then(|value| value.get("providerID"))
+                .and_then(|value| {
+                    value
+                        .get("providerID")
+                        .or_else(|| value.pointer("/model/providerID"))
+                })
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
                 .or_else(|| provider_from_raw(raw, tool, model.as_deref())),
@@ -460,7 +479,7 @@ mod tests {
                 "id": "msg-assistant-001",
                 "data": {
                     "role": "assistant", "modelID": "gpt-5", "providerID": "openai",
-                    "tokens": {"input": 12, "output": 34, "cache": {"read": 5, "write": 2}},
+                    "tokens": {"input": 12, "output": 34, "reasoning": 7, "cache": {"read": 5, "write": 2}},
                     "summary": "must not leave the parser"
                 }
             },
@@ -495,6 +514,50 @@ mod tests {
                 .as_deref(),
             Some("gpt-5")
         );
+    }
+
+    #[test]
+    fn opencode_v2_native_assistant_row_preserves_token_model_and_source_identity() {
+        // Native session_message rows store type/seq outside data and use a
+        // nested model instead of V1's modelID/providerID fields.
+        let raw = json!({"message": {
+            "id": "msg-v2", "session_id": "ses-v2", "type": "assistant", "seq": 2,
+            "data": {"model": {"id": "custom-model", "providerID": "private-provider"},
+                "tokens": {"input": 12, "output": 34, "reasoning": 7,
+                    "cache": {"read": 5, "write": 2}}, "content": []}
+        }});
+        for tool in ["opencode", "kilo"] {
+            let observation = compact_session_event(
+                &raw,
+                200,
+                attrs(tool, "ses-v2"),
+                Some("msg-v2".into()),
+                None,
+                None,
+            );
+            let token = observation.token.expect("V2 token snapshot");
+            assert_eq!(
+                (
+                    token.input,
+                    token.output,
+                    token.cache_read,
+                    token.cache_write
+                ),
+                (12, 41, 5, 2)
+            );
+            assert_eq!(token.model.as_deref(), Some("custom-model"));
+            assert_eq!(token.provider.as_deref(), Some("private-provider"));
+            assert_eq!(
+                token.source_key,
+                hashed_source_key(tool, "ses-v2", "message", "msg-v2")
+            );
+            assert_eq!(
+                sparse_get_string(&observation.attrs, attr_pos::MODEL)
+                    .flatten()
+                    .as_deref(),
+                Some("custom-model")
+            );
+        }
     }
 
     #[test]

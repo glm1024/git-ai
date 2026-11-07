@@ -10,6 +10,15 @@ prior knowledge of the client is required.
 
 ---
 
+## Client activation boundary
+
+This distribution defaults to Git notes (`refs/notes/ai`), including when an
+API key is configured. HTTP notes require an explicit `notes_backend.kind=http`
+(or `GIT_AI_NOTES_BACKEND_KIND=http`) and a dedicated `notes_backend.backend_url`
+(or `GIT_AI_NOTES_BACKEND_URL`). An unset notes URL remains unset; it never falls
+back to `api_base_url`. Without that address, HTTP reads and flushes are skipped.
+Configuring an API key or a general API address does not authorize notes uploads.
+
 ## 1. Conceptual model
 
 The server stores opaque UTF-8 strings ("note content") keyed by a hex commit

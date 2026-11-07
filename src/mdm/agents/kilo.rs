@@ -128,7 +128,7 @@ impl KiloInstaller {
         let mut content = OPENCODE_PLUGIN_CONTENT.to_string();
         content = Self::replace_required(
             content,
-            "import type { Plugin } from \"@opencode-ai/plugin\"",
+            "import type { Plugin } from \"@opencode/plugin\"",
             "import type { Plugin } from \"@kilocode/plugin\"",
             1,
         )?;
@@ -145,7 +145,28 @@ impl KiloInstaller {
             1,
         )?;
         content = Self::replace_required(content, TOOL_INPUT_ANCHOR, KILO_RUNTIME_FIELDS, 2)?;
+        content = Self::replace_required(
+            content,
+            "export const GitAiPlugin: Plugin.Plugin = {",
+            "const GitAiPlugin: Plugin.Plugin = {",
+            1,
+        )?;
+        content = Self::replace_required(
+            content,
+            "export const GitAiPluginV1 =",
+            "const GitAiPluginV1 =",
+            1,
+        )?;
+        // Kilo v7 still loads a callable V1 plugin factory. OpenCode V2's
+        // object default export is not a compatible Kilo entrypoint.
+        content = Self::replace_required(
+            content,
+            "export default {\n  ...GitAiPlugin,\n  async server(ctx?: V1PluginContext) {\n    return GitAiPluginV1(ctx)\n  },\n}",
+            "export default GitAiPluginV1",
+            1,
+        )?;
         content = content
+            .replace("@opencode/plugin", "@kilocode/plugin")
             .replace("git-ai plugin for OpenCode", "git-ai plugin for Kilo v7")
             .replace(
                 "integrates git-ai with OpenCode",
@@ -154,7 +175,7 @@ impl KiloInstaller {
             .replace("~/.config/opencode/plugins", "~/.config/kilo/plugin")
             .replace(".opencode/plugins", ".kilo/plugin")
             .replace(
-                "https://opencode.ai/docs/plugins/",
+                "https://opencode.ai/v2/docs/build/plugins",
                 "https://kilo.ai/docs/automate/extending/plugins",
             )
             .replace("[git-ai opencode]", "[git-ai kilo]")
@@ -391,7 +412,10 @@ mod tests {
     fn test_kilo_plugin_is_generated_from_opencode_with_kilo_contract() {
         let content = KiloInstaller::generate_plugin_content(&params().binary_path).unwrap();
         assert!(content.contains("@kilocode/plugin"));
-        assert!(!content.contains("@opencode-ai/plugin"));
+        assert!(content.contains("export default GitAiPluginV1"));
+        assert!(!content.contains("export default {"));
+        assert!(!content.contains("export const GitAiPlugin"));
+        assert!(!content.contains("@opencode/plugin"));
         assert!(content.contains(
             "[\"checkpoint\", \"kilo\", \"--strict-errors\", \"--hook-input\", \"stdin\"]"
         ));
@@ -436,7 +460,7 @@ mod tests {
             .expect("pending call deletion");
 
         assert!(post_checkpoint < delete_pending);
-        assert!(post_content.contains("const postToolInput = input.args ?? callInfo?.toolInput"));
+        assert!(post_content.contains("const postToolInput = callInfo?.toolInput ?? input.args"));
         assert!(post_content.contains("const candidateFilePaths = callInfo"));
         assert!(post_content.contains("? callInfo.filePaths"));
         assert!(!post_content.contains("new Set([...callInfo.filePaths, ...extractedFilePaths])"));

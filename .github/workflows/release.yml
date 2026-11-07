@@ -388,7 +388,7 @@ jobs:
 
       - name: Azure login for MSI signing
         if: inputs.dry_run != true
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -768,13 +768,20 @@ jobs:
           ' repo/install.ps1 > release/install.ps1
           echo "Generated version-pinned install.ps1 for $VERSION from $REPO"
 
+      - name: Copy MDM login-start scripts
+        run: |
+          cp repo/mdm/macos/install-login-start.sh release/git-ai-login-start-macos.sh
+          cp repo/mdm/linux/install-login-start.sh release/git-ai-login-start-linux.sh
+          cp repo/mdm/windows/install-login-start.ps1 release/git-ai-login-start-windows.ps1
+          chmod +x release/git-ai-login-start-*.sh
+
       - name: Add install scripts to SHA256SUMS
         run: |
           cd release
-          sha256sum install.sh install.ps1 >> SHA256SUMS
+          sha256sum install.sh install.ps1 git-ai-login-start-* >> SHA256SUMS
 
       - name: Generate attestations for release artifacts
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             release/git-ai-*
@@ -827,6 +834,12 @@ jobs:
             - **macOS PKG (Intel)**: `git-ai-macos-x64.pkg`
             - **macOS PKG (Apple Silicon)**: `git-ai-macos-arm64.pkg`
             - **macOS PKG (Universal)**: `git-ai-macos-universal.pkg`
+
+            ### MDM login-start scripts
+            Register `git-ai bg start` to run at login (see `mdm/README.md`):
+            - **macOS LaunchAgent**: `git-ai-login-start-macos.sh`
+            - **Linux systemd user unit**: `git-ai-login-start-linux.sh`
+            - **Windows Scheduled Task**: `git-ai-login-start-windows.ps1`
 
             ### SHA256 Checksums
             ```
@@ -958,7 +971,7 @@ jobs:
           path: release
 
       - name: Generate attestations for notarized PKGs
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             release/git-ai-macos-*.pkg

@@ -26,7 +26,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Current schema version (must match MIGRATIONS.len())
-const SCHEMA_VERSION: usize = 16;
+const SCHEMA_VERSION: usize = 17;
 
 // This value is part of the metrics retry index schema. Changing it requires a
 // migration that rebuilds `metrics_retryable` with the same literal used by
@@ -246,6 +246,8 @@ const MIGRATIONS: &[&str] = &[
     // Migration 15 -> 16: ZCode request corrections keep a frozen contribution
     // bucket and an independent monotonically increasing daily snapshot sequence.
     // No historical token source is replayed or recomputed.
+    "",
+    // 16 -> 17: preserve the observed commit source through deferred retries.
     "",
 ];
 
@@ -691,6 +693,13 @@ impl MetricsDatabase {
                 "ALTER TABLE session_token_sources ADD COLUMN daily_bucket_key TEXT NOT NULL DEFAULT ''")?;
             self.add_column_if_missing("session_token_daily", "snapshot_sequence",
                 "ALTER TABLE session_token_daily ADD COLUMN snapshot_sequence INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if from_version == 16 {
+            self.add_column_if_missing(
+                "deferred_commit_metric_jobs",
+                "commit_source",
+                crate::metrics::deferred_commit_jobs::ADD_COMMIT_SOURCE_SQL,
+            )?;
         }
         // Version 6 is the first schema containing session_activity. Add the
         // columns before compacting legacy content so those rows can establish

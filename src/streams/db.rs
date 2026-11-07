@@ -145,6 +145,13 @@ const MIGRATIONS: &[&str] = &[
 
     INSERT INTO schema_version (version) VALUES (6);
     "#,
+    // Version 7: OpenCode pagination now uses TimestampCursor. Leave legacy
+    // values intact: the reader parses RFC3339 with Rust and upgrades type/value
+    // atomically after a successful read. SQLite date conversion rounds fractional
+    // milliseconds and invalid values must never be replaced with epoch.
+    r#"
+    INSERT INTO schema_version (version) VALUES (7);
+    "#,
 ];
 
 /// Record representing a tracked stream cursor in the database.
@@ -423,11 +430,14 @@ impl StreamsDatabase {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().timestamp();
+        let watermark_type = watermark.watermark_type().to_string();
         let watermark_value = watermark.serialize();
 
+        // Readers may upgrade a legacy strategy. Persist its type and value
+        // together so the next batch or daemon restart can deserialize it.
         let rows_changed = conn.execute(
-            "UPDATE tracked_streams SET watermark_value = ?1, last_processed_at = ?2 WHERE session_id = ?3 AND stream_kind = ?4 AND stream_path = ?5",
-            params![watermark_value, now, session_id, stream_kind, stream_path],
+            "UPDATE tracked_streams SET watermark_value = ?1, last_processed_at = ?2, watermark_type = ?6 WHERE session_id = ?3 AND stream_kind = ?4 AND stream_path = ?5",
+            params![watermark_value, now, session_id, stream_kind, stream_path, watermark_type],
         )
         .map_err(|e| StreamError::Fatal {
             message: format!("Failed to update watermark: {}", e),
@@ -715,6 +725,59 @@ mod tests {
     }
 
     #[test]
+    fn test_opencode_late_legacy_watermark_update_preserves_restart() {
+        use crate::streams::watermark::{TimestampCursorWatermark, WatermarkType};
+
+        let (db, temp) = create_test_db();
+        // An older daemon can insert a Timestamp stream after V7 has run.
+        // No startup migration can repair a row added after this connection opened.
+        let mut legacy = create_test_stream("late-legacy-opencode");
+        legacy.tool = "opencode".into();
+        legacy.stream_format = "OpenCodeSqlite".into();
+        legacy.watermark_type = "Timestamp".into();
+        legacy.watermark_value = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000)
+            .unwrap()
+            .to_rfc3339();
+        db.insert_stream(&legacy).unwrap();
+        let unrelated = create_test_stream("unrelated-claude");
+        db.insert_stream(&unrelated).unwrap();
+
+        let cursor = TimestampCursorWatermark::new(1_700_000_000_123.0, "msg-last".into());
+        db.update_watermark(
+            &legacy.session_id,
+            &legacy.stream_kind,
+            &legacy.stream_path,
+            &cursor,
+        )
+        .unwrap();
+        drop(db);
+
+        let reopened = StreamsDatabase::open(temp.path()).unwrap();
+        let persisted = reopened
+            .get_stream(&legacy.session_id, &legacy.stream_kind, &legacy.stream_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.watermark_type, "TimestampCursor");
+        let kind: WatermarkType = persisted.watermark_type.parse().unwrap();
+        assert_eq!(
+            kind.deserialize(&persisted.watermark_value)
+                .unwrap()
+                .serialize(),
+            cursor.serialize()
+        );
+        assert_eq!(
+            reopened
+                .get_stream(
+                    &unrelated.session_id,
+                    &unrelated.stream_kind,
+                    &unrelated.stream_path
+                )
+                .unwrap(),
+            Some(unrelated)
+        );
+    }
+
+    #[test]
     fn test_update_file_metadata() {
         let (db, _temp) = create_test_db();
         let stream = create_test_stream("session-1");
@@ -815,7 +878,70 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 6); // Current schema version
+        assert_eq!(version, MIGRATIONS.len() as u32);
+    }
+
+    #[test]
+    fn test_migration_v7_preserves_legacy_and_invalid_cursor_evidence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("migration_v7.db");
+        {
+            let conn = crate::sqlite::open_with_memory_limits(&path).unwrap();
+            for migration in &MIGRATIONS[..6] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute_batch(
+                r#"
+                INSERT INTO tracked_streams (
+                    session_id, stream_kind, tool, stream_path, stream_format,
+                    watermark_type, watermark_value, external_session_id,
+                    first_seen_at, last_processed_at, last_known_size
+                ) VALUES
+                    ('old', 'transcript', 'opencode', '/old.db', 'OpenCodeSqlite',
+                     'Timestamp', '2026-01-01T00:00:00.123999999Z', 'old', 100, 200, 4321),
+                    ('invalid', 'transcript', 'opencode', '/invalid.db', 'OpenCodeSqlite',
+                     'Timestamp', 'not-a-timestamp', 'invalid', 100, 200, 4321),
+                    ('new', 'transcript', 'opencode', '/new.db', 'OpenCodeSqlite',
+                     'TimestampCursor', '1767225600123|msg-done', 'new', 100, 200, 4321),
+                    ('codex', 'transcript', 'codex', '/codex.jsonl', 'CodexJsonl',
+                     'CodexByteOffset', '4321|1', 'codex', 100, 200, 4321);
+            "#,
+            )
+            .unwrap();
+        }
+        let db = StreamsDatabase::open(&path).unwrap();
+        let old = db
+            .get_stream("old", "transcript", "/old.db")
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.watermark_type, "Timestamp");
+        assert_eq!(old.watermark_value, "2026-01-01T00:00:00.123999999Z");
+        let invalid = db
+            .get_stream("invalid", "transcript", "/invalid.db")
+            .unwrap()
+            .unwrap();
+        assert_eq!(invalid.watermark_type, "Timestamp");
+        assert_eq!(invalid.watermark_value, "not-a-timestamp");
+        assert!(
+            crate::streams::watermark::WatermarkType::Timestamp
+                .deserialize(&invalid.watermark_value)
+                .is_err()
+        );
+        assert_eq!(
+            (invalid.last_processed_at, invalid.last_known_size),
+            (200, 4321)
+        );
+        assert_eq!((old.last_processed_at, old.last_known_size), (200, 4321));
+        let new = db
+            .get_stream("new", "transcript", "/new.db")
+            .unwrap()
+            .unwrap();
+        assert_eq!(new.watermark_value, "1767225600123|msg-done");
+        let codex = db
+            .get_stream("codex", "transcript", "/codex.jsonl")
+            .unwrap()
+            .unwrap();
+        assert_eq!(codex.watermark_value, "4321|1");
     }
 
     #[test]
@@ -1141,6 +1267,64 @@ mod tests {
         let result = db_arc.get_stream("session-1", "transcript", "/path/to/transcript.jsonl");
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_opencode_timestamp_cursor_migration_preserves_progress() {
+        use crate::streams::watermark::{TimestampWatermark, WatermarkType};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("opencode_migration.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+        for migration in &MIGRATIONS[..4] {
+            conn.execute_batch(migration).unwrap();
+        }
+        let old_db = StreamsDatabase {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        let mut legacy = create_test_stream("legacy-opencode");
+        legacy.tool = "opencode".into();
+        legacy.stream_format = "OpenCodeSqlite".into();
+        legacy.watermark_type = "Timestamp".into();
+        legacy.watermark_value = "2023-11-14T17:13:20.123-05:00".into();
+        legacy.last_known_size = 12345;
+        legacy.repo_work_dir = Some("/work/project".into());
+        old_db.insert_stream(&legacy).unwrap();
+
+        let mut initial = legacy.clone();
+        initial.session_id = "initial-opencode".into();
+        initial.watermark_value = "1970-01-01T00:00:00+00:00".into();
+        old_db.insert_stream(&initial).unwrap();
+        let unrelated = create_test_stream("unrelated");
+        old_db.insert_stream(&unrelated).unwrap();
+        let mut cursor = legacy.clone();
+        cursor.session_id = "cursor-opencode".into();
+        cursor.watermark_type = "TimestampCursor".into();
+        cursor.watermark_value = "1700000000123|msg-last".into();
+        old_db.insert_stream(&cursor).unwrap();
+        drop(old_db);
+
+        // Reopening twice verifies migration and restart retain both cursor
+        // fields and leave other streams and session metadata unchanged.
+        for _ in 0..2 {
+            let db = StreamsDatabase::open(&db_path).unwrap();
+            for expected in [&legacy, &initial, &unrelated, &cursor] {
+                assert_eq!(
+                    db.get_stream(&expected.session_id, "transcript", &expected.stream_path)
+                        .unwrap()
+                        .as_ref(),
+                    Some(expected)
+                );
+            }
+            let watermark = WatermarkType::Timestamp
+                .deserialize(&legacy.watermark_value)
+                .unwrap();
+            let watermark = watermark
+                .as_any()
+                .downcast_ref::<TimestampWatermark>()
+                .unwrap();
+            assert_eq!(watermark.0.timestamp_millis(), 1_700_000_000_123);
+        }
     }
 
     #[test]
