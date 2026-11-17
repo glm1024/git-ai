@@ -1,7 +1,7 @@
 ARG RUST_VERSION=1.93.0
 FROM rust:${RUST_VERSION}-bookworm
 
-ARG CARGO_XWIN_VERSION=0.23.0
+ARG CARGO_XWIN_VERSION=0.23.1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

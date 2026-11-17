@@ -113,7 +113,8 @@ ensure_linux_builder() {
 }
 
 ensure_windows_builder() {
-    WINDOWS_BUILDER_IMAGE=${GIT_AI_WINDOWS_BUILDER_IMAGE:-"git-ai-offline-windows-builder:rust-${RUST_VERSION}-xwin-0.23.0"}
+    cargo_xwin_version=0.23.1
+    WINDOWS_BUILDER_IMAGE=${GIT_AI_WINDOWS_BUILDER_IMAGE:-"git-ai-offline-windows-builder:rust-${RUST_VERSION}-xwin-${cargo_xwin_version}"}
 
     require_command docker
     if docker image inspect "${WINDOWS_BUILDER_IMAGE}" >/dev/null 2>&1; then
@@ -129,7 +130,7 @@ ensure_windows_builder() {
         --platform linux/amd64 \
         --load \
         --build-arg "RUST_VERSION=${RUST_VERSION}" \
-        --build-arg "CARGO_XWIN_VERSION=0.23.0" \
+        --build-arg "CARGO_XWIN_VERSION=${cargo_xwin_version}" \
         --tag "${WINDOWS_BUILDER_IMAGE}" \
         --file "${SCRIPT_DIR}/Dockerfile.windows-builder" \
         "${SCRIPT_DIR}"
