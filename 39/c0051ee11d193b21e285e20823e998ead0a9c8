@@ -1,0 +1,24 @@
+scripts/offline-build/Dockerfile.windows-builder
+  s_4901005f8b3d68::t_dea154dce78ae3 4
+scripts/offline-build/common.sh
+  s_4901005f8b3d68::t_dea154dce78ae3 116-117,133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6",
+  "base_commit_sha": "39c0051ee11d193b21e285e20823e998ead0a9c8",
+  "prompts": {},
+  "sessions": {
+    "s_4901005f8b3d68": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e452-fbf4-70d2-a34d-593a2e44ea9f",
+        "model": "gpt-6.1-sol"
+      },
+      "trace_models": {
+        "t_dea154dce78ae3": "gpt-6.1-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
