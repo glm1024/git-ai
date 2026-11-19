@@ -1,0 +1,30 @@
+src/daemon/ref_cursor.rs
+  s_f6530361ef9312::t_024d6fdcd61432 58-71,409-411,441,446-447,607,663-703,705,708-714,716,719-724,726-729,1956-1959,1980,1984,4694-4736,7292-7293,7346-7347,7481-7482
+  s_f6530361ef9312::t_a5bab2028d4c41 715,725,4737-4738
+tests/daemon_mode.rs
+  s_f6530361ef9312::t_312663a7bf5bed 64-67,1587,1590,1602,1605,1624,1631,1637,1644,1650,1652,1657,1659,4060-4080,5771-5773,5777,5816,5823,5829,5831
+产品业务.md
+  s_f6530361ef9312::t_7942ea6e2f6ba9 75-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6",
+  "base_commit_sha": "34dfa8ac3394053e0f1d4a8f8c9270cc77fc965f",
+  "prompts": {},
+  "sessions": {
+    "s_f6530361ef9312": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1f29a-c459-7a01-9c3f-697f1a90af3d",
+        "model": "gpt-6.2-astra"
+      },
+      "trace_models": {
+        "t_024d6fdcd61432": "gpt-6.2-astra",
+        "t_312663a7bf5bed": "gpt-6.2-astra",
+        "t_7942ea6e2f6ba9": "gpt-6.2-astra",
+        "t_a5bab2028d4c41": "gpt-6.2-astra"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
