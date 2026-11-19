@@ -55,6 +55,20 @@ struct CursorEntry {
     end_offset: u64,
 }
 
+impl CursorEntry {
+    fn was_last_write_during(&self, cmd: &NormalizedCommand) -> bool {
+        let Ok(metadata) = fs::metadata(&self.path) else {
+            return false;
+        };
+        metadata.len() == self.end_offset
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|ts| (cmd.started_at_ns..=cmd.finished_at_ns).contains(&ts.as_nanos()))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UpdateRefSpec {
     reference: String,
@@ -392,8 +406,9 @@ impl RefCursor {
 
     /// Clamp a cold-start seed offset so it never lands past the command's own
     /// matching reflog entry. Returns the start offset of the earliest entry
-    /// at/before `offset` that matches this command (by expected transition and
-    /// message prefixes); if no such entry precedes the offset, returns `offset`
+    /// at/before `offset` that matches this command. For a commit, a matching
+    /// subject must also be adjacent to the offset or inside its time window.
+    /// If no matching entry precedes the offset, returns `offset`
     /// unchanged (the offset legitimately skips only prior, non-matching
     /// history).
     fn clamp_seed_to_own_entry(
@@ -423,10 +438,13 @@ impl RefCursor {
                     "HEAD".to_string()
                 };
                 let entries = read_reflog_entries(key.to_string(), &path, &reference, None)?;
+                let window = reflog_timestamp_window(cmd);
                 let earliest_own = entries
                     .into_iter()
                     .filter(|entry| {
                         entry.start_offset < offset
+                            && (entry.end_offset == offset
+                                || entry.timestamp_secs.is_some_and(|ts| window.contains(ts)))
                             && expected.matches(entry)
                             && message_matches(&entry.message, &prefix_refs)
                     })
@@ -586,9 +604,7 @@ impl RefCursor {
         } else {
             &["commit", "commit (initial):"]
         };
-        let expected = self
-            .head_expected_transition(cmd, state)
-            .without_old_oid_constraint()
+        let expected = ExpectedTransition::from_state_and_working_logs(cmd, state)
             .with_reflog_messages(commit_reflog_messages(&args, amend));
         let entry = self.find_commit_head_entry(cmd, prefixes, expected.clone())?;
         crate::wltrace::wltrace(
@@ -644,26 +660,73 @@ impl RefCursor {
         message_prefixes: &[&str],
         expected: ExpectedTransition,
     ) -> Result<Option<CursorEntry>, GitAiError> {
-        // Prefer the exact argv-derived reflog message when possible: it is the
-        // strongest discriminator for untraced duplicate commit entries. A
-        // commit-msg hook can rewrite the subject after argv is fixed, though, and
-        // git records that final subject in the reflog. In that case fall back to a
-        // command-window match below instead of dropping the HEAD transition.
-        if let Some(entry) =
-            self.find_head_entry(cmd.worktree.as_deref(), message_prefixes, expected.clone())?
-        {
-            return Ok(Some(entry));
-        }
-
-        if expected.messages.is_empty() {
+        let Some(git_dir) = cmd.worktree.as_deref().and_then(git_dir_for_worktree) else {
             return Ok(None);
+        };
+        let key = head_key(&git_dir);
+        let path = git_dir.join("logs/HEAD");
+        let start = self.reflog_start_offset(&key, &path)?;
+        let mut candidates = read_reflog_entries(key.clone(), &path, "HEAD", start)?;
+        let boundary = cmd
+            .reflog_start_offsets
+            .get(&key)
+            .copied()
+            .filter(|offset| {
+                *offset == 0
+                    || candidates
+                        .iter()
+                        .any(|entry| entry.start_offset == *offset || entry.end_offset == *offset)
+            });
+        candidates.retain(|entry| {
+            !self.entry_consumed(entry)
+                && message_matches(&entry.message, message_prefixes)
+                && valid_ref_transition(&entry.old, &entry.new)
+        });
+        let matches_subject = |entry: &CursorEntry| {
+            expected.messages.is_empty() || expected.messages.contains(&entry.message)
+        };
+        let window = reflog_timestamp_window(cmd);
+        let in_window =
+            |entry: &CursorEntry| entry.timestamp_secs.is_some_and(|ts| window.contains(ts));
+
+        // A late offset may be the START of a later, unrelated commit. Don't
+        // prefer it over the command's own in-window row just because both
+        // subjects match. Git can backdate rows with GIT_COMMITTER_DATE, so a
+        // matching boundary remains usable when there is no competing row.
+        if let Some(offset) = boundary
+            && let Some(entry) = candidates
+                .iter()
+                .find(|entry| entry.start_offset == offset && matches_subject(entry))
+            && (in_window(entry)
+                || !candidates
+                    .iter()
+                    .any(|other| in_window(other) && matches_subject(other)))
+        {
+            return Ok(Some(entry.clone()));
         }
 
-        self.find_head_entry_in_command_window(
-            cmd,
-            message_prefixes,
-            expected.without_reflog_message_constraint(),
-        )
+        // An alias can lack a root HEAD offset. For backdated commits the
+        // committer timestamp cannot help, but a complete final row from a
+        // known base, physically appended during this command, still can.
+        if let Some(entry) = candidates.last()
+            && expected.old_oids.contains(&entry.old)
+            && matches_subject(entry)
+            && entry.was_last_write_during(cmd)
+        {
+            return Ok(Some(entry.clone()));
+        }
+
+        // A delayed or missing observation cannot authorize a scan back to
+        // the first matching subject. Inside the command window prefer the
+        // exact subject, allowing a commit-msg hook to have rewritten it.
+        candidates.retain(in_window);
+        if candidates.iter().any(matches_subject) {
+            candidates.retain(matches_subject);
+        }
+        if candidates.len() <= 1 {
+            return Ok(candidates.pop());
+        }
+        Ok(boundary.and_then(|offset| Self::select_candidate_with_hint(Some(offset), candidates)))
     }
 
     fn enrich_cherry_pick(
@@ -1653,43 +1716,6 @@ impl RefCursor {
         Ok(latest_before_hint)
     }
 
-    fn find_head_entry_in_command_window(
-        &mut self,
-        cmd: &NormalizedCommand,
-        message_prefixes: &[&str],
-        expected: ExpectedTransition,
-    ) -> Result<Option<CursorEntry>, GitAiError> {
-        let Some(worktree) = cmd.worktree.as_deref() else {
-            return Ok(None);
-        };
-        let Some(git_dir) = git_dir_for_worktree(worktree) else {
-            return Ok(None);
-        };
-        let key = head_key(&git_dir);
-        let path = git_dir.join("logs").join("HEAD");
-        let start = self.reflog_start_offset(&key, &path)?;
-        let command_window = reflog_timestamp_window(cmd);
-        let candidates = read_reflog_entries(key.clone(), &path, "HEAD", start)?
-            .into_iter()
-            .filter(|entry| {
-                !self.entry_consumed(entry)
-                    && expected.matches(entry)
-                    && message_matches(&entry.message, message_prefixes)
-                    && entry
-                        .timestamp_secs
-                        .is_some_and(|timestamp| command_window.contains(timestamp))
-            })
-            .collect::<Vec<_>>();
-
-        if self.command_start_hints.contains_key(&key) {
-            return Ok(self.select_candidate_with_hint(&key, candidates));
-        }
-        Ok(match candidates.as_slice() {
-            [entry] => Some(entry.clone()),
-            _ => None,
-        })
-    }
-
     fn find_head_entry(
         &mut self,
         worktree: Option<&Path>,
@@ -1927,7 +1953,10 @@ impl RefCursor {
                 && message_matches(&entry.message, message_prefixes)
         });
         if use_hint {
-            Ok(self.select_candidate_with_hint(&key, candidates))
+            Ok(Self::select_candidate_with_hint(
+                self.command_start_hints.get(&key).copied(),
+                candidates,
+            ))
         } else {
             Ok(candidates.next())
         }
@@ -1948,11 +1977,11 @@ impl RefCursor {
     /// match before the hint. That still preserves the single-candidate case, and
     /// it avoids consuming an older untraced duplicate-message commit when both
     /// the untraced commit and this command's commit sit before the late hint.
-    fn select_candidate_with_hint<I>(&self, key: &str, candidates: I) -> Option<CursorEntry>
+    fn select_candidate_with_hint<I>(hint: Option<u64>, candidates: I) -> Option<CursorEntry>
     where
         I: IntoIterator<Item = CursorEntry>,
     {
-        let Some(hint) = self.command_start_hints.get(key).copied() else {
+        let Some(hint) = hint else {
             return candidates.into_iter().next();
         };
         let mut latest_before_hint: Option<CursorEntry> = None;
@@ -3154,11 +3183,6 @@ fn current_worktree_branch_ref<'a>(
 impl ExpectedTransition {
     fn with_reflog_messages(mut self, messages: HashSet<String>) -> Self {
         self.messages = messages;
-        self
-    }
-
-    fn without_reflog_message_constraint(mut self) -> Self {
-        self.messages.clear();
         self
     }
 
@@ -4665,6 +4689,51 @@ mod tests {
             ref_changes: Vec::new(),
             confidence: Confidence::Low,
         }
+    }
+
+    #[test]
+    fn duplicate_commit_subject_requires_evidence_from_this_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = create_git_dir(&worktree);
+        let head_log = git_dir.join("logs/HEAD");
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let state = family_state(&family);
+        let mut cmd = command_with_worktree(&family, Some(worktree), &["commit", "-m", "c"]);
+        cmd.started_at_ns = 200_000_000_000;
+        cmd.finished_at_ns = cmd.started_at_ns;
+        let selected = |mut cmd: NormalizedCommand| {
+            RefCursor::new(family.clone())
+                .enrich_command(&mut cmd, &state)
+                .unwrap();
+            cmd.ref_changes
+                .into_iter()
+                .map(|c| c.new)
+                .collect::<Vec<_>>()
+        };
+
+        extend_reflog(&git_dir, "HEAD", &[reflog_line_at(A, B, 100, "commit: c")]);
+        assert!(
+            selected(cmd.clone()).is_empty(),
+            "a historical subject alone proves nothing"
+        );
+        extend_reflog(&git_dir, "HEAD", &[reflog_line_at(B, C, 200, "commit: c")]);
+        assert_eq!(selected(cmd.clone()), [C], "alias with no start offset");
+        let mut late = cmd.clone();
+        late.reflog_start_offsets
+            .insert(head_key(&git_dir), fs::metadata(&head_log).unwrap().len());
+        assert_eq!(selected(late.clone()), [C], "cold start at EOF");
+        extend_reflog(&git_dir, "HEAD", &[reflog_line_at(C, D, 300, "commit: c")]);
+        assert_eq!(
+            selected(late),
+            [C],
+            "later same-subject commit after the observation"
+        );
+        extend_reflog(&git_dir, "HEAD", &[reflog_line_at(D, E, 200, "commit: c")]);
+        assert!(
+            selected(cmd).is_empty(),
+            "two unbounded in-window matches are ambiguous"
+        );
     }
 
     #[test]
@@ -7220,6 +7289,8 @@ mod tests {
         extend_branch_commit(&git_dir, "refs/heads/main", B, C, 20, "commit: traced");
         let mut traced =
             command_with_worktree(&family, Some(worktree.clone()), &["commit", "-m", "traced"]);
+        traced.started_at_ns = 20_000_000_000;
+        traced.finished_at_ns = traced.started_at_ns;
         cursor.enrich_command(&mut traced, &state).unwrap();
         assert_eq!(traced.ref_changes.len(), 2, "{:?}", traced.ref_changes);
 
@@ -7272,6 +7343,8 @@ mod tests {
             Some(worktree.clone()),
             &["commit", "-m", "same subject"],
         );
+        traced.started_at_ns = 30_000_000_000;
+        traced.finished_at_ns = traced.started_at_ns;
         cursor.enrich_command(&mut traced, &state).unwrap();
 
         assert_eq!(
@@ -7405,6 +7478,8 @@ mod tests {
         extend_branch_commit(&git_dir, "refs/heads/main", B, C, 20, "commit: traced");
         let mut traced =
             command_with_worktree(&family, Some(worktree.clone()), &["commit", "-m", "traced"]);
+        traced.started_at_ns = 20_000_000_000;
+        traced.finished_at_ns = traced.started_at_ns;
         cursor.enrich_command(&mut traced, &state).unwrap();
         assert!(!traced.ref_changes.is_empty());
 

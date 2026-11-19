@@ -61,6 +61,10 @@ fn daemon_control_socket_path(repo: &TestRepo) -> PathBuf {
     repo.daemon_control_socket_path()
 }
 
+fn trace_now_ns() -> u64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64
+}
+
 fn daemon_trace_socket_path(repo: &TestRepo) -> PathBuf {
     repo.daemon_trace_socket_path()
 }
@@ -1580,8 +1584,10 @@ fn daemon_trace_current_dir_commands_reserve_order_from_def_repo() {
         .expect("a checkpoint should succeed");
     repo.git_og(&["add", "a.txt"])
         .expect("a add should succeed");
+    let a_start = trace_now_ns();
     repo.git_og(&["commit", "-m", "commit A"])
         .expect("commit A should succeed");
+    let a_end = trace_now_ns();
     let commit_a = repo
         .git_og(&["rev-parse", "HEAD"])
         .expect("rev-parse A should succeed")
@@ -1593,8 +1599,10 @@ fn daemon_trace_current_dir_commands_reserve_order_from_def_repo() {
         .expect("b checkpoint should succeed");
     repo.git_og(&["add", "b.txt"])
         .expect("b add should succeed");
+    let b_start = trace_now_ns();
     repo.git_og(&["commit", "-m", "commit B"])
         .expect("commit B should succeed");
+    let b_end = trace_now_ns();
     let commit_b = repo
         .git_og(&["rev-parse", "HEAD"])
         .expect("rev-parse B should succeed")
@@ -1613,42 +1621,42 @@ fn daemon_trace_current_dir_commands_reserve_order_from_def_repo() {
                 "event": "start",
                 "sid": "current-dir-a",
                 "argv": ["git", "-c", session_arg_a, "commit", "-m", "commit A"],
-                "time_ns": 1_000u64,
+                "time_ns": a_start,
             }),
             json!({
                 "event": "def_repo",
                 "sid": "current-dir-a",
                 "worktree": worktree,
                 "repo": git_dir,
-                "time_ns": 1_001u64,
+                "time_ns": a_start + 1,
             }),
             json!({
                 "event": "start",
                 "sid": "current-dir-b",
                 "argv": ["git", "-c", session_arg_b, "commit", "-m", "commit B"],
-                "time_ns": 2_000u64,
+                "time_ns": b_start,
             }),
             json!({
                 "event": "def_repo",
                 "sid": "current-dir-b",
                 "worktree": worktree,
                 "repo": git_dir,
-                "time_ns": 2_001u64,
+                "time_ns": b_start + 1,
             }),
             json!({
                 "event": "exit",
                 "sid": "current-dir-b",
                 "code": 0,
-                "time_ns": 2_100u64,
+                "time_ns": b_end,
             }),
-            trace_atexit_frame("current-dir-b", 0, 2_101u64),
+            trace_atexit_frame("current-dir-b", 0, b_end + 1),
             json!({
                 "event": "exit",
                 "sid": "current-dir-a",
                 "code": 0,
-                "time_ns": 1_100u64,
+                "time_ns": a_end,
             }),
-            trace_atexit_frame("current-dir-a", 0, 1_101u64),
+            trace_atexit_frame("current-dir-a", 0, a_end + 1),
         ],
     );
     repo.sync_daemon_external_completion_sessions(&[session_a, session_b]);
@@ -4050,6 +4058,27 @@ fn daemon_failed_rebase_does_not_consume_later_continue_reflog_entry() {
 }
 
 #[test]
+fn alias_commit_with_historical_subject_keeps_attribution_on_new_commit() {
+    let mut repo = TestRepo::new_dedicated_daemon();
+    repo.git_og(&["config", "alias.c", "commit -m"]).unwrap();
+    repo.git_og_with_env(
+        &["commit", "--allow-empty", "-m", "c"],
+        &[("GIT_COMMITTER_DATE", "2020-01-01T12:00:00Z")],
+    )
+    .unwrap();
+    let old = repo.git_og(&["rev-parse", "HEAD"]).unwrap();
+    repo.filename("new.py")
+        .set_contents(lines!["first".ai(), "second".ai()]);
+    repo.git_og(&["add", "new.py"]).unwrap();
+    repo.sync_daemon();
+    repo.restart_dedicated_daemon_for_test();
+    repo.git(&["c", "c"]).unwrap();
+    repo.filename("new.py")
+        .assert_committed_lines(lines!["first".ai(), "second".ai()]);
+    assert!(repo.read_authorship_note(old.trim()).is_none());
+}
+
+#[test]
 fn daemon_late_cherry_pick_trace_uses_actual_destination_not_stale_commit_entry() {
     let mut repo = TestRepo::new_dedicated_daemon();
     let trace_socket = daemon_trace_socket_path(&repo);
@@ -5739,9 +5768,13 @@ fn daemon_delayed_pull_rebase_autostash_does_not_consume_later_commit() {
     local
         .git_og(&["add", "-A"])
         .expect("raw add should succeed");
+    // The replay arrives late, but its trace timestamps still describe the
+    // actual git invocation that created the HEAD reflog entry.
+    let commit_start_ns = trace_now_ns();
     local
         .git_og(&["commit", "-m", "commit uncommitted AI work"])
         .expect("raw commit should succeed");
+    let commit_end_ns = trace_now_ns();
     let final_commit = local
         .git_og(&["rev-parse", "HEAD"])
         .expect("rev-parse final commit should succeed")
@@ -5780,22 +5813,22 @@ fn daemon_delayed_pull_rebase_autostash_does_not_consume_later_commit() {
                 "event": "start",
                 "sid": "delayed-commit-after-pull",
                 "argv": ["git", "-c", commit_session_arg, "-C", worktree, "commit", "-m", "commit uncommitted AI work"],
-                "time_ns": 2_000u64,
+                "time_ns": commit_start_ns,
             }),
             json!({
                 "event": "def_repo",
                 "sid": "delayed-commit-after-pull",
                 "worktree": worktree,
                 "repo": git_dir,
-                "time_ns": 2_001u64,
+                "time_ns": commit_start_ns + 1,
             }),
             json!({
                 "event": "exit",
                 "sid": "delayed-commit-after-pull",
                 "code": 0,
-                "time_ns": 2_100u64,
+                "time_ns": commit_end_ns,
             }),
-            trace_atexit_frame("delayed-commit-after-pull", 0, 2_101u64),
+            trace_atexit_frame("delayed-commit-after-pull", 0, commit_end_ns + 1),
         ],
     );
     local.sync_daemon_external_completion_sessions(&[pull_session, commit_session]);
