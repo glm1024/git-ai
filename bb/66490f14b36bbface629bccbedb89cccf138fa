@@ -1,0 +1,84 @@
+.github/workflows/mdm-login-start-nightly.yml
+  s_f6530361ef9312::t_e492298f10394d 47,52,54,64-65
+.github/workflows/nightly-upgrade.yml
+  s_f6530361ef9312::t_e492298f10394d 55,62-63,67,125,132-133,137
+.github/workflows/release.yml
+  s_f6530361ef9312::t_7512b13d51e7d9 89-91,270-272,905-906
+Cargo.toml
+  s_f6530361ef9312::t_7512b13d51e7d9 3
+build.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 1-14
+flake.nix
+  s_f6530361ef9312::t_7512b13d51e7d9 39
+scripts/offline-build/common.sh
+  s_f6530361ef9312::t_7512b13d51e7d9 72-77
+scripts/offline-build/test-build-win-package.sh
+  s_f6530361ef9312::t_e16a1aa5f402ee 20,53,65
+scripts/offline-build/test-release-contract.sh
+  s_f6530361ef9312::t_7512b13d51e7d9 33-35,43-44
+src/api/client.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 288,306
+src/authorship/attribution_recovery.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 1914
+src/authorship/authorship_log_serialization.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 19,22
+src/authorship/post_commit.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 1244
+src/ci/gitlab.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 93,309
+src/commands/debug.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 127,129
+src/commands/git_ai_handlers.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 92,94
+src/commands/install_hooks.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 889
+src/commands/upgrade.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 529,1160,1353,1457,1628,2092,2163,2709,2723,2797,2814,2836,2858
+  s_f6530361ef9312::t_cc351470a55838 1599-1603
+src/daemon.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 12005,12209
+src/daemon/checkpoint.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 194,222,279
+src/daemon/rewrite_metrics.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 843
+  s_f6530361ef9312::t_cc351470a55838 563-564
+src/daemon/stream_worker.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 1248
+src/daemon/telemetry_worker.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 1888,1926,1955,1970,2254
+src/daemon/token_usage_worker.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 1352
+src/metrics/mod.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 48
+tests/integration/session_event_repo_url.rs
+  s_f6530361ef9312::t_7512b13d51e7d9 724
+产品业务.md
+  s_f6530361ef9312::t_7512b13d51e7d9 62
+构建方法.md
+  s_f6530361ef9312::t_7512b13d51e7d9 29,40,56-57
+Cargo.lock
+  s_f6530361ef9312::t_0889a8d5821bc1 1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.6.1",
+  "base_commit_sha": "bb66490f14b36bbface629bccbedb89cccf138fa",
+  "prompts": {},
+  "sessions": {
+    "s_f6530361ef9312": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1f29a-c459-7a01-9c3f-697f1a90af3d",
+        "model": "gpt-6.2-sol"
+      },
+      "trace_models": {
+        "t_0889a8d5821bc1": "gpt-6.2-sol",
+        "t_7512b13d51e7d9": "gpt-6.2-sol",
+        "t_cc351470a55838": "gpt-6.2-sol",
+        "t_e16a1aa5f402ee": "gpt-6.2-sol",
+        "t_e492298f10394d": "gpt-6.2-sol"
+      },
+      "human_author": "markMe1024 <com.mark.yu2015@gmail.com>"
+    }
+  }
+}
