@@ -86,7 +86,9 @@ jobs:
         id: get-version
         shell: bash
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
+          SCRIPT_DIR="$PWD/scripts/offline-build"
+          . "$SCRIPT_DIR/common.sh"
+          VERSION=$(cli_version)
           echo "version=v$VERSION" >> $GITHUB_OUTPUT
 
       - name: Build in Docker (Linux)
@@ -265,7 +267,9 @@ jobs:
         id: get-version
         shell: bash
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
+          SCRIPT_DIR="$PWD/scripts/offline-build"
+          . "$SCRIPT_DIR/common.sh"
+          VERSION=$(cli_version)
           echo "version=v$VERSION" >> $GITHUB_OUTPUT
 
       - name: Install Rust toolchain
@@ -898,8 +902,8 @@ jobs:
           CURRENT_VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
           echo "Current version: $CURRENT_VERSION"
           
-          # Parse version components
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          # The next upstream patch starts without a local release revision.
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%+*}"
           
           # Bump patch version
           NEW_PATCH=$((PATCH + 1))

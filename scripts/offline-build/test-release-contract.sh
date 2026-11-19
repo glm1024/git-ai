@@ -30,7 +30,9 @@ HOME="${help_home}" sh "${REPO_ROOT}/install.sh" --help >/dev/null
 [ ! -e "${help_home}/.git-ai" ] || fail 'sh install.sh --help must not create install state'
 rm -rf "${help_home}"
 
-cli_version=$(awk -F '"' '/^version = "/ { print $2; exit }' "${REPO_ROOT}/Cargo.toml")
+. "${SCRIPT_DIR}/common.sh"
+cli_version=$(cli_version)
+cargo_version=$(awk -F '"' '/^version = "/ { print $2; exit }' "${REPO_ROOT}/Cargo.toml")
 lock_version=$(awk '
     /^name = "git-ai"$/ { in_package = 1; next }
     in_package && /^version = "/ { gsub(/^version = "|"$/, ""); print; exit }
@@ -38,8 +40,8 @@ lock_version=$(awk '
 flake_version=$(awk -F '"' '/^[[:space:]]*version = "/ { print $2; exit }' "${REPO_ROOT}/flake.nix")
 printf '%s\n' "${cli_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)*$' \
     || fail "Invalid CLI release version: ${cli_version}"
-[ "${lock_version}" = "${cli_version}" ] || fail "Cargo.lock version does not match Cargo.toml"
-[ "${flake_version}" = "${cli_version}" ] || fail "flake.nix version does not match Cargo.toml"
+[ "${lock_version}" = "${cargo_version}" ] || fail "Cargo.lock version does not match Cargo.toml"
+[ "${flake_version}" = "${cli_version}" ] || fail "flake.nix version does not match the CLI release version"
 
 assert_contains "${REPO_ROOT}/agent-support/vscode/package.json" '"version": "0.1.24"'
 assert_contains "${REPO_ROOT}/agent-support/vscode/package-lock.json" '"version": "0.1.24"'

@@ -16,10 +16,10 @@ pub const AUTHORSHIP_LOG_VERSION: &str = "authorship/3.0.0";
 pub const GIT_AI_VERSION: &str = "development";
 
 #[cfg(all(debug_assertions, not(test)))]
-pub const GIT_AI_VERSION: &str = concat!("development:", env!("CARGO_PKG_VERSION"));
+pub const GIT_AI_VERSION: &str = concat!("development:", env!("GIT_AI_RELEASE_VERSION"));
 
 #[cfg(not(debug_assertions))]
-pub const GIT_AI_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const GIT_AI_VERSION: &str = env!("GIT_AI_RELEASE_VERSION");
 
 /// Metadata section that goes below the divider as JSON
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

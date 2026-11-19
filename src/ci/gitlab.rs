@@ -90,7 +90,7 @@ fn gitlab_api_get(
         .header(auth_header_name, auth_token)
         .header(
             "User-Agent",
-            &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
+            &format!("git-ai/{}", env!("GIT_AI_RELEASE_VERSION")),
         );
     crate::http::send(request)
 }
@@ -306,7 +306,7 @@ pub fn get_gitlab_ci_context() -> Result<Option<CiContext>, GitAiError> {
             .header(auth_header_name, &auth_token)
             .header(
                 "User-Agent",
-                &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
+                &format!("git-ai/{}", env!("GIT_AI_RELEASE_VERSION")),
             );
         match crate::http::send(request) {
             Ok(resp) if resp.status_code == 200 => {

@@ -12002,7 +12002,7 @@ fn report_ingest_losses(coordinator: &Arc<ActorDaemonCoordinator>) {
             .checkpoints_dropped
             .saturating_sub(last_reported.checkpoints_dropped),
     );
-    let attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"));
+    let attrs = crate::metrics::EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"));
     let event = crate::metrics::MetricEvent::from_values(values, attrs.to_sparse());
     match crate::daemon::telemetry_worker::persist_metrics_now(&[event]) {
         Ok(()) => *last_reported = current,
@@ -12206,7 +12206,7 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
 
     tracing::info!(
         pid = std::process::id(),
-        version = env!("CARGO_PKG_VERSION"),
+        version = env!("GIT_AI_RELEASE_VERSION"),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         "daemon started"

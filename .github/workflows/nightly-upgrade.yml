@@ -52,19 +52,19 @@ jobs:
           with urllib.request.urlopen(req) as response:
               releases = json.load(response)
 
-          pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+          pattern = re.compile(r"^v?(\d+\.\d+\.\d+(?:\.\d+)?)$")
           versions = {}
           for release in releases:
               tag = release.get("tag_name", "")
               match = pattern.match(tag)
               if not match:
                   continue
-              version_tuple = tuple(int(part) for part in match.groups())
-              normalized = "v" + ".".join(match.groups())
+              version_tuple = tuple(int(part) for part in match.group(1).split("."))
+              normalized = "v" + match.group(1)
               versions[version_tuple] = normalized
 
           if not versions:
-              raise SystemExit("No semver releases found")
+              raise SystemExit("No numeric releases found")
 
           min_upgrade_tuple = (1, 0, 26)
 
@@ -122,19 +122,19 @@ jobs:
           with urllib.request.urlopen(req) as response:
               releases = json.load(response)
 
-          pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+          pattern = re.compile(r"^v?(\d+\.\d+\.\d+(?:\.\d+)?)$")
           versions = {}
           for release in releases:
               tag = release.get("tag_name", "")
               match = pattern.match(tag)
               if not match:
                   continue
-              version_tuple = tuple(int(part) for part in match.groups())
-              normalized = "v" + ".".join(match.groups())
+              version_tuple = tuple(int(part) for part in match.group(1).split("."))
+              normalized = "v" + match.group(1)
               versions[version_tuple] = normalized
 
           if not versions:
-              raise SystemExit("No semver releases found")
+              raise SystemExit("No numeric releases found")
 
           min_upgrade_tuple = (1, 0, 26)
 

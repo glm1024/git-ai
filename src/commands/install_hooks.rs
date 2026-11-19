@@ -886,7 +886,7 @@ fn warn_if_git_version_too_old() {
 fn emit_install_hooks_metrics(results: &[(String, InstallResult)]) -> Result<(), GitAiError> {
     use crate::metrics::{EventAttributes, InstallHooksValues};
 
-    let attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"));
+    let attrs = EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"));
 
     for (tool_id, result) in results {
         let mut values = InstallHooksValues::new()

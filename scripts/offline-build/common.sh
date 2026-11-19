@@ -69,7 +69,12 @@ cargo_offline_env() {
 }
 
 cli_version() {
-    awk -F '"' '/^[[:space:]]*version = / { print $2; exit }' "${REPO_ROOT}/Cargo.toml"
+    awk -F '"' '/^[[:space:]]*version = / {
+        version = $2
+        if (version ~ /[+][0-9]+$/) sub(/[+]/, ".", version)
+        print version
+        exit
+    }' "${REPO_ROOT}/Cargo.toml"
 }
 
 vscode_version() {

@@ -1349,7 +1349,7 @@ fn emit_changed_buckets(
             .long_context_cache_write_tokens(aggregate.long_context_cache_write)
             .long_context_cache_write_1h_tokens(aggregate.long_context_cache_write_1h)
             .transcript_cost_micro_usd(aggregate.transcript_cost_micro_usd);
-        let mut attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+        let mut attrs = EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
             .custom_attributes_map(custom_attributes)
             .session_id(identity.session_id.clone())
             .tool(&identity.tool)

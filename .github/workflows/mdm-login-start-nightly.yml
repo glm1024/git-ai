@@ -44,14 +44,14 @@ jobs:
           with urllib.request.urlopen(urllib.request.Request(url, headers=headers)) as response:
               releases = json.load(response)
 
-          pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+          pattern = re.compile(r"^v?(\d+\.\d+\.\d+(?:\.\d+)?)$")
           versions = {}
           for release in releases:
               match = pattern.match(release.get("tag_name", ""))
               if match:
-                  versions[tuple(int(p) for p in match.groups())] = "v" + ".".join(match.groups())
+                  versions[tuple(int(p) for p in match.group(1).split("."))] = "v" + match.group(1)
           if len(versions) < 2:
-              raise SystemExit("Need at least two semver releases")
+              raise SystemExit("Need at least two numeric releases")
 
           # The daemon updates to whatever the `latest` channel serves, which can
           # lag the newest GitHub release while a release is being promoted.
@@ -61,8 +61,8 @@ jobs:
           channel = pattern.match(channel_version)
           if not channel:
               raise SystemExit(f"unexpected channel version {channel_version!r}")
-          latest_tuple = tuple(int(p) for p in channel.groups())
-          latest = "v" + ".".join(channel.groups())
+          latest_tuple = tuple(int(p) for p in channel.group(1).split("."))
+          latest = "v" + channel.group(1)
 
           # Recent releases only: the daemon-driven self-update path must exist
           # in the starting version.

@@ -89,9 +89,9 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "version" | "--version" | "-v" => {
             if cfg!(debug_assertions) {
-                println!("{} (debug)", env!("CARGO_PKG_VERSION"));
+                println!("{} (debug)", env!("GIT_AI_RELEASE_VERSION"));
             } else {
-                println!(env!("CARGO_PKG_VERSION"));
+                println!(env!("GIT_AI_RELEASE_VERSION"));
             }
             std::process::exit(0);
         }

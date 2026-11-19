@@ -1885,7 +1885,7 @@ fn flush_sentry_and_posthog(
             "platform": "other",
             "tags": base_tags,
             "extra": extra,
-            "release": format!("git-ai@{}", env!("CARGO_PKG_VERSION")),
+            "release": format!("git-ai@{}", env!("GIT_AI_RELEASE_VERSION")),
         });
 
         if let Some(client) = &oss_client {
@@ -1923,7 +1923,7 @@ fn flush_sentry_and_posthog(
             "platform": "other",
             "tags": perf_tags,
             "extra": extra,
-            "release": format!("git-ai@{}", env!("CARGO_PKG_VERSION")),
+            "release": format!("git-ai@{}", env!("GIT_AI_RELEASE_VERSION")),
         });
 
         if let Some(client) = &oss_client {
@@ -1952,7 +1952,7 @@ fn flush_sentry_and_posthog(
             "platform": "other",
             "tags": base_tags,
             "extra": extra,
-            "release": format!("git-ai@{}", env!("CARGO_PKG_VERSION")),
+            "release": format!("git-ai@{}", env!("GIT_AI_RELEASE_VERSION")),
         });
 
         if let Some(client) = &oss_client {
@@ -1967,7 +1967,7 @@ fn flush_sentry_and_posthog(
             let mut properties = BTreeMap::new();
             properties.insert("os".to_string(), json!(std::env::consts::OS));
             properties.insert("arch".to_string(), json!(std::env::consts::ARCH));
-            properties.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+            properties.insert("version".to_string(), json!(env!("GIT_AI_RELEASE_VERSION")));
             properties.insert("message".to_string(), json!(msg.message));
             properties.insert("level".to_string(), json!(msg.level));
             if let Some(ctx) = &msg.context
@@ -2251,7 +2251,7 @@ impl SentryClient {
         let auth_header = format!(
             "Sentry sentry_version=7, sentry_key={}, sentry_client=git-ai/{}",
             self.public_key,
-            env!("CARGO_PKG_VERSION")
+            env!("GIT_AI_RELEASE_VERSION")
         );
 
         let body = serde_json::to_string(&event)?;

@@ -526,7 +526,7 @@ fn reconcile_completed_windows_upgrade(
     cache: Option<&UpdateCache>,
     api_base_url: &str,
 ) -> WindowsUpgradeReceiptStatus {
-    match reconcile_upgrade_receipt_files(channel, cache, env!("CARGO_PKG_VERSION")) {
+    match reconcile_upgrade_receipt_files(channel, cache, env!("GIT_AI_RELEASE_VERSION")) {
         UpgradeReceiptFileResult::Absent => WindowsUpgradeReceiptStatus::Absent,
         UpgradeReceiptFileResult::CleanupOnly => {
             log_message(
@@ -1157,7 +1157,7 @@ fn run_impl_with_url(
     channel: UpdateChannel,
     skip_install: bool,
 ) -> UpgradeAction {
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("GIT_AI_RELEASE_VERSION");
 
     #[cfg(windows)]
     {
@@ -1350,7 +1350,7 @@ fn print_cached_notice(cache: &UpdateCache) {
         return;
     }
 
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("GIT_AI_RELEASE_VERSION");
     let available_version = cache.available_semver.as_deref().unwrap_or("");
 
     eprintln!();
@@ -1454,7 +1454,7 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
 
     // Re-fetch the release to get the tag needed for the installer.
     let release = fetch_release_for_channel(api_base_url, channel)?;
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("GIT_AI_RELEASE_VERSION");
     let action = determine_action(false, &release, current_version);
     #[cfg(windows)]
     let recover_missing_receipt = should_recover_missing_windows_receipt(
@@ -1596,8 +1596,11 @@ fn check_for_update_available_with_settings(
         // for the next normal channel check and is then cleared.
         let mut validate_current_receipt_against_channel = false;
         if !auto_updates_disabled {
-            match classify_cached_pending_update(cache.as_ref(), channel, env!("CARGO_PKG_VERSION"))
-            {
+            match classify_cached_pending_update(
+                cache.as_ref(),
+                channel,
+                env!("GIT_AI_RELEASE_VERSION"),
+            ) {
                 Some(CachedPendingDisposition::NewerThanCurrent) => {
                     return Ok(DaemonUpdateCheckResult::UpdateReady);
                 }
@@ -1622,7 +1625,7 @@ fn check_for_update_available_with_settings(
     }
 
     let release = fetch_release_for_channel(api_base_url, channel)?;
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("GIT_AI_RELEASE_VERSION");
     let action = determine_action(false, &release, current_version);
     if windows_receipt_recovery_enabled
         && should_recover_missing_windows_receipt(
@@ -2086,7 +2089,7 @@ mod tests {
         set_test_cache_dir(&temp_dir);
 
         let mock_url = |body: &str| format!("mock://{}", body);
-        let current = env!("CARGO_PKG_VERSION");
+        let current = env!("GIT_AI_RELEASE_VERSION");
         let test_checksum = "a".repeat(64); // Valid SHA256 length
 
         // Newer version available - should upgrade
@@ -2157,7 +2160,7 @@ mod tests {
         set_test_cache_dir(&temp_dir);
 
         let mock_url = |body: &str| format!("mock://{}", body);
-        let current = env!("CARGO_PKG_VERSION");
+        let current = env!("GIT_AI_RELEASE_VERSION");
         let test_checksum = "a".repeat(64); // Valid SHA256 length
 
         // Newer version available - should upgrade
@@ -2703,7 +2706,7 @@ mod tests {
         let release =
             fetch_release_for_channel(&format!("mock://{}", mock_payload), UpdateChannel::Latest)
                 .unwrap();
-        let action = determine_action(false, &release, env!("CARGO_PKG_VERSION"));
+        let action = determine_action(false, &release, env!("GIT_AI_RELEASE_VERSION"));
         assert_eq!(action, UpgradeAction::UpgradeAvailable);
 
         // Persist and verify the cache reflects the available update.
@@ -2717,7 +2720,7 @@ mod tests {
 
     #[test]
     fn test_check_for_update_available_same_version() {
-        let current = env!("CARGO_PKG_VERSION");
+        let current = env!("GIT_AI_RELEASE_VERSION");
         let test_checksum = "a".repeat(64);
         let mock_payload = format!(
             r#"{{"channels":{{"latest":{{"version":"v{}","checksum":"{}"}}}}}}"#,
@@ -2791,7 +2794,7 @@ mod tests {
         let mut cache = UpdateCache::new(UpdateChannel::Latest);
         cache.last_checked_at = current_timestamp();
         cache.available_tag = Some(tag.to_string());
-        cache.available_semver = Some(env!("CARGO_PKG_VERSION").to_string());
+        cache.available_semver = Some(env!("GIT_AI_RELEASE_VERSION").to_string());
         write_update_cache(&cache);
     }
 
@@ -2808,7 +2811,7 @@ mod tests {
     fn fresh_current_pending_windows_release_requires_exact_channel_match() {
         let temp_dir = tempfile::tempdir().unwrap();
         set_test_cache_dir(&temp_dir);
-        let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let current_tag = format!("v{}", env!("GIT_AI_RELEASE_VERSION"));
         write_fresh_current_pending_update(&current_tag);
 
         let result = check_for_update_available_with_settings(
@@ -2830,7 +2833,7 @@ mod tests {
     fn fresh_current_pending_windows_release_rollback_clears_stale_cache() {
         let temp_dir = tempfile::tempdir().unwrap();
         set_test_cache_dir(&temp_dir);
-        let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let current_tag = format!("v{}", env!("GIT_AI_RELEASE_VERSION"));
         write_fresh_current_pending_update(&current_tag);
 
         let result = check_for_update_available_with_settings(
@@ -2852,7 +2855,7 @@ mod tests {
     fn fresh_current_pending_windows_different_tag_clears_stale_cache() {
         let temp_dir = tempfile::tempdir().unwrap();
         set_test_cache_dir(&temp_dir);
-        let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let current_tag = format!("v{}", env!("GIT_AI_RELEASE_VERSION"));
         write_fresh_current_pending_update(&current_tag);
         let different_tag = format!("{}-next-other", current_tag);
 

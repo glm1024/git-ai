@@ -560,7 +560,8 @@ fn lifecycle_attrs(
     branch: Option<&str>,
     context: &RewriteMetricBatchContext,
 ) -> EventAttributes {
-    let mut attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION")).commit_sha(new_tip);
+    let mut attrs =
+        EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION")).commit_sha(new_tip);
     attrs = attrs.author(&context.author);
     if let Some(branch) = branch {
         attrs = attrs.branch(branch);
@@ -839,7 +840,7 @@ fn rewrite_metric_attrs(
     batch_context: &RewriteMetricBatchContext,
 ) -> EventAttributes {
     let base_commit_sha = metric_commit.parent_sha.as_deref().unwrap_or("initial");
-    let mut attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+    let mut attrs = EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
         .commit_sha(metric_commit.new_sha.clone())
         .author(&batch_context.author);
     attrs = if base_commit_sha == "initial" {

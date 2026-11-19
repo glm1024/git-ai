@@ -1911,7 +1911,7 @@ struct RecoveryMetricInput<'a> {
 }
 
 fn recovery_metric_attrs(input: &RecoveryMetricInput<'_>) -> EventAttributes {
-    let attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+    let attrs = EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
         .commit_sha(input.commit_sha)
         .session_id(input.session_id)
         .trace_id(input.trace_id);

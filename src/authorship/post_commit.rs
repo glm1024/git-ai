@@ -1241,7 +1241,7 @@ pub(crate) fn commit_metric_attrs(
     parent_sha: &str,
     human_author: &str,
 ) -> crate::metrics::EventAttributes {
-    let mut attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+    let mut attrs = crate::metrics::EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
         .author(human_author)
         .commit_sha(commit_sha);
     attrs = if parent_sha == "initial" {

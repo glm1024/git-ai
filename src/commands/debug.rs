@@ -124,9 +124,9 @@ fn build_debug_report(options: DebugOptions) -> String {
         out,
         "Git AI version: {}",
         if cfg!(debug_assertions) {
-            format!("{} (debug)", env!("CARGO_PKG_VERSION"))
+            format!("{} (debug)", env!("GIT_AI_RELEASE_VERSION"))
         } else {
-            env!("CARGO_PKG_VERSION").to_string()
+            env!("GIT_AI_RELEASE_VERSION").to_string()
         }
     );
     let _ = writeln!(

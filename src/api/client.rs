@@ -285,7 +285,7 @@ impl ApiContext {
             .get(url)
             .header(
                 "User-Agent",
-                &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
+                &format!("git-ai/{}", env!("GIT_AI_RELEASE_VERSION")),
             )
             .header("X-Distinct-ID", &config::get_or_create_distinct_id());
         (agent, request)
@@ -303,7 +303,7 @@ impl ApiContext {
             .post(url)
             .header(
                 "User-Agent",
-                &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
+                &format!("git-ai/{}", env!("GIT_AI_RELEASE_VERSION")),
             )
             .header("X-Distinct-ID", &config::get_or_create_distinct_id());
         (agent, request)

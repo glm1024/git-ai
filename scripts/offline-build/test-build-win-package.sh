@@ -17,7 +17,7 @@ cp "${SCRIPT_DIR}/WINDOWS-INSTALL.md" "${TEST_ROOT}/repo/scripts/offline-build/"
 cat > "${TEST_ROOT}/repo/Cargo.toml" <<'EOF'
 [package]
 name = "git-ai-package-test"
-version = "9.8.7"
+version = "9.8.7+1"
 EOF
 cat > "${TEST_ROOT}/repo/install.ps1" <<'EOF'
 Write-Output 'test installer'
@@ -50,7 +50,7 @@ git -C "${TEST_ROOT}/repo" add .
 git -C "${TEST_ROOT}/repo" commit -qm fixture
 
 sh "${TEST_ROOT}/repo/scripts/offline-build/build-win.sh" >/dev/null
-archive="${TEST_ROOT}/repo/offline-dist/git-ai-windows-v9.8.7.zip"
+archive="${TEST_ROOT}/repo/offline-dist/git-ai-windows-v9.8.7.1.zip"
 [ -f "${archive}" ] || {
     printf '%s\n' '[build-win-test] ERROR: final ZIP was not created' >&2
     exit 1
@@ -62,7 +62,7 @@ archive="${TEST_ROOT}/repo/offline-dist/git-ai-windows-v9.8.7.zip"
 unzip -tq "${archive}" >/dev/null
 unzip -q "${archive}" -d "${TEST_ROOT}/extracted"
 (
-    cd "${TEST_ROOT}/extracted/git-ai-windows-v9.8.7"
+    cd "${TEST_ROOT}/extracted/git-ai-windows-v9.8.7.1"
     shasum -a 256 -c SHA256SUMS >/dev/null
     [ -f install.cmd ] || {
         printf '%s\n' '[build-win-test] ERROR: install.cmd is missing from Windows ZIP' >&2

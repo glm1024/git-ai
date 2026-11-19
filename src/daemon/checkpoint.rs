@@ -191,7 +191,7 @@ pub(crate) struct FrozenCheckpointMetricsContext {
 impl FrozenCheckpointMetricsContext {
     pub(crate) fn capture(repo: &Repository) -> Self {
         Self {
-            git_ai_version: env!("CARGO_PKG_VERSION").to_string(),
+            git_ai_version: env!("GIT_AI_RELEASE_VERSION").to_string(),
             custom_attributes: crate::config::Config::fresh()
                 .metrics_custom_attributes()
                 .clone(),
@@ -219,7 +219,7 @@ pub fn build_agent_usage_attrs(
 ) -> crate::metrics::EventAttributes {
     let session_id = generate_session_id(&agent_id.id, &agent_id.tool);
 
-    let mut attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+    let mut attrs = crate::metrics::EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
         .session_id(session_id)
         .tool(&agent_id.tool)
         .model(&agent_id.model)
@@ -276,7 +276,7 @@ fn build_checkpoint_attrs(
         .map(|aid| generate_session_id(&aid.id, &aid.tool))
         .unwrap_or_default();
 
-    let mut attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+    let mut attrs = crate::metrics::EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
         .session_id(session_id);
     attrs = if base_commit == "initial" {
         attrs.base_commit_sha_null()

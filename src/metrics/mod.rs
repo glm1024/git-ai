@@ -45,7 +45,7 @@ pub use types::{EventValues, METRICS_API_VERSION, MetricEvent, MetricsBatch};
 ///     .tool_model_pairs(vec!["all".to_string()])
 ///     .ai_additions(vec![100]);
 ///
-/// let attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+/// let attrs = EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
 ///     .repo_url("https://github.com/user/repo")
 ///     .author("user@example.com")
 ///     .tool("claude-code");

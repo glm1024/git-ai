@@ -721,7 +721,7 @@ fn test_full_pipeline_session_events_carry_repo_url() {
         .and_then(|p| resolve_repo_url_from_path(p));
 
     // Build attrs
-    let mut base_attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+    let mut base_attrs = EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
         .session_id(retrieved.session_id.clone())
         .tool(&retrieved.tool)
         .external_session_id(retrieved.external_session_id.clone())

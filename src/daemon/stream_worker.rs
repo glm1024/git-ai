@@ -1245,7 +1245,7 @@ impl StreamWorker {
             );
         }
 
-        let mut base_attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+        let mut base_attrs = EventAttributes::with_version(env!("GIT_AI_RELEASE_VERSION"))
             .session_id(stream.session_id.clone())
             .tool(&stream.tool)
             .custom_attributes_map(config::Config::fresh().metrics_custom_attributes());
